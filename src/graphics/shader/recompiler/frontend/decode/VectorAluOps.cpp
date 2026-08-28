@@ -776,9 +776,10 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 
 void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 	operand.dpp = true;
-	if (encoding == 233u) {
-		operand.dpp8     = true;
-		operand.dpp_ctrl = modifier >> 8u;
+	if (encoding == 233u || encoding == 234u) {
+		operand.dpp8               = true;
+		operand.dpp_ctrl           = modifier >> 8u;
+		operand.dpp_fetch_inactive = encoding == 234u;
 		return;
 	}
 	operand.negate             = ((modifier >> 20u) & 0x1u) != 0u;
@@ -1686,7 +1687,8 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
-		case 233u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 233u:
+		case 234u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		default: break;
@@ -1721,7 +1723,8 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
-		case 233u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
+		case 233u:
+		case 234u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
 		case 249u: DecodeVop1Sdwa(pc, code, word_index, opcode, vdst, inst); return;
 		case 250u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
 		default: break;
