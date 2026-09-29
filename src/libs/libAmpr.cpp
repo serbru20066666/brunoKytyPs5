@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #ifdef min
@@ -724,41 +725,38 @@ struct CommandBufferState {
 	bool     header_validated = false;
 	bool     buffer_validated = false;
 	struct ReadFileCommand {
-		uint64_t record_offset = 0;
-		uint32_t file_id       = 0;
-		uint64_t destination   = 0;
-		uint64_t size          = 0;
-		uint64_t file_offset   = 0;
+		uint32_t file_id     = 0;
+		uint64_t destination = 0;
+		uint64_t size        = 0;
+		uint64_t file_offset = 0;
 	};
 	struct KernelEventCommand {
-		uint64_t record_offset = 0;
-		uint64_t eq            = 0;
-		int32_t  id            = 0;
-		uint64_t data          = 0;
+		uint64_t eq   = 0;
+		int32_t  id   = 0;
+		uint64_t data = 0;
 	};
 	struct WriteAddressCommand {
-		uint64_t record_offset = 0;
-		uint64_t address       = 0;
-		uint64_t value         = 0;
+		uint64_t address = 0;
+		uint64_t value   = 0;
 	};
 	struct AmmMapCommand {
-		uint64_t       record_offset = 0;
-		AmmCommandKind kind          = AmmCommandKind::MapAuto;
-		uint64_t       va            = 0;
-		uint64_t       dmem_offset   = 0;
-		uint64_t       size          = 0;
-		int32_t        type          = 0;
-		int32_t        prot          = 0;
-		uint8_t        gpu_mask_id   = 0;
+		AmmCommandKind kind        = AmmCommandKind::MapAuto;
+		uint64_t       va          = 0;
+		uint64_t       dmem_offset = 0;
+		uint64_t       size        = 0;
+		int32_t        type        = 0;
+		int32_t        prot        = 0;
+		uint8_t        gpu_mask_id = 0;
 	};
-	std::vector<ReadFileCommand>     read_file_commands;
-	std::vector<KernelEventCommand>  kernel_event_commands;
-	std::vector<WriteAddressCommand> write_address_commands;
-	std::vector<AmmMapCommand>       amm_map_commands;
-	bool                             gather_scatter_valid       = false;
-	uint32_t                         gather_scatter_file_id     = 0;
-	uint64_t                         gather_scatter_destination = 0;
-	uint64_t                         gather_scatter_file_offset = 0;
+	struct Command {
+		uint64_t record_offset;
+		std::variant<ReadFileCommand, KernelEventCommand, WriteAddressCommand, AmmMapCommand> data;
+	};
+	std::vector<Command> commands;
+	bool                 gather_scatter_valid       = false;
+	uint32_t             gather_scatter_file_id     = 0;
+	uint64_t             gather_scatter_destination = 0;
+	uint64_t             gather_scatter_file_offset = 0;
 };
 
 struct AmmUsageStatsData {
@@ -775,11 +773,6 @@ static std::mutex                                       g_command_buffer_mutex;
 static std::unordered_map<uint64_t, CommandBufferState> g_command_buffers;
 static std::unordered_map<uint64_t, uint64_t>           g_command_buffer_aliases;
 using CommandBufferIterator = std::unordered_map<uint64_t, CommandBufferState>::iterator;
-
-static bool HasQueuedCommands(const CommandBufferState& state) {
-	return !state.read_file_commands.empty() || !state.kernel_event_commands.empty() ||
-	       !state.write_address_commands.empty() || !state.amm_map_commands.empty();
-}
 
 static void RegisterCommandBufferAliasLocked(uint64_t command_buffer, uint64_t buffer) {
 	for (auto it = g_command_buffer_aliases.begin(); it != g_command_buffer_aliases.end();) {
@@ -969,7 +962,7 @@ static bool UpdateCommandBufferTypeFlags(uint64_t command_buffer, uint32_t set_b
 static std::unordered_map<uint64_t, CommandBufferState>::iterator
 ResolveCommandBufferStateLocked(uint64_t command_buffer) {
 	auto it = g_command_buffers.find(command_buffer);
-	if (it != g_command_buffers.end() && HasQueuedCommands(it->second)) {
+	if (it != g_command_buffers.end() && !it->second.commands.empty()) {
 		return it;
 	}
 
@@ -1018,10 +1011,7 @@ static bool WriteCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
 	state.write_offset     = write_offset;
 	state.header_validated = true;
 	state.buffer_validated = false;
-	state.read_file_commands.clear();
-	state.kernel_event_commands.clear();
-	state.write_address_commands.clear();
-	state.amm_map_commands.clear();
+	state.commands.clear();
 	state.gather_scatter_valid       = false;
 	state.gather_scatter_file_id     = 0;
 	state.gather_scatter_destination = 0;
@@ -1126,7 +1116,8 @@ static bool AppendReadFileRecord(uint64_t command_buffer, uint8_t opcode, uint32
 	std::memset(reinterpret_cast<void*>(state.buffer + record_offset), 0,
 	            static_cast<size_t>(record_size));
 	std::memcpy(reinterpret_cast<void*>(state.buffer + record_offset), &opcode, sizeof(opcode));
-	state.read_file_commands.push_back({record_offset, file_id, destination, size, file_offset});
+	state.commands.push_back({record_offset, CommandBufferState::ReadFileCommand {
+	                                             file_id, destination, size, file_offset}});
 	if (!CommitCommandBufferRecord(command_buffer, &state, record_size)) {
 		return false;
 	}
@@ -1164,7 +1155,8 @@ static bool AppendKernelEventRecord(uint64_t command_buffer, uint64_t eq, int32_
 	const auto record_offset = state.write_offset;
 	std::memcpy(reinterpret_cast<void*>(state.buffer + record_offset), record.data(),
 	            record.size());
-	state.kernel_event_commands.push_back({record_offset, eq, id, data});
+	state.commands.push_back(
+	    {record_offset, CommandBufferState::KernelEventCommand {eq, id, data}});
 	return CommitCommandBufferRecord(command_buffer, &state, KERNEL_EVENT_RECORD_SIZE);
 }
 
@@ -1184,7 +1176,8 @@ static bool AppendWriteAddressRecord(uint64_t command_buffer, uint64_t address, 
 	const auto record_offset = state.write_offset;
 	std::memset(reinterpret_cast<void*>(state.buffer + record_offset), 0,
 	            static_cast<size_t>(record_size));
-	state.write_address_commands.push_back({record_offset, address, value});
+	state.commands.push_back(
+	    {record_offset, CommandBufferState::WriteAddressCommand {address, value}});
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
@@ -1258,11 +1251,9 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 		return false;
 	}
 
-	auto record          = cmd;
-	record.record_offset = state.write_offset;
 	auto* record_addr    = reinterpret_cast<void*>(state.buffer + state.write_offset);
 	std::memset(record_addr, 0, static_cast<size_t>(record_size));
-	state.amm_map_commands.push_back(record);
+	state.commands.push_back({state.write_offset, cmd});
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
@@ -1368,124 +1359,79 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	enum class CommandKind {
-		ReadFile,
-		KernelEvent,
-		WriteAddress,
-		AmmMap,
-	};
-
-	struct OrderedCommand {
-		uint64_t    record_offset = 0;
-		CommandKind kind          = CommandKind::ReadFile;
-		size_t      index         = 0;
-	};
-
-	std::vector<OrderedCommand> ordered;
-	ordered.reserve(state.read_file_commands.size() + state.kernel_event_commands.size() +
-	                state.write_address_commands.size() + state.amm_map_commands.size());
-	for (size_t i = 0; i < state.read_file_commands.size(); i++) {
-		if (state.read_file_commands[i].record_offset < state.write_offset) {
-			ordered.push_back(
-			    {state.read_file_commands[i].record_offset, CommandKind::ReadFile, i});
+	for (const auto& entry: state.commands) {
+		if (entry.record_offset >= state.write_offset) {
+			break;
 		}
-	}
-	for (size_t i = 0; i < state.kernel_event_commands.size(); i++) {
-		if (state.kernel_event_commands[i].record_offset < state.write_offset) {
-			ordered.push_back(
-			    {state.kernel_event_commands[i].record_offset, CommandKind::KernelEvent, i});
-		}
-	}
-	for (size_t i = 0; i < state.write_address_commands.size(); i++) {
-		if (state.write_address_commands[i].record_offset < state.write_offset) {
-			ordered.push_back(
-			    {state.write_address_commands[i].record_offset, CommandKind::WriteAddress, i});
-		}
-	}
-	for (size_t i = 0; i < state.amm_map_commands.size(); i++) {
-		if (state.amm_map_commands[i].record_offset < state.write_offset) {
-			ordered.push_back({state.amm_map_commands[i].record_offset, CommandKind::AmmMap, i});
-		}
-	}
+		if (const auto* payload = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
+			const auto& command = *payload;
+			std::string host_path;
+			if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
+				LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", command.file_id);
+				*execution_result = LibKernel::KERNEL_ERROR_ENOENT;
+				*error_offset     = static_cast<uint32_t>(entry.record_offset);
+				return OK;
+			}
 
-	std::sort(ordered.begin(), ordered.end(), [](const OrderedCommand& a, const OrderedCommand& b) {
-		return a.record_offset < b.record_offset;
-	});
+			uint64_t bytes_read = 0;
+			auto result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
+			                                  command.size, &bytes_read);
+			DebugAprRead(host_path, command.file_offset, command.size, command.destination,
+			             bytes_read, result);
+			if (result != OK) {
+				LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
+				     ", path=%s\n",
+				     command.file_id, static_cast<uint32_t>(result), host_path.c_str());
+				*execution_result = result;
+				*error_offset     = static_cast<uint32_t>(entry.record_offset);
+				return OK;
+			}
+		} else if (const auto* payload =
+		               std::get_if<CommandBufferState::KernelEventCommand>(&entry.data)) {
+			const auto& command = *payload;
+			const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
+			auto        result  = LibKernel::EventQueue::KernelTriggerUserEvent(
+			    eq, command.id, reinterpret_cast<void*>(command.data));
+			if (result != OK) {
+				LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
+				     ", result=0x%08" PRIx32 "\n",
+				     command.eq, command.id, static_cast<uint32_t>(result));
+				*execution_result = result;
+				*error_offset     = static_cast<uint32_t>(entry.record_offset);
+				return OK;
+			}
+		} else if (const auto* payload =
+		               std::get_if<CommandBufferState::WriteAddressCommand>(&entry.data)) {
+			const auto& command = *payload;
+			if (!AprShared::WriteGuest(command.address, command.value)) {
+				LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
+				     " value=0x%016" PRIx64 "\n",
+				     command.address, command.value);
+				*execution_result = LibKernel::KERNEL_ERROR_EFAULT;
+				*error_offset     = static_cast<uint32_t>(entry.record_offset);
+				return OK;
+			}
+		} else if (const auto* payload =
+		               std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
+			const auto& command = *payload;
+			int         result  = OK;
+			if (command.kind == AmmCommandKind::Unmap) {
+				result = LibKernel::Memory::KernelMunmap(command.va, command.size);
+			} else {
+				result = ExecuteAmmMapCommand(command);
+			}
 
-	for (const auto& entry: ordered) {
-		switch (entry.kind) {
-			case CommandKind::ReadFile: {
-				const auto& command = state.read_file_commands[entry.index];
-				std::string host_path;
-				if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
-					LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n",
-					     command.file_id);
-					*execution_result = LibKernel::KERNEL_ERROR_ENOENT;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return OK;
-				}
-
-				uint64_t bytes_read = 0;
-				auto result = ReadHostFileToGuest(host_path, command.file_offset,
-				                                  command.destination, command.size, &bytes_read);
-				DebugAprRead(host_path, command.file_offset, command.size, command.destination,
-				             bytes_read, result);
-				if (result != OK) {
-					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
-					     ", path=%s\n",
-					     command.file_id, static_cast<uint32_t>(result), host_path.c_str());
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return OK;
-				}
-				NoteRepeatedRead(command.file_id, command.file_offset, bytes_read);
-			} break;
-			case CommandKind::KernelEvent: {
-				const auto& command = state.kernel_event_commands[entry.index];
-				const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
-				auto        result  = LibKernel::EventQueue::KernelTriggerUserEvent(
-				    eq, command.id, reinterpret_cast<void*>(command.data));
-				if (result != OK) {
-					LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
-					     ", result=0x%08" PRIx32 "\n",
-					     command.eq, command.id, static_cast<uint32_t>(result));
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return OK;
-				}
-			} break;
-			case CommandKind::WriteAddress: {
-				const auto& command = state.write_address_commands[entry.index];
-				if (!AprShared::WriteGuest(command.address, command.value)) {
-					LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
-					     " value=0x%016" PRIx64 "\n",
-					     command.address, command.value);
-					*execution_result = LibKernel::KERNEL_ERROR_EFAULT;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return OK;
-				}
-			} break;
-			case CommandKind::AmmMap: {
-				const auto& command = state.amm_map_commands[entry.index];
-				int         result  = OK;
-				if (command.kind == AmmCommandKind::Unmap) {
-					result = LibKernel::Memory::KernelMunmap(command.va, command.size);
-				} else {
-					result = ExecuteAmmMapCommand(command);
-				}
-
-				if (result != OK) {
-					LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64
-					     " dmem=0x%016" PRIx64 " size=0x%016" PRIx64 " type=%" PRId32
-					     " prot=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",
-					     static_cast<uint32_t>(command.kind), command.va, command.dmem_offset,
-					     command.size, command.type, static_cast<uint32_t>(command.prot),
-					     static_cast<uint32_t>(result));
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return OK;
-				}
-			} break;
+			if (result != OK) {
+				LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64 " dmem=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " type=%" PRId32 " prot=0x%08" PRIx32
+				     " result=0x%08" PRIx32 "\n",
+				     static_cast<uint32_t>(command.kind), command.va, command.dmem_offset,
+				     command.size, command.type, static_cast<uint32_t>(command.prot),
+				     static_cast<uint32_t>(result));
+				*execution_result = result;
+				*error_offset     = static_cast<uint32_t>(entry.record_offset);
+				return OK;
+			}
 		}
 	}
 
