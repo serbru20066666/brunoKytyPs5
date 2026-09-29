@@ -4775,54 +4775,56 @@ public:
                   partial_unmap_survivor_value,
               "partial invalidation lost disjoint native bytes");
 
-      constexpr uint64_t large_offset = 0x10000;
-      constexpr uint64_t large_size = 64ull << 20;
-      constexpr uint32_t large_value = 0x5aa55aa5u;
-      constexpr uint32_t large_stale = 0x12345678u;
-      std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
-      std::memcpy(memory + large_offset + large_size - sizeof(large_stale),
-                  &large_stale, sizeof(large_stale));
-      auto large_allocation =
-          cache.ObtainBuffer(base + large_offset, large_size, true, false);
-      Require(name, "near-capacity dirty allocation",
-              large_allocation.first != nullptr,
-              "failed to allocate the near-capacity dirty native buffer");
-      cache.FillBuffer(base + large_offset, large_size, large_value, false);
-      const auto large_submission_tick = scheduler.CurrentTick();
-      for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+      for (const uint64_t large_size : {64ull << 20, 68ull << 20}) {
+        constexpr uint64_t large_offset = 0x10000;
+        const uint32_t large_value =
+            large_size == (64ull << 20) ? 0x5aa55aa5u : 0xa55aa55au;
+        constexpr uint32_t large_stale = 0x12345678u;
+        std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
+        std::memcpy(memory + large_offset + large_size - sizeof(large_stale),
+                    &large_stale, sizeof(large_stale));
+        auto large_allocation =
+            cache.ObtainBuffer(base + large_offset, large_size, true, false);
+        Require(name, "large dirty allocation",
+                large_allocation.first != nullptr,
+                "failed to allocate the large dirty native buffer");
+        cache.FillBuffer(base + large_offset, large_size, large_value, false);
+        const auto large_submission_tick = scheduler.CurrentTick();
+        for (uint32_t tick = 0; tick <= 160; tick++) {
+          cache.RunGarbageCollector();
+        }
+        // The capacity-sized case can wrap the ring; the oversized case must
+        // keep its separate staging allocation alive through publication.
+        Require(name, "large synchronized retirement",
+                !cache.IsRegionRegistered(base + large_offset, large_size) &&
+                    scheduler.CurrentTick() > large_submission_tick &&
+                    scheduler.CurrentTick() <= large_submission_tick + 2,
+                "large dirty Buffer exceeded the GC synchronization budget");
+        uint32_t large_before_completion = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + large_offset,
+                                                &large_before_completion,
+                                                sizeof(large_before_completion));
+        Require(name, "large backing publication",
+                large_before_completion == large_value,
+                "large Buffer GC retired ownership before publication");
+        const auto large_image_source =
+            cache.ObtainBufferForImage(base + large_offset, sizeof(large_value));
+        Require(name, "fixed download after Buffer retirement",
+                large_image_source.first != nullptr &&
+                    &BufferCacheTestAccess::DownloadBuffer(cache) ==
+                        fixed_download &&
+                    fixed_download->Handle() == fixed_download_handle &&
+                    fixed_download->Size() == (64ull << 20),
+                "image acquisition replaced the shared Buffer download stream");
+        std::vector<uint32_t> large_published(large_size / sizeof(uint32_t));
+        Require(name, "large Buffer publication contents",
+                Libs::LibKernel::Memory::TryReadBacking(
+                    base + large_offset, large_published.data(), large_size) &&
+                    std::ranges::all_of(large_published, [large_value](uint32_t value) {
+                      return value == large_value;
+                    }),
+                "large Buffer GC did not publish its complete transfer");
       }
-      // Earlier dirty owners in this GC pass may require one ring-wrap drain
-      // before the full-capacity download can reserve the stream.
-      Require(name, "near-capacity synchronized retirement",
-              !cache.IsRegionRegistered(base + large_offset, large_size) &&
-                  scheduler.CurrentTick() > large_submission_tick &&
-                  scheduler.CurrentTick() <= large_submission_tick + 2,
-              "capacity-sized dirty Buffer exceeded one ring-wrap drain");
-      uint32_t large_before_completion = 0;
-      Libs::LibKernel::Memory::TryReadBacking(base + large_offset,
-                                              &large_before_completion,
-                                              sizeof(large_before_completion));
-      Require(name, "near-capacity backing publication",
-              large_before_completion == large_value,
-              "near-capacity Buffer GC retired ownership before publication");
-      const auto large_image_source =
-          cache.ObtainBufferForImage(base + large_offset, sizeof(large_value));
-      Require(name, "fixed download after Buffer retirement",
-              large_image_source.first != nullptr &&
-                  &BufferCacheTestAccess::DownloadBuffer(cache) ==
-                      fixed_download &&
-                  fixed_download->Handle() == fixed_download_handle &&
-                  fixed_download->Size() == (64ull << 20),
-              "image acquisition replaced the shared Buffer download stream");
-      std::vector<uint32_t> large_published(large_size / sizeof(uint32_t));
-      Require(name, "near-capacity Buffer publication contents",
-              Libs::LibKernel::Memory::TryReadBacking(
-                  base + large_offset, large_published.data(), large_size) &&
-                  std::ranges::all_of(large_published, [](uint32_t value) {
-                    return value == large_value;
-                  }),
-              "near-capacity Buffer GC did not publish its complete transfer");
 
       constexpr uint64_t grouped_first_offset = 0x10000;
       constexpr uint64_t grouped_second_offset = 0x2300000;
