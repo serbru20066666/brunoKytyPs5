@@ -477,13 +477,21 @@ void TestSparseBackingReadPreservesResidency() {
 	                      [](uint8_t value) { return value == 0; }),
 	      "sparse backing read did not preserve resident data between reserved gaps");
 	Check(test,
-	      !Libs::LibKernel::Memory::TryReadSparseBacking(
-	          base + SceKernelMemoryPoolReserveLen - commit_size, bytes.data(), commit_size * 2),
-	      "sparse backing read crossed the owned reservation");
+	      Libs::LibKernel::Memory::TryReadSparseBacking(
+	          base + SceKernelMemoryPoolReserveLen - commit_size, bytes.data(), commit_size * 2) &&
+	          std::all_of(bytes.begin(), bytes.begin() + commit_size * 2,
+	                      [](uint8_t value) { return value == 0; }),
+	      "sparse backing read rejected unbacked guest address space beyond a reservation");
 
-	constexpr uint64_t unowned = 0x5000000000ull;
+	constexpr uint64_t unowned = 0x10000;
 	Check(test, !Libs::LibKernel::Memory::TryReadSparseBacking(unowned, bytes.data(), commit_size),
 	      "sparse backing read accepted an unowned virtual range");
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadSparseBacking(
+	          Libs::LibKernel::Memory::kExtendedMemoryBase +
+	              Libs::LibKernel::Memory::kExtendedMemorySize - commit_size,
+	          bytes.data(), commit_size * 2),
+	      "sparse backing read crossed the owned guest address space");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, commit_size, 0),
 	        "KernelMemoryPoolDecommit(first)");
@@ -511,12 +519,7 @@ void TestSparseReadDuringDirectCommit() {
 	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, chunk_size,
 	            SceKernelMtypeC, &physical),
 	        "KernelAllocateDirectMemory");
-	void* arena = reinterpret_cast<void*>(0x80180000000ull);
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	            &arena, size, SceKernelMapFixed | SceKernelMapNoOverwrite, size),
-	        "KernelReserveVirtualRange");
-	const auto base = reinterpret_cast<uint64_t>(arena);
+	constexpr uint64_t base = 0x80180000000ull;
 	const auto map_chunk = [&](uint64_t index) {
 		void* address = reinterpret_cast<void*>(base + index * chunk_size);
 		return Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
@@ -529,6 +532,8 @@ void TestSparseReadDuringDirectCommit() {
 	std::memset(reinterpret_cast<void*>(base + (chunks - 1) * chunk_size), 0xa7, chunk_size);
 
 	std::vector<uint8_t> bytes(size, 0x5a);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), size),
+	      "dense backing read accepted unbacked guest address space");
 	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size),
 	      "sparse read rejected a partly committed direct mapping");
 	Check(test, bytes.front() == 0x3c && bytes[chunk_size] == 0 && bytes.back() == 0xa7,
@@ -536,7 +541,7 @@ void TestSparseReadDuringDirectCommit() {
 	Libs::LibKernel::Memory::TestFailNextVirtualRangeReplacement();
 	CheckFailed(test, map_chunk(1), "KernelMapNamedDirectMemory(injected replacement failure)");
 	ExpectRange(test, Query(test, base + chunk_size), base + chunk_size,
-	            base + (chunks - 1) * chunk_size, 0, 0, 0, 0, 0, "anon");
+	            base + chunk_size * 2, 0, 0, 0, 0, 0, "anon");
 	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base + chunk_size, bytes.data(),
 	                                                    chunk_size) &&
 	                Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size) &&
@@ -1112,6 +1117,10 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 2),
 	      "runtime allocation is outside the owner");
 	*reinterpret_cast<uint64_t*>(base) = 0x52554e54494d454full; // "RUNTIMEO"
+	uint64_t snapshot = UINT64_MAX;
+	Check(test, !Libs::LibKernel::Memory::TryReadSparseBacking(base, &snapshot, sizeof(snapshot)) &&
+	                snapshot == UINT64_MAX,
+	      "sparse backing read replaced private committed data with zeros");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestMemory(base, SceKernelPageSize,
 	                                                  Common::VirtualMemory::Mode::Read),
@@ -1120,6 +1129,9 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	      "runtime free failed");
 	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize * 2),
 	      "runtime free did not restore the owner placeholder");
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, &snapshot, sizeof(snapshot)) &&
+	                snapshot == 0,
+	      "sparse backing read rejected freed guest-owned memory");
 
 	const auto reused = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::ReadWrite, "runtime_reuse", true);

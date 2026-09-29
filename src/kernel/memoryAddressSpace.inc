@@ -223,13 +223,13 @@ public:
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
 			const auto  offset = entry.backing_offset + start - entry.vaddr;
 			if (cursor < start) {
-				std::memset(destination + cursor - vaddr, 0, start - cursor);
+				std::memset(destination + (cursor - vaddr), 0, start - cursor);
 			}
-			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+			std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
 			cursor = start + bytes;
 		}
 		if (cursor < end) {
-			std::memset(destination + cursor - vaddr, 0, end - cursor);
+			std::memset(destination + (cursor - vaddr), 0, end - cursor);
 		}
 		return true;
 	}
@@ -812,6 +812,20 @@ public:
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		auto            mapping = m_mapped.upper_bound(vaddr);
+		if (mapping != m_mapped.begin()) {
+			--mapping;
+		}
+		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
+			const auto& region = mapping->second;
+			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+				return false;
+			}
+		}
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
