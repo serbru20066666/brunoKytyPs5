@@ -419,11 +419,11 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestPrtBackingReadPreservesSparseResidency() {
-	const char*        test         = "PrtBackingReadPreservesSparseResidency";
-	constexpr uint64_t commit_size  = SceKernelMemoryPoolCommitLen;
-	constexpr uint64_t aperture_len = commit_size * 3;
-	int64_t            pool_offset  = -1;
+void TestSparseBackingReadPreservesResidency() {
+	const char*        test        = "SparseBackingReadPreservesResidency";
+	constexpr uint64_t commit_size = SceKernelMemoryPoolCommitLen;
+	constexpr uint64_t sparse_size = commit_size * 3;
+	int64_t            pool_offset = -1;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMemoryPoolExpand(
 	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), commit_size * 2,
@@ -449,15 +449,13 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	std::memset(reinterpret_cast<void*>(base), 0x3c, commit_size);
 	std::memset(reinterpret_cast<void*>(base + commit_size * 2), 0xa7, commit_size);
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, aperture_len),
-	        "KernelSetPrtAperture");
-	std::vector<uint8_t> bytes(aperture_len, 0x5a);
+	std::vector<uint8_t> bytes(sparse_size, 0x5a);
 	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
 	      "dense backing read accepted a nonresident span");
 	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0x5a; }),
 	      "failed dense backing read modified its destination");
-	Check(test, Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), bytes.size()),
-	      "PRT backing read rejected a valid sparse aperture range");
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), bytes.size()),
+	      "sparse backing read rejected a partly committed memory pool");
 	Check(test,
 	      std::all_of(bytes.begin(), bytes.begin() + commit_size,
 	                  [](uint8_t value) { return value == 0x3c; }) &&
@@ -465,22 +463,27 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	                      [](uint8_t value) { return value == 0; }) &&
 	          std::all_of(bytes.begin() + commit_size * 2, bytes.end(),
 	                      [](uint8_t value) { return value == 0xa7; }),
-	      "PRT backing read did not copy resident pages and zero nonresident pages");
+	      "sparse backing read did not copy resident pages and zero nonresident pages");
+	std::fill(bytes.begin(), bytes.end(), 0x5a);
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base + commit_size, bytes.data(),
+	                                                        bytes.size()),
+	      "sparse backing read rejected leading and trailing reservations");
 	Check(test,
-	      !Libs::LibKernel::Memory::TryReadPrtBacking(base + commit_size * 2, bytes.data(),
-	                                                  commit_size * 2),
-	      "PRT backing read crossed the registered aperture");
+	      std::all_of(bytes.begin(), bytes.begin() + commit_size,
+	                  [](uint8_t value) { return value == 0; }) &&
+	          std::all_of(bytes.begin() + commit_size, bytes.begin() + commit_size * 2,
+	                      [](uint8_t value) { return value == 0xa7; }) &&
+	          std::all_of(bytes.begin() + commit_size * 2, bytes.end(),
+	                      [](uint8_t value) { return value == 0; }),
+	      "sparse backing read did not preserve resident data between reserved gaps");
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadSparseBacking(
+	          base + SceKernelMemoryPoolReserveLen - commit_size, bytes.data(), commit_size * 2),
+	      "sparse backing read crossed the owned reservation");
 
-	constexpr uint64_t unowned_prt = 0x5000000000ull;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelSetPrtAperture(
-	            2, reinterpret_cast<void*>(unowned_prt), commit_size),
-	        "KernelSetPrtAperture(unowned)");
-	Check(test,
-	      !Libs::LibKernel::Memory::TryReadPrtBacking(unowned_prt, bytes.data(), commit_size),
-	      "PRT backing read accepted an unowned virtual range");
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
-	        "KernelSetPrtAperture(clear)");
+	constexpr uint64_t unowned = 0x5000000000ull;
+	Check(test, !Libs::LibKernel::Memory::TryReadSparseBacking(unowned, bytes.data(), commit_size),
+	      "sparse backing read accepted an unowned virtual range");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, commit_size, 0),
 	        "KernelMemoryPoolDecommit(first)");
@@ -497,8 +500,8 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestPrtReadDuringDirectCommit() {
-	const char*        test       = "PrtReadDuringDirectCommit";
+void TestSparseReadDuringDirectCommit() {
+	const char*        test       = "SparseReadDuringDirectCommit";
 	constexpr uint64_t chunk_size = SceKernelMemoryPoolCommitLen;
 	constexpr uint64_t chunks     = 32;
 	constexpr uint64_t size       = chunk_size * chunks;
@@ -508,17 +511,17 @@ void TestPrtReadDuringDirectCommit() {
 	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, chunk_size,
 	            SceKernelMtypeC, &physical),
 	        "KernelAllocateDirectMemory");
-	void* arena = reinterpret_cast<void*>(0x1000000000ull);
-	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&arena, size, 0, size),
+	void* arena = reinterpret_cast<void*>(0x80180000000ull);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &arena, size, SceKernelMapFixed | SceKernelMapNoOverwrite, size),
 	        "KernelReserveVirtualRange");
 	const auto base = reinterpret_cast<uint64_t>(arena);
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, size),
-	        "KernelSetPrtAperture");
 	const auto map_chunk = [&](uint64_t index) {
 		void* address = reinterpret_cast<void*>(base + index * chunk_size);
 		return Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
 		    &address, chunk_size, SceKernelProtCpuRw, SceKernelMapFixed,
-		    physical + static_cast<int64_t>(index * chunk_size), chunk_size, "prt_direct");
+		    physical + static_cast<int64_t>(index * chunk_size), chunk_size, "sparse_direct");
 	};
 	CheckOk(test, map_chunk(0), "KernelMapNamedDirectMemory(first)");
 	CheckOk(test, map_chunk(chunks - 1), "KernelMapNamedDirectMemory(last)");
@@ -526,17 +529,17 @@ void TestPrtReadDuringDirectCommit() {
 	std::memset(reinterpret_cast<void*>(base + (chunks - 1) * chunk_size), 0xa7, chunk_size);
 
 	std::vector<uint8_t> bytes(size, 0x5a);
-	Check(test, Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), size),
-	      "PRT read rejected a partly committed direct mapping");
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size),
+	      "sparse read rejected a partly committed direct mapping");
 	Check(test, bytes.front() == 0x3c && bytes[chunk_size] == 0 && bytes.back() == 0xa7,
-	      "PRT read lost resident bytes or sparse zeros");
+	      "sparse read lost resident bytes or sparse zeros");
 	Libs::LibKernel::Memory::TestFailNextVirtualRangeReplacement();
 	CheckFailed(test, map_chunk(1), "KernelMapNamedDirectMemory(injected replacement failure)");
 	ExpectRange(test, Query(test, base + chunk_size), base + chunk_size,
 	            base + (chunks - 1) * chunk_size, 0, 0, 0, 0, 0, "anon");
 	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base + chunk_size, bytes.data(),
 	                                                    chunk_size) &&
-	                Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), size) &&
+	                Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size) &&
 	                bytes[chunk_size] == 0,
 	      "failed direct publication did not restore sparse reservation and backing");
 
@@ -548,7 +551,7 @@ void TestPrtReadDuringDirectCommit() {
 		std::vector<uint8_t> snapshot(size);
 		started.store(true, std::memory_order_release);
 		while (!stop.load(std::memory_order_acquire)) {
-			if (!Libs::LibKernel::Memory::TryReadPrtBacking(base, snapshot.data(), size) ||
+			if (!Libs::LibKernel::Memory::TryReadSparseBacking(base, snapshot.data(), size) ||
 			    snapshot.front() != 0x3c || snapshot.back() != 0xa7) {
 				read_failed.store(true, std::memory_order_relaxed);
 			}
@@ -568,15 +571,13 @@ void TestPrtReadDuringDirectCommit() {
 	stop.store(true, std::memory_order_release);
 	reader.join();
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
-	        "KernelSetPrtAperture(clear)");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size),
 	        "KernelReleaseDirectMemory");
 	CheckOk(test, map_result, "KernelMapNamedDirectMemory(middle)");
 	Check(test, reads.load(std::memory_order_relaxed) != 0 &&
 	                !read_failed.load(std::memory_order_relaxed),
-	      "PRT read observed a gap while direct backing was committed");
+	      "sparse read observed a gap while direct backing was committed");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4258,8 +4259,8 @@ int main(int argc, char** argv) {
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
-	RunTest(TestPrtBackingReadPreservesSparseResidency);
-	RunTest(TestPrtReadDuringDirectCommit);
+	RunTest(TestSparseBackingReadPreservesResidency);
+	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);

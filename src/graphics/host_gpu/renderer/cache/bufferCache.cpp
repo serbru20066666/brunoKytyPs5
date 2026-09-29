@@ -981,8 +981,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	    Libs::LibKernel::Memory::BackingContains(vaddr, size) &&
 	    GuestCopies::HandOver(m_scheduler.Current().Handle(), staging, vaddr, size);
 	if (!deferred &&
-	    (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                            !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)))) {
+	    (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size))) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();
