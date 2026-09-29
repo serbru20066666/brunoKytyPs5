@@ -1520,8 +1520,11 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		return OK;
 	}
 
-	std::vector<uint8_t> buffer(
-	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
+	static thread_local std::vector<uint8_t> buffer;
+	const auto buffer_size = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
+	if (buffer.size() < buffer_size) {
+		buffer.resize(buffer_size);
+	}
 	while (*bytes_read < readable) {
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
