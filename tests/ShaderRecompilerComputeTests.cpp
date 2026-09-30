@@ -24907,6 +24907,158 @@ TestCase VectorVopcCmpxLtU16CapturedSdwaExecMask() {
   return test;
 }
 
+TestCase VectorVopcCmpxLtI16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+  enum Encoding { Captured, Compact, Vop3, HighLhs, HighRhs, SdwaOperands };
+  struct CompareCase {
+    u32 lhs;
+    u32 rhs;
+    u32 expected_exec;
+    Encoding encoding = Captured;
+    u32 incoming_exec = 1;
+    u32 src0_sel = 6;
+    u32 src1_sel = 6;
+    u32 src0_sext = 0;
+    u32 src1_sext = 0;
+  };
+  const std::array<CompareCase, 30> cases{{
+      {0xffff000eu, 15u, 1}, // Ignore the high half: 14 < 15.
+      {0x8000000fu, 15u, 0}, // Equality is false despite a negative high half.
+      {0x00000010u, 15u, 0},
+      {0x7fff0000u, 15u, 1},
+      {0x0000ffffu, 15u, 1}, // Signed -1, not unsigned 65535.
+      {0x00008000u, 15u, 1}, // Minimum signed halfword.
+      {0x00007fffu, 15u, 0}, // Maximum signed halfword.
+      {0x0000fff0u, 15u, 1},
+      {0x0000ffffu, 15u, 0, Captured, 0}, // Cannot reactivate an inactive lane.
+      {0xffff000fu, 15u, 0, Captured, 0},
+      {0x1234ffffu, 0xabcd0000u, 1, Compact}, // -1 < 0.
+      {0xffff0000u, 0x0000ffffu, 0, Compact}, // 0 < -1 is false.
+      {0xabcd8000u, 0x12347fffu, 1, Vop3},
+      {0x12347fffu, 0xabcd8000u, 0, Vop3},
+      {0xffff0010u, 15u, 1, HighLhs}, // Select -1 in WORD_1.
+      {0x0010ffffu, 15u, 0, HighLhs}, // Select 16, not the negative low half.
+      {0x1234fffeu, 0xffff8000u, 1, HighRhs}, // -2 < selected -1.
+      {0x1234ffffu, 0xabcd0000u, 1, SdwaOperands, 1, 4, 4, 1, 1},
+      {0x12345680u, 0u, 1, SdwaOperands, 1, 0, 6, 1, 0}, // BYTE_0 SEXT: -128.
+      {0x1234567fu, 0u, 0, SdwaOperands, 1, 0, 6, 1, 0}, // +127.
+      {0x12345680u, 0u, 0, SdwaOperands, 1, 0, 6, 0, 0}, // Without SEXT: +128.
+      {0x12348000u, 0u, 1, SdwaOperands, 1, 1, 6, 1, 0},
+      {0x12803456u, 0u, 1, SdwaOperands, 1, 2, 6, 1, 0},
+      {0x80345678u, 0u, 1, SdwaOperands, 1, 3, 6, 1, 0},
+      {0x0000ffffu, 0x12345680u, 0, SdwaOperands, 1, 6, 0, 0, 1}, // -1 < -128 is false.
+      {0x0000ff7fu, 0x12345680u, 1, SdwaOperands, 1, 6, 0, 0, 1}, // -129 < -128.
+      {0x0000ffffu, 0x12347f00u, 1, SdwaOperands, 1, 6, 1, 0, 1},
+      {0u, 0x12803456u, 0, SdwaOperands, 1, 6, 2, 0, 1},
+      {0u, 0x80345678u, 0, SdwaOperands, 1, 6, 3, 0, 1},
+      {0xff000001u, 0x000100ffu, 1, SdwaOperands, 1, 3, 2, 1, 1},
+  }};
+  constexpr u32 vcc_lo = 0x76543210u;
+  constexpr u32 vcc_hi = 0x89abcdefu;
+  TestCase test;
+  test.name = "VectorVopcCmpxLtI16CapturedSdwaExecMask";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.lhs);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 1, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 2, entry.rhs);
+    AppendSMovLiteral(&code, 106, vcc_lo);
+    AppendSMovLiteral(&code, 107, vcc_hi);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.incoming_exec)));
+    switch (entry.encoding) {
+    case Compact: code.push_back(0x7d320501u); break;
+    case Vop3: code.insert(code.end(), {0xd499007eu, 0x00020501u}); break;
+    case HighLhs: code.insert(code.end(), {0x7d331ef9u, 0x86050001u}); break;
+    case HighRhs:
+      code.push_back(EncodeVopc(0x99u, 249u, 2u));
+      code.push_back(EncodeVopcSdwa(1u, 0u, 0u, 6u, 5u));
+      break;
+    case SdwaOperands:
+      code.push_back(EncodeVopc(0x99u, 249u, 2u));
+      code.push_back(EncodeVopcSdwa(1u, 0u, 0u, entry.src0_sel, entry.src1_sel,
+                                  entry.src0_sext, entry.src1_sext));
+      break;
+    default: code.insert(code.end(), {0x7d331ef9u, 0x86060001u}); break;
+    }
+    code.push_back(EncodeSMovB32(20, 126)); // Snapshot EXEC before restoring it.
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = static_cast<u32>(cases.size()) + i * 4u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgprPair(&code, 106, out + 2u); // CMPX preserves both VCC halves.
+    test.expected.insert(test.expected.end(),
+                         {entry.expected_exec, 0u, vcc_lo, vcc_hi});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_LT_I16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMPX_LT_I16", cases.size()}};
+  test.required_spirv = {"OpSLessThan", "OpBitFieldSExtract"};
+  return test;
+}
+
+TestCase VectorVopcCmpxLtI16WaveMasks(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 marker = 0xfeedabcdu;
+  constexpr u32 vcc_lo = 0x01234567u;
+  constexpr u32 vcc_hi = 0x89abcdefu;
+  constexpr u32 expected_exec_lo = 0xaaaaaaaau;
+  const u32 expected_exec_hi = wave_size == 64u ? 0x33333333u : 0u;
+  TestCase test;
+  test.name = wave_size == 32u ? "VectorVopcCmpxLtI16Wave32Masks"
+                              : "VectorVopcCmpxLtI16Wave64Masks";
+  test.initial.assign(6u * wave_size, 0xdeadbeefu);
+  constexpr u32 inputs[] = {0xffff000eu, 0x0000ffffu, 0x8000000fu, 0x12348000u};
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.initial[lane] = inputs[lane % 4u];
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.expected[wave_size + lane] = expected_exec_lo;
+    test.expected[2u * wave_size + lane] = expected_exec_hi;
+    test.expected[3u * wave_size + lane] = vcc_lo;
+    test.expected[4u * wave_size + lane] = vcc_hi;
+    const u32 mask = lane < 32u ? expected_exec_lo : expected_exec_hi;
+    if ((mask & (1u << (lane % 32u))) != 0u) {
+      test.expected[5u * wave_size + lane] = marker;
+    }
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 30);
+  AppendVMovLiteral(&code, 4, marker);
+  code.push_back(EncodeSop1(0x04, 10, 126)); // Save the full incoming EXEC.
+  AppendSMovLiteral(&code, 106, vcc_lo);
+  AppendSMovLiteral(&code, 107, vcc_hi);
+  AppendSMovLiteral(&code, 126, 0xeeeeeeeeu);
+  AppendSMovLiteral(&code, 127, 0x77777777u);
+  code.insert(code.end(), {0x7d331ef9u, 0x86060001u});
+  code.push_back(EncodeSMovB32(20, 126));
+  code.push_back(EncodeSMovB32(21, 127));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 5u * wave_size);
+  code.push_back(EncodeSop1(0x04, 126, 10)); // Restore lanes to inspect the raw masks.
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 0, wave_size);
+  AppendStoreSgprAtLaneDwordOffset(&code, 21, 0, 2u * wave_size);
+  AppendStoreSgprAtLaneDwordOffset(&code, 106, 0, 3u * wave_size);
+  AppendStoreSgprAtLaneDwordOffset(&code, 107, 0, 4u * wave_size);
+  AppendEnd(&code);
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD, O::V_CMPX_LT_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpSLessThan", "OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
   using O = ShaderOpcode;
   struct CompareCase {
@@ -24914,9 +25066,9 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
     u32 rhs;
     u32 incoming_exec;
     u32 expected_exec;
-    u32 encoding = 0; // 0: SDWA, 1: compact, 2: VOP3, 3: SDWA sign-extend.
+    u32 encoding = 0; // SDWA, compact, VOP3, sign-extended words/bytes.
   };
-  const std::array<CompareCase, 12> cases{{
+  const std::array<CompareCase, 16> cases{{
       {0x12340000u, 0x56780000u, 1, 1}, // Equal low half; ignore high half.
       {0xffff0001u, 0xabcd0001u, 1, 1},
       {0x00000000u, 0x12340000u, 1, 1},
@@ -24929,6 +25081,10 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
       {0x00008000u, 0x0000ffffu, 1, 0, 2},
       {0x0001ffffu, 0x12340001u, 1, 0, 3}, // Sign-extended low halves differ.
       {0x00000001u, 0x00010001u, 0, 0}, // CMPX cannot reactivate an inactive lane.
+      {0x12345680u, 0x0000ff80u, 1, 1, 4}, // SEXT BYTE_0 is unsigned U16 0xff80.
+      {0x123456ffu, 0x0000ffffu, 1, 1, 4},
+      {0x0000ff80u, 0x12348000u, 1, 1, 5}, // SEXT BYTE_1 on src1.
+      {0x1234ffffu, 0x5678ffffu, 1, 1, 6}, // SEXT WORD_0 versus DWORD low half.
   }};
   constexpr u32 vcc_hi = 0x89abcdefu;
   TestCase test;
@@ -24952,6 +25108,18 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
     case 3:
       code.push_back(EncodeVopc(0xba, 249u, 1u));
       code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 6u, 6u, 1u, 1u));
+      break;
+    case 4:
+      code.push_back(EncodeVopc(0xba, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 0u, 6u, 1u, 0u));
+      break;
+    case 5:
+      code.push_back(EncodeVopc(0xba, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 6u, 1u, 0u, 1u));
+      break;
+    case 6:
+      code.push_back(EncodeVopc(0xba, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 4u, 6u, 1u, 0u));
       break;
     default:
       code.push_back(EncodeVopc(0xba, 249u, 1u));
@@ -31878,6 +32046,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
   AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxLtU16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxLtI16CapturedSdwaExecMask);
+  for (u32 wave_size : {32u, 64u}) {
+    cases.push_back(VectorVopcCmpxLtI16WaveMasks(wave_size));
+  }
   AddCase(VectorVopcCmpxEqU16SdwaCompactVop3ExecMask);
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
@@ -36872,6 +37044,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxEqU16SdwaCompactVop3ExecMask());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmpx-lt-i16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpxLtI16CapturedSdwaExecMask());
+    RunCase(&vulkan, VectorVopcCmpxLtI16WaveMasks(32));
+    RunCase(&vulkan, VectorVopcCmpxLtI16WaveMasks(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-lt-u16-only") == 0) {
