@@ -10749,7 +10749,7 @@ public:
                 allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
             "comparison texture mapping failed");
     // Sea of Stars' 1D comparison texture and the existing six-face cube.
-    const auto check_layout = [&](bool cube) {
+    const auto check_layout = [&](bool cube, uint32_t swizzle) {
       const uint32_t layers = cube ? depths.size() : 1;
       const auto depth_at = [&](uint32_t layer, bool reversed) {
         const auto index = cube ? layer : 2u;
@@ -10775,7 +10775,7 @@ public:
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
       ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
-          0x00700000u, 0, cube ? 0xb0100204u : 0x81800924u,
+          0x00700000u, 0, (cube ? 0xb0100000u : 0x81800000u) | swizzle,
           layers - 1u, 0x00700000u, 0, 0}};
       ShaderSamplerResource sampler_descriptor{{1u << 12u, 0, 1u << 24u, 0}};
       TestCase test;
@@ -10826,6 +10826,13 @@ public:
           executor, compiled.program.info.images[0], value);
       const auto view = cache.FindTexture(binding.image_id, binding.desc);
       auto &image = cache.GetImage(binding.image_id);
+      if (swizzle == DstSel(4, 4, 4, 1)) {
+        const vk::ComponentMapping mapping{vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eR,
+                                            vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eOne};
+        Require(name, "RRR1 depth view", std::ranges::any_of(image.views, [&](const auto &cached) {
+                  return cached.view == view && cached.info.mapping == mapping;
+                }), "comparison depth view lost its replicated depth or constant alpha");
+      }
       Require(name, "fresh depth backing", view != nullptr &&
                   image.info.pixel_format == vk::Format::eD16Unorm &&
                   image.info.guest_format == Prospero::BufferFormat::k16UNorm &&
@@ -10904,8 +10911,9 @@ public:
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     };
-    check_layout(false);
-    check_layout(true);
+    check_layout(false, DstSel(4, 4, 4, 4));
+    check_layout(false, DstSel(4, 4, 4, 1));
+    check_layout(true, DstSel(4, 0, 0, 1));
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "comparison texture unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
@@ -33162,6 +33170,10 @@ void CheckSampledColorViews() {
           IsSupportedSampledDepthView(
               vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 0, 0, 0)),
           "D16 depth target did not select its R000 depth-aspect view");
+  Require("SampledColorViews", "D16 RRR1 depth target",
+          IsSupportedSampledDepthView(
+              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 4, 4, 1)),
+          "D16 depth target rejected replicated depth with constant alpha");
   Require("SampledColorViews", "D16S8 R001 depth target",
           IsSupportedSampledDepthView(vk::Format::eD16UnormS8Uint,
                                       vk::Format::eR16Unorm,
