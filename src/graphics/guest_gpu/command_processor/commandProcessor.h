@@ -89,7 +89,6 @@ public:
 	void            BufferFlushIfGpuIdle();
 	// Submits for a queued interrupt, batching within the label flush interval.
 	void            BufferFlushForInterrupt();
-	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
