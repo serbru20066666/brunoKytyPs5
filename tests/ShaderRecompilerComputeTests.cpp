@@ -16070,6 +16070,40 @@ public:
           source_stage, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
           &barrier, 0, nullptr);
     };
+    auto scratch_input = CreateHostBuffer(name, 32, AllFlags,
+        {0x00020001u, 0x00040003u, 0x00060005u, 0x00080007u,
+         0x000a0009u, 0x000c000bu, 0x000e000du, 0x0010000fu});
+    auto scratch_output = CreateHostBuffer(name, 56, AllFlags, {});
+    const auto copy_scratch = [&](TileManager::Result result, uint64_t offset) {
+      const vk::BufferCopy copy{result.offset, offset, result.size};
+      scheduler.Current().Handle().copyBuffer(result.buffer, scratch_output.buffer, 1, &copy);
+    };
+    // Keep all four conversions in flight to check growth, overwrite ordering,
+    // the requested span on reuse, and two simultaneously live workspaces.
+    const auto first = tile_manager.SwapBgra16({scratch_input.buffer, 0, 8});
+    copy_scratch(first, 0);
+    const auto grown = tile_manager.SwapBgra16({scratch_input.buffer, 0, 32});
+    copy_scratch(grown, 8);
+    const auto reused = tile_manager.SwapBgra16({scratch_input.buffer, 8, 8});
+    copy_scratch(reused, 40);
+    const auto paired = tile_manager.SwapBgra16(reused);
+    copy_scratch(paired, 48);
+    Require(name, "scratch workspace reuse",
+            first.buffer != grown.buffer && grown.buffer == reused.buffer &&
+                reused.buffer != paired.buffer && reused.size == 8 && paired.size == 8,
+            "scratch growth, input exclusion, or requested span was lost");
+    host_barrier(scratch_output.buffer, scratch_output.size,
+                    vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite);
+    scheduler.Finish();
+    Require(name, "scratch workspace GPU contents",
+            ReadBuffer(name, scratch_output, 14) == std::vector<u32>{
+                0x00020003u, 0x00040001u,
+                0x00020003u, 0x00040001u, 0x00060007u, 0x00080005u,
+                0x000a000bu, 0x000c0009u, 0x000e000fu, 0x0010000du,
+                0x00060007u, 0x00080005u, 0x00060005u, 0x00080007u},
+            "scratch reuse overwrote an earlier result or its live conversion input");
+    DestroyBuffer(&scratch_output);
+    DestroyBuffer(&scratch_input);
     const auto gpu_detile =
         [&](const std::vector<uint8_t> &tiled, std::vector<uint8_t> *linear,
             uint64_t tiled_capacity, uint64_t linear_capacity,
