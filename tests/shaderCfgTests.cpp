@@ -13545,11 +13545,11 @@ void TestPixelProgramCacheBindingIdentity() {
   Check(MakeStageStaticKey(no_depth_export) != MakeStageStaticKey(depth_export),
         "pixel shader identity omitted depth-export semantics");
 
-  auto check_program_identity = [&](const uint32_t *shader) {
+  auto check_program_identity = [&](std::span<const uint32_t> shader) {
     HW::PixelShaderInfo regs{};
-    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
     ShaderMappedData mapped{};
-    mapped.code_size_bytes = sizeof(uint32_t);
+    mapped.code_size_bytes = static_cast<uint32_t>(shader.size_bytes());
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
 
     const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
@@ -13564,7 +13564,8 @@ void TestPixelProgramCacheBindingIdentity() {
                                               second_info);
     CompilePixelRuntime(second_params, second_info);
     Check(
-        first_params.hash == second_params.hash &&
+        first_params.hash == XXH3_64bits(shader.data(), shader.size_bytes()) &&
+            first_params.hash == second_params.hash &&
             first_key == MakeStageStaticKey(second_info) &&
             first_info.stage.program != nullptr &&
             second_info.stage.program != nullptr,
@@ -13576,6 +13577,22 @@ void TestPixelProgramCacheBindingIdentity() {
   const auto request_10 = check_program_identity(shader_10);
   Check(request_01 == request_10,
         "relocated identical pixel programs did not share their source identity");
+
+  // Identical metadata after the scalar-literal prefix must not mask changes
+  // to the executable code when computing program identity.
+  std::array<uint32_t, 200> shader{};
+  shader[0] = 0xbeeb03ffu;
+  shader[1] = 0x5fu;
+  shader[2] = EncodeSMovB32(0, 129);
+  shader[3] = EncodeSopp(0x01);
+  shader[192] = 0x65726162u;
+  shader[193] = 0x746f6f66u;
+  shader[196] = 0x12345678u;
+  shader[197] = 0x9abcdef0u;
+  const auto first = check_program_identity(shader);
+  shader[2] = EncodeSMovB32(0, 130);
+  Check(check_program_identity(shader).first != first.first,
+        "re-registering changed code at the same address reused its old identity");
 
 }
 
