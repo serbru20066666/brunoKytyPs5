@@ -1888,37 +1888,41 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
-void TestDisabledSystemDebugBranch() {
+void TestDisabledDebugBranches() {
   using namespace ShaderRecompiler;
-  // Relocate PPSA08709 MS pc 0x530 to zero, retaining its displacement to the
-  // system validation helper immediately after the main shader's S_ENDPGM.
-  std::array<uint32_t, 274> shader;
-  shader.fill(EncodeSopp(0x00));
-  shader[0] = 0xbf97010fu;
-  shader[1] = EncodeVop1(0x01, 1, 129);
-  shader[2] = EncodeMubuf0(0x1c, 0, false);
-  shader[3] = EncodeMubuf1(1, 0, 0);
-  shader[271] = EncodeSopp(0x01);
-  shader[272] = 0xffffffffu; // System-only helper must not be decoded.
-  shader[273] = 0xffffffffu;
-  Decoder::Program decoded;
-  Decoder::DecodeProgram(shader, decoded);
-  Check(decoded.instructions.front().opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS &&
-            decoded.instructions.front().branch_target == 0x440u &&
-            decoded.instructions.back().pc == 0x43cu &&
-            decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
-        "disabled system debug branch reached its post-ENDPGM validation helper");
-  auto graph = CFG::BuildGraph(decoded);
-  Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
-            graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
-        "disabled system debug branch changed normal shader control flow");
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("S_CBRANCH_CDBGSYS 0x00000440") != std::string::npos) &&
-            (result.ir_dump.find("StoreBufferU32") != std::string::npos),
-        "disabled system debug branch lost its identity or fallthrough write");
-  CheckSpirvBinaryValidates(result.spirv);
+  // Both debug branches fall through when conditional shader debugging is disabled.
+  // Retain the post-ENDPGM helper displacement from PPSA08709 and exercise the
+  // OR_USER variant encountered in PPSA03671 with the same body.
+  for (const auto opcode : {Decoder::Opcode::S_CBRANCH_CDBGSYS,
+                            Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER}) {
+    std::array<uint32_t, 274> shader;
+    shader.fill(EncodeSopp(0x00));
+    shader[0] = EncodeSopp(opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS ? 0x17 : 0x19, 0x10f);
+    shader[1] = EncodeVop1(0x01, 1, 129);
+    shader[2] = EncodeMubuf0(0x1c, 0, false);
+    shader[3] = EncodeMubuf1(1, 0, 0);
+    shader[271] = EncodeSopp(0x01);
+    shader[272] = 0xffffffffu; // Debug-only helper must not be decoded.
+    shader[273] = 0xffffffffu;
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(shader, decoded);
+    Check(decoded.instructions.front().opcode == opcode &&
+              decoded.instructions.front().branch_target == 0x440u &&
+              decoded.instructions.back().pc == 0x43cu &&
+              decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+          "disabled debug branch reached its post-ENDPGM validation helper");
+    auto graph = CFG::BuildGraph(decoded);
+    Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
+              graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
+          "disabled debug branch changed normal shader control flow");
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    auto result = RecompileForTest(shader, options);
+    Check((result.decoded_dump.find(" 0x00000440") != std::string::npos) &&
+              (result.ir_dump.find("StoreBufferU32") != std::string::npos),
+          "disabled debug branch lost its identity or fallthrough write");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
@@ -14184,7 +14188,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
-  TestDisabledSystemDebugBranch();
+  TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
