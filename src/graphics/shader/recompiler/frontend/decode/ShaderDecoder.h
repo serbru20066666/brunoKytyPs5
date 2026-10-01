@@ -355,6 +355,7 @@ enum class Opcode {
 	V_CMP_NEQ_F32,
 	V_CMP_NLT_F32,
 	V_CMP_TRU_F32,
+	V_CMP_EQ_F64,
 	V_CMPX_LT_F32,
 	V_CMPX_EQ_F32,
 	V_CMPX_LE_F32,

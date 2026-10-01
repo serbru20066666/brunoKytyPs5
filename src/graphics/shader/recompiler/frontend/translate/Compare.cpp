@@ -40,11 +40,13 @@ void Translator::EmitInteger16Compare(const Decoder::Instruction& inst, IR::Valu
 
 void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                   bool half, bool cmpx) {
+	const auto type = IR::ArgTypeOf(opcode, 0);
 	const auto lhs =
-	    half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, IR::Type::F32);
+	    half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, type);
 	const auto rhs =
-	    half ? IR::Value(ReadF16AsF32(inst.src1)) : ReadOperand(inst.src1, IR::Type::F32);
-	const IR::FPCompareFlags flags{.flush_input_denorms = !half && flush_f32_inputs};
+	    half ? IR::Value(ReadF16AsF32(inst.src1)) : ReadOperand(inst.src1, type);
+	const IR::FPCompareFlags flags{
+	    .flush_input_denorms = !half && type == IR::Type::F32 && flush_f32_inputs};
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false, cmpx);
 }
 
