@@ -192,6 +192,7 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
+    {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
     {0x11u, Opcode::IMAGE_ATOMIC_ADD},
     {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
     {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
@@ -358,6 +359,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "MIMG image gather requires exactly one dmask bit");
+	}
+	if (inst.opcode == Opcode::IMAGE_ATOMIC_CMPSWAP && inst.dmask != 0x3u) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG image compare-and-swap requires 32-bit DMASK 0x3");
 	}
 	const bool supports_d16 = sample != nullptr || gather != nullptr || opcode == 0x00u ||
 	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;

@@ -310,6 +310,7 @@ inline constexpr auto EmitImageRead            = EmitImage;
 inline constexpr auto EmitImageWrite           = EmitImage;
 inline constexpr auto EmitImageSampleRaw       = EmitImage;
 inline constexpr auto EmitImageGatherRaw       = EmitImage;
+inline constexpr auto EmitImageAtomicCompareSwap32 = EmitImage;
 inline constexpr auto EmitImageAtomicSwap32    = EmitImage;
 inline constexpr auto EmitImageAtomicIAdd32    = EmitImage;
 inline constexpr auto EmitImageAtomicSMin32    = EmitImage;

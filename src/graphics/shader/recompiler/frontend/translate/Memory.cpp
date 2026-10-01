@@ -558,9 +558,18 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
-	const auto result =
-	    ir.Emit(opcode, {resource, address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	            AddMemoryInfo(memory, inst.pc));
+	const auto data     = MemorySourceAt(inst, 0);
+	const auto flags    = AddMemoryInfo(memory, inst.pc);
+	IR::Value  result;
+	if (opcode == IR::ValueOpcode::ImageAtomicCompareSwap32) {
+		// VDATA supplies the replacement; VDATA+1 supplies the comparison.
+		result = ir.Emit(opcode,
+		                 {resource, address, ReadU32(data), ReadU32(OffsetOperand(data, 1u)),
+		                  ir.GetExec()},
+		                 flags);
+	} else {
+		result = ir.Emit(opcode, {resource, address, ReadU32(data), ir.GetExec()}, flags);
+	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
 	}
@@ -1030,6 +1039,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
 
+		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCompareSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
