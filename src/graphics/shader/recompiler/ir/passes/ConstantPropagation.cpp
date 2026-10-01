@@ -854,6 +854,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::UGreaterThan64:
 			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a > b; });
 			return;
+		case ValueOpcode::ULessThanEqual64:
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a <= b; });
+			return;
+		case ValueOpcode::UGreaterThanEqual64:
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a >= b; });
+			return;
+		case ValueOpcode::SLessThanEqual64:
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) {
+				return std::bit_cast<int64_t>(a) <= std::bit_cast<int64_t>(b);
+			});
+			return;
 		case ValueOpcode::SLessThan64:
 			FoldU64Compare(inst, [](uint64_t a, uint64_t b) {
 				return std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);

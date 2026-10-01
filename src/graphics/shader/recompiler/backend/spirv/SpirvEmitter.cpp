@@ -262,7 +262,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
 				}
-				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+				if (shared_access == IR::SharedAccess::Atomic &&
+				    IR::SharedComponentCount(inst.GetOpcode()) == 2u) {
 					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
 						Fail(program, "64-bit shared atomics require compute LDS");
 					}
