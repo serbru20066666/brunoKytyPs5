@@ -11592,6 +11592,124 @@ void TestValuePhiValidation() {
 #endif
 }
 
+void TestWave32MaskProjection() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = wave_size;
+    for (uint32_t id = 0; id < 3; ++id) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    auto *entry = program.blocks[0];
+    auto *loop = program.blocks[1];
+    entry->AddBranch(loop);
+    loop->AddBranch(loop);
+    loop->AddBranch(program.blocks[2]);
+    program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[2].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    IREmitter e(entry);
+    const auto zero = U32(Value(0u));
+    const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+    const auto active = e.INotEqual(raw, zero);
+    const auto selected = e.IEqual(raw, U32(Value(7u)));
+    const auto ballot = [&](IREmitter &ir, U1 predicate, uint32_t component = 0u) {
+      return ir.CompositeExtract(ir.Emit(ValueOpcode::Ballot, {predicate}), component);
+    };
+    const auto thread_bit = [&](IREmitter &ir, U32 word, bool own_lane = true) {
+      const auto bit = own_lane
+          ? ir.BitwiseAnd(U32(ir.Emit(ValueOpcode::LaneId)), U32(Value(31u)))
+          : U32(Value(3u));
+      return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), U32(Value(1u))), zero);
+    };
+    const auto active_mask = ballot(e, active);
+    const auto direct = thread_bit(e, active_mask);
+    const auto arbitrary = thread_bit(e, raw);
+    const auto mixed = thread_bit(e, e.BitwiseAnd(active_mask, raw));
+    const auto mixed_or = thread_bit(e, e.BitwiseOr(active_mask, raw));
+    const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
+    const auto different_lane = thread_bit(e, active_mask, false);
+    const auto high_half = thread_bit(e, ballot(e, active, 1u));
+    const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
+    const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
+    const auto initial_predicate = e.LogicalAnd(active, selected);
+    const auto entry_size = entry->Instructions().size();
+    ConstantPropagationPass({entry}, wave_size);
+    Check(entry->Instructions().size() == entry_size,
+          "rejected mixed mask graph left unused projected instructions");
+    const auto combined_mask = e.BitwiseOr(active_mask, ballot(e, selected));
+    const auto combined = thread_bit(e, combined_mask);
+    const auto gated_mask = e.Select(selected, combined_mask, zero);
+    const auto gated = thread_bit(e, gated_mask);
+    const auto rejected = thread_bit(e, e.Select(selected, zero, combined_mask));
+    const auto combined_predicate = e.LogicalOr(active, selected);
+    const auto gated_predicate = e.LogicalAnd(selected, combined_predicate);
+    const auto rejected_predicate = e.Emit(ValueOpcode::SelectU1,
+                                          {selected, Value(false), combined_predicate});
+    const auto gated_raw_consumer = e.Emit(ValueOpcode::IAdd32, {gated_mask, Value(3u)});
+    auto &mask = loop->AppendNewInst(ValueOpcode::Phi);
+    mask.SetFlags(Type::U32);
+    auto &predicate = loop->AppendNewInst(ValueOpcode::Phi);
+    predicate.SetFlags(Type::U1);
+    IREmitter body(loop);
+    const auto matches = body.LogicalAnd(U1(Value(&predicate)), selected);
+    const auto remaining = body.BitwiseAnd(U32(Value(&mask)), body.BitwiseNot(ballot(body, matches)));
+    const auto remaining_predicate = body.LogicalAnd(U1(Value(&predicate)), body.LogicalNot(matches));
+    const auto remaining_live = thread_bit(body, remaining);
+    const auto live = thread_bit(body, U32(Value(&mask)));
+    mask.AddPhiOperand(entry, initial_mask);
+    mask.AddPhiOperand(loop, remaining);
+    predicate.AddPhiOperand(entry, initial_predicate);
+    predicate.AddPhiOperand(loop, remaining_predicate);
+    program.block_info[1].condition = remaining_predicate;
+
+    ConstantPropagationPass(program.blocks, wave_size);
+    if (wave_size == 32u) {
+      Check(direct.Resolve() == active.Resolve(), "wave32 ballot round trip lost its predicate");
+      Check(EquivalentValue(program, combined, combined_predicate),
+            "wave32 OR mask projection changed a lane predicate");
+      Check(EquivalentValue(program, gated, gated_predicate) &&
+                EquivalentValue(program, rejected, rejected_predicate),
+            "wave32 select mask projection changed a scalar gate or selected arm");
+      Check(EquivalentValue(program, live.Resolve(), Value(&predicate)),
+            "projected mask Phi differs from the existing per-lane EXEC Phi");
+      Check(EquivalentValue(program, remaining_live.Resolve(), remaining_predicate) &&
+                std::count_if(loop->begin(), loop->end(), [](const Inst &inst) {
+                  return inst.GetOpcode() == ValueOpcode::LogicalAnd;
+                }) == 3,
+            "backedge-first projection duplicated the loop's logical mask operation");
+      const auto *projected = live.Resolve().TryInstruction();
+      Check(projected != nullptr && projected->GetOpcode() == ValueOpcode::Phi &&
+                projected->GetType() == Type::U1 && projected->PhiBlock(0) == entry &&
+                projected->PhiBlock(1) == loop,
+            "mask projection lost loop Phi type or predecessor order");
+    } else {
+      Check(direct.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                live.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                combined.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                gated.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                rejected.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "wave64 low-half mask was projected onto the wrong invocation");
+    }
+    for (const auto value : {arbitrary, mixed, mixed_or, mixed_select, different_lane, high_half}) {
+      Check(value.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "mask projection accepted an arbitrary mask, lane or ballot half");
+    }
+    Check(raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == initial_mask.Resolve() &&
+              gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
+          "mask projection changed a raw scalar mask consumer");
+    ResolveControlFlowIdentities(program);
+    RemoveIdentities(program.blocks);
+    ValidateProgram(program, true);
+  }
+}
+
 void TestU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
 
@@ -14297,6 +14415,7 @@ int main() {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
+  TestWave32MaskProjection();
   TestU64ShiftConstantPropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
