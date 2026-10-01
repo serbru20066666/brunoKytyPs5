@@ -52,8 +52,11 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
-	// An empty span means that all sources are active.
+	// Walks the blocks the plan's conditions reach: the descriptor sources they use (an empty
+	// span means that all sources are active) and the scalar reads they make.
 	std::span<const uint8_t> FindActiveSources();
+	// Refreshes the reachable scalar reads (after the activity walk, which it makes if the
+	// caller has not); the others read as zero.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
@@ -73,6 +76,8 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// FindActiveSources has run for this refresh.
+	bool                             m_activity_found = false;
 };
 
 // Whether plans compiled from now on read consecutive flat SRT slots as runs (the default).
@@ -119,6 +124,8 @@ private:
 	uint64_t                         m_generation;
 	// Set by a successful RefreshFlatBuffer: this walker's slot values.
 	const std::vector<uint32_t>*     m_flat = nullptr;
+	// FindActiveSources has run for this refresh.
+	bool                             m_activity_found = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

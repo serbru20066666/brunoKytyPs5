@@ -8588,11 +8588,17 @@ void TestNestedSelectionPreservesDescriptorSources() {
           "nested descriptor selection lost its structured resource bindings");
     for (size_t i = 0; i < result.program.info.buffers.size(); ++i) {
       const auto pc = result.program.info.buffers[i].first_use_pc;
-      const uint32_t expected = pc == 8u * 4u ? table[0]
-                                : pc == 14u * 4u ? table[4]
-                                : pc == direct_arm * 4u ? user_data[8]
-                                : pc == join * 4u ? user_data[4] : 0u;
-      Check(expected != 0u && result.resources.buffers[i].dwords[0] == expected,
+      Check(pc == 8u * 4u || pc == 14u * 4u || pc == direct_arm * 4u || pc == join * 4u,
+            "nested descriptor selection lost a native source location");
+      const auto selected_pc = (mode == 0u ? 8u : mode == 1u ? 14u : direct_arm) * 4u;
+      const auto *expected = pc == 8u * 4u ? table.data()
+                           : pc == 14u * 4u ? table.data() + 4
+                           : pc == direct_arm * 4u ? user_data.data() + 8 : user_data.data() + 4;
+      const auto &descriptor = result.resources.buffers[i];
+      const bool unused = pc != selected_pc && pc != join * 4u;
+      Check(descriptor.dword_count == 4 &&
+                (std::equal(expected, expected + 4, descriptor.dwords.begin()) ||
+                 (unused && std::ranges::all_of(descriptor.dwords, [](auto word) { return word == 0; }))),
             "nested descriptor selection chose another arm's descriptor");
     }
     CheckSpirvBinaryValidates(result.spirv);
@@ -8700,10 +8706,10 @@ void TestNativeScalarReadDescriptorPlanning() {
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.user_data = user_data;
     const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
-    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 1u &&
-              std::ranges::equal(result.resources.flattened_srt, table),
-          "scalar descriptor planning retained an unrelated native execution mask");
     const auto expected = mode == 2u ? table : std::array<uint32_t, 4>{};
+    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 1u &&
+              std::ranges::equal(result.resources.flattened_srt, expected),
+          "scalar descriptor planning retained an unrelated native execution mask");
     Check(std::equal(expected.begin(), expected.end(), result.resources.buffers[0].dwords.begin()),
           "scalar descriptor planning selected the wrong native resource");
     CheckSpirvBinaryValidates(result.spirv);

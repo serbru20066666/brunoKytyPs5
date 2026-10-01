@@ -509,6 +509,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> srt_reads;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -520,6 +521,7 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
+	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -694,7 +696,8 @@ struct ResourcePlan {
 		// A node with a block is a branch, one with sources a leaf, one with neither not filled in.
 		uint32_t                block   = None;
 		std::array<uint32_t, 3> next    = {None, None, None};
-		uint32_t                sources = None; // Offset in active_tree_sources.
+		// Offset in active_tree_sources: the sources' activity, then the slots' liveness.
+		uint32_t                sources = None;
 	};
 	// Evaluation scratch: nested clean/EXEC memos, activity, material keys and the learned walk
 	// tree. Each thread that refreshes plans uses its own slot (see ResourceScratchSlot).
@@ -702,10 +705,12 @@ struct ResourcePlan {
 		std::deque<EvaluationContext>                 evaluation_contexts;
 		uint32_t                                      evaluation_depth = 0;
 		std::vector<uint8_t>                          active_sources;
+		// Per srt_reads entry, whether a block the last activity walk reached reads it; empty
+		// when every entry is read (a plan without control flow).
+		std::vector<uint8_t>                          live_slots;
 		std::vector<uint8_t>                          visited_blocks;
 		std::vector<uint32_t>                         pending_blocks;
 		std::vector<uint32_t>                         material_keys;
-		std::vector<std::pair<uint64_t, uint64_t>>    specialization_reads;
 		std::vector<ActiveTraceStep>                  active_trace;
 		std::vector<ActiveTreeNode>                   active_tree;
 		std::vector<uint8_t>                          active_tree_sources;
