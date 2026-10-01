@@ -261,7 +261,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
 	if (!compute_program) {
-		// Temporary until RT is implemented.
+		// No program to run yet.
 		return;
 	}
 	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
@@ -442,7 +442,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
 	if (!compute_program) {
-		// Temporary until RT is implemented.
+		// No program to run yet.
 		return;
 	}
 	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))

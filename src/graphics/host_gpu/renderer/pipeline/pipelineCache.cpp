@@ -395,7 +395,6 @@ struct PipelineCache::ProgramCache {
 		// the last hit stays valid while the specialization and push data cursor are unchanged.
 		uint32_t                                    last_permutation = UINT32_MAX;
 		uint32_t                                    last_push_cursor = 0;
-		bool                                        skip_dispatch = false;
 		std::vector<PendingPermutation>             pending;
 		// Set once a GPU-thread refresh succeeded (its plan is compiled): only then may the draw
 		// speculation thread refresh this plan (see Speculate).
@@ -773,9 +772,6 @@ struct PipelineCache::ProgramCache {
 					     static_cast<unsigned long long>(params.hash));
 				}
 			}
-			if (source.skip_dispatch) {
-				return {};
-			}
 			if (auto program = existing(source)) {
 				return *program;
 			}
@@ -787,9 +783,6 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
 		if (entry != programs.end() && &entry->second != refreshed) {
 			if (auto program = existing(entry->second)) {
 				return *program;
@@ -836,12 +829,6 @@ struct PipelineCache::ProgramCache {
 			}
 			if (!translated) {
 				translated = ShaderRecompiler::TranslateProgram(params.code, options);
-			}
-			if (translated->skip_dispatch) {
-				std::unique_lock lock(programs_mutex);
-				entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-				entry->second.skip_dispatch = true;
-				return {};
 			}
 			{
 				std::unique_lock lock(programs_mutex);
@@ -1438,7 +1425,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			auto         translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			// Reject inconsistent metadata before ApplyResourceSpecialization's hard assertions.
 			// Live guest lookups still compile normally if a record cannot be replayed.
-			if (translated.skip_dispatch || !translated.program.resource_tracking_complete ||
+			if (!translated.program.resource_tracking_complete ||
 			    translated.program.info.buffers.size() != record.specialization.buffers.size() ||
 			    translated.program.info.images.size() > record.specialization.images.size()) {
 				continue;

@@ -13700,6 +13700,30 @@ void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
   Check((result.ir_dump.find("GetScratchResource") != std::string::npos) &&
             result.program.scratch_dwords == 1,
         "SCRATCH incorrectly entered guest address tracking");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // A local aperture proof must not admit a median which can still produce a
+  // canonical global address. Such stores need the existing ownership proof.
+  const uint32_t mixed_domain_store[] = {
+      EncodeSop1(0x04, 8, 237), // s_mov_b64 s[8:9], private_base
+      EncodeVop3Word0(0x159, 1),
+      EncodeVop3Word1(128, 9, 256 + 2), // median(0, private high, dynamic v2)
+      EncodeFlat0(0x1c, 0, 0), EncodeFlat1(0, 0x7d, 3, 0),
+      EncodeSopp(0x01),
+  };
+  ExpectFatal([&]() { (void)RecompileForTest(mixed_domain_store, options); },
+              "mixed local/global FLAT store bypassed GPU ownership tracking");
+  const uint32_t changed_mask_store[] = {
+      EncodeSop1(0x04, 8, 237), EncodeSop1(0x04, 10, 235),
+      EncodeVop1(0x01, 1, 128), // canonical old address high
+      EncodeSop1(0x03, 126, 255), 0x55555555u,
+      EncodeVop3Word0(0x159, 1), EncodeVop3Word1(9, 11, 256 + 2),
+      EncodeSop1(0x04, 126, 193), // restore all lanes after the median
+      EncodeFlat0(0x1c, 0, 0), EncodeFlat1(0, 0x7d, 3, 0),
+      EncodeSopp(0x01),
+  };
+  ExpectFatal([&]() { (void)RecompileForTest(changed_mask_store, options); },
+              "FLAT proof discarded a differently predicated address value");
+#endif
 }
 
 void TestCompilerStageInputOwnership() {
@@ -14085,7 +14109,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
-  TestRayTracingDispatchDetection();
+  TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

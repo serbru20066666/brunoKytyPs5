@@ -31988,6 +31988,8 @@ TestCase DispatcherIrreducibleControlFlow() {
   return test;
 }
 
+#include "ShaderRayTracingGpuTests.inc"
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -32289,6 +32291,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
+  cases.push_back(FlatStackApertures(32));
+  cases.push_back(FlatStackApertures(64));
+  cases.push_back(BvhIntersections(true, true, 1));
+  for (bool barycentrics : {false, true}) {
+    for (bool sorted : {false, true}) {
+      cases.push_back(BvhIntersections(barycentrics, sorted));
+    }
+  }
   AddCase(DsReadWriteVariants);
   AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
   AddCase(DsWriteB8D16HiWritesByteTwo);
@@ -37261,6 +37271,18 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, FlatStackApertures(32));
+    RunCase(&vulkan, FlatStackApertures(64));
+    RunCase(&vulkan, BvhIntersections(true, true, 1));
+    for (bool barycentrics : {false, true}) {
+      for (bool sorted : {false, true}) {
+        RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
+      }
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
