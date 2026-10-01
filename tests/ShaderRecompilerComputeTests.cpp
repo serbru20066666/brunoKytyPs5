@@ -29661,6 +29661,27 @@ TestCase Wave64CrossHalfLaneAndLds() {
   return test;
 }
 
+void CheckWave64WholeWaveResults() {
+  const auto test = Wave64CrossHalfLaneAndLds();
+  const auto native = CompileCase(test, 64);
+  const auto emulated = CompileCase(test, 32);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string native_text, emulated_text;
+  Require(test.name, "whole-wave disassembly",
+          tools.Disassemble(native.spirv, &native_text) &&
+              tools.Disassemble(emulated.spirv, &emulated_text),
+          "failed to disassemble whole-wave operations");
+  const auto ballots = CountText(native_text, "OpGroupNonUniformBallot ");
+  Require(test.name, "whole-wave ballot reuse",
+          ballots != 0 &&
+              CountText(emulated_text, "OpGroupNonUniformBallot ") == ballots * 2,
+          "emulated halves repeated a whole-wave ballot");
+  // READLANE still emits two shuffles per half; READFIRSTLANE needs one shared pair.
+  Require(test.name, "whole-wave first-lane reuse",
+          CountText(emulated_text, "OpGroupNonUniformShuffle ") == 6,
+          "emulated halves repeated the first-active-lane broadcast");
+}
+
 TestCase Wave64RawMasksAndScalarBranch() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -38129,6 +38150,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
+    CheckWave64WholeWaveResults();
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());
@@ -38676,6 +38698,7 @@ int main(int argc, char **argv) {
   CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
+  CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
