@@ -20575,6 +20575,111 @@ TestCase ScalarMaskProvenanceOverlapAndMixedBinary() {
            O::S_ENDPGM}};
 }
 
+TestCase ScalarB32MaskDataflow(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 mask = 0xffff0000u, rhs = 0x0f0f0f0fu;
+  constexpr u32 sentinel = 0xdeadbeefu, marker = 0x12345678u;
+  struct Operation {
+    u32 encoding;
+    O opcode;
+    u32 expected;
+    u32 source = rhs;
+  };
+  const std::array operations{
+      Operation{0x0e, O::S_AND_B32, mask & rhs},
+      Operation{0x10, O::S_OR_B32, mask | rhs},
+      Operation{0x12, O::S_XOR_B32, mask ^ rhs},
+      Operation{0x14, O::S_ANDN2_B32, mask & ~rhs},
+      Operation{0x16, O::S_ORN2_B32, mask | ~rhs},
+      Operation{0x18, O::S_NAND_B32, ~(mask & rhs)},
+      Operation{0x1a, O::S_NOR_B32, ~(mask | rhs)},
+      Operation{0x1c, O::S_XNOR_B32, ~(mask ^ rhs)},
+      Operation{0x07, O::S_NOT_B32, ~mask},
+      Operation{0x12, O::S_XOR_B32, 0, mask}};
+  TestCase test;
+  test.name = wave_size == 32 ? "ScalarB32MaskDataflowWave32" : "ScalarB32MaskDataflowWave64";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 16, 126)); // Preserve both EXEC halves.
+  AppendVMovU32(&code, 2, marker);
+  AppendVMovU32(&code, 1, 4);
+  for (const bool predicate_source : {false, true}) {
+    for (const auto &operation : operations) {
+      code.push_back(EncodeVopc(0xc1, InlineU32(15), 0)); // Lanes greater than 15.
+      code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
+      code.push_back(EncodeSop2(0x0a, 107, 106, InlineU32(0))); // VCC_HI is a wave32 mask temporary.
+      code.push_back(EncodeSMovB32(8, 107));
+      if (wave_size == 32) {
+        code.push_back(EncodeSMovB32(127, 8));
+        code.push_back(EncodeSMovB32(8, 127)); // EXEC_HI must preserve its own scalar word.
+        code.push_back(EncodeSMovB32(127, InlineU32(0)));
+      }
+      AppendSMovLiteral(&code, 9, sentinel); // Adjacent write must preserve a wave32 predicate.
+      if (predicate_source) {
+        if (operation.source == mask) {
+          code.push_back(EncodeVopc(0xc1, InlineU32(15), 0));
+        } else {
+          code.push_back(EncodeVop2(0x1b, 3, InlineU32(7), 0));
+          code.push_back(EncodeVopc(0xc1, Vgpr(3), 1)); // (lane & 7) < 4.
+        }
+        code.push_back(EncodeSMovB32(10, 106));
+      } else {
+        code.push_back(EncodeSMovB32(10, operation.source == rhs ? 60u : 61u));
+      }
+      code.push_back(operation.opcode == O::S_NOT_B32
+                         ? EncodeSop1(operation.encoding, 8, 8)
+                         : EncodeSop2(operation.encoding, 8, 8, 10));
+      code.push_back(EncodeSop2(0x0a, 12, InlineU32(1), InlineU32(0))); // Capture scalar SCC.
+      code.push_back(EncodeSop2(0x0a, 8, 8, 10)); // Aliased scalar select, including SCC0.
+      code.push_back(EncodeSMovB32(126, 8));
+      const auto offset = static_cast<u32>(test.expected.size());
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+      code.push_back(EncodeSop1(0x04, 126, 16));
+      const auto selected = operation.expected != 0 ? operation.expected : operation.source;
+      for (u32 lane = 0; lane < wave_size; ++lane) {
+        test.expected.push_back(lane >= 32 || (selected & (1u << lane)) != 0
+                                    ? marker : sentinel);
+      }
+      for (const auto [reg, value] : std::array<std::pair<u32, u32>, 3>{{
+               {8, selected}, {9, sentinel}, {12, operation.expected != 0}}}) {
+        AppendStoreSgprAtLaneDwordOffset(&code, reg, 0, static_cast<u32>(test.expected.size()));
+        test.expected.insert(test.expected.end(), wave_size, value);
+      }
+      test.opcodes.push_back(operation.opcode);
+    }
+  }
+  if (wave_size == 32) {
+    for (u32 low : {106u, 126u}) {
+      code.push_back(EncodeVopc(0xc1, InlineU32(15), 0));
+      code.push_back(EncodeSMovB32(low + 1, 106)); // A previously known high-word predicate.
+      code.push_back(EncodeSop1(0x04, low, 193u)); // Full scalar -1 overwrites both words.
+      code.push_back(EncodeSMovB32(8, low + 1));
+      code.push_back(EncodeSop1(0x04, 126, 16));
+      code.push_back(EncodeSMovB32(126, 8));
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), wave_size, marker);
+      code.push_back(EncodeSop1(0x04, 126, 16));
+      AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), wave_size, UINT32_MAX);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.assign(test.expected.size(), sentinel);
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[50] = static_cast<u32>(test.expected.size() * sizeof(u32));
+  test.user_data[60] = rhs; // Raw masks initialized at shader entry.
+  test.user_data[61] = mask;
+  test.has_user_data = true;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B32, O::S_MOV_B64, O::S_CSELECT_B32, O::S_CMP_EQ_U32,
+      O::V_CMP_LT_U32, O::V_MOV_B32, O::V_AND_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+      O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+  return test;
+}
+
 TestCase ScalarLiteral() {
   using O = ShaderOpcode;
 
@@ -32462,6 +32567,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarWqmB32Masks(32));
   cases.push_back(ScalarWqmB32Masks(64));
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
+  cases.push_back(ScalarB32MaskDataflow(32));
+  cases.push_back(ScalarB32MaskDataflow(64));
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
@@ -37763,6 +37870,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarWqmB32Masks(32));
     RunCase(&vulkan, ScalarWqmB32Masks(64));
     RunCase(&vulkan, ScalarMaskProvenanceOverlapAndMixedBinary());
+    RunCase(&vulkan, ScalarB32MaskDataflow(32));
+    RunCase(&vulkan, ScalarB32MaskDataflow(64));
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     RunCase(&vulkan, Vop1MoveRelDestination());
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
