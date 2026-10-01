@@ -10124,6 +10124,44 @@ void TestMergedShaderUserDataSnapshot() {
   Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
             fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
+  context.SetShaderStages(0x00482030u);
+  context.SetMaxOutputPerSubgroup(32);
+  context.SetGsMaxVertOut(32);
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kPointList);
+  user_config.SetGeControl({1, 1});
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 0;
+  regs.gs_regs.rsrc2.es_vgpr_component_count = 1;
+  ShaderVertexInputInfo fast_input{};
+  PrepareProgram(regs, context, user_config, fast_input);
+  Check(fast_input.mesh.fast_launch && fast_input.mesh.threads_num[0] == 32 &&
+            fast_input.mesh.primitives_per_group == 1 && fast_input.mesh.vertices_per_group == 1 &&
+            fast_input.mesh.max_vertices == 32 && fast_input.mesh.max_primitives == 32,
+        "captured fast-launch shader lost its per-group launch and output limits");
+  auto ordinary_input = fast_input;
+  ordinary_input.mesh.fast_launch = false;
+  Check(MakeStageStaticKey(fast_input) != MakeStageStaticKey(ordinary_input),
+        "fast launch shared the ordinary input-assembly shader key");
+
+  const uint32_t fast_code[] = {
+      EncodeSMovB32(124, 255), 0x20020u, // allocate the full 32 vertices and primitives
+      EncodeSopp(0x10, 9),
+      EncodeVop1(0x01, 0, 256 + 5),
+      EncodeVop1(0x01, 1, 256 + 6),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 0, 1),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  options.input_info.vertex = &fast_input;
+  options.wave_size = fast_input.mesh.wave_size;
+  options.back_code = {};
+  const auto fast_result = RecompileForTest(fast_code, options);
+  CheckSpirvBinaryValidates(fast_result.spirv);
+  Check(fast_result.program.memory_info.empty(),
+        "compiled fast-launch entry retained an unused index-buffer resource");
+  const auto fast_source = DisassembleSpirvBinary(fast_result.spirv);
+  Check(SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputVertices 32") &&
+            SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputPrimitivesEXT 32"),
+        "fast-launch SPIR-V truncated the mesh output capacity");
+
 }
 
 void TestEmbeddedFetchPreservesSharedScalarLoad() {
@@ -10337,8 +10375,10 @@ void TestMeshInputAssembly() {
     uint32_t wave_info, first, second, third, byte_offset, vertex_id;
     bool fetch;
     uint32_t wave_size = 64;
+    bool fast_launch = false;
+    uint32_t threads = 256;
   };
-  const Case cases[] = {
+  std::vector<Case> cases = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
        0x40000309, 6, 7, 8, 340, 0xabcc, true},
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 9, 2, 0x1002, 0,
@@ -10386,16 +10426,32 @@ void TestMeshInputAssembly() {
       {Prospero::PrimitiveType::kTriStrip, 40, 40, 0, 32, 0, 0, 11,
        0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
+  for (const uint32_t wave_size : {32u, 64u}) {
+    for (const uint32_t threads : {wave_size, 2u * wave_size}) {
+      for (const uint32_t group : {0u, 1u, 11u}) {
+        for (const uint32_t lane : {0u, wave_size - 1u, threads - 1u}) {
+          const uint32_t wave_info = ((threads / wave_size) << 28u) |
+                                     ((lane / wave_size) << 24u) |
+                                     (lane < wave_size ? 0x101u : 0u);
+          const uint32_t base_vertex = group == 11u ? UINT32_MAX : 11u;
+          cases.push_back({Prospero::PrimitiveType::kPointList, 1, 12, group, lane, 0, 0,
+                           base_vertex, wave_info, 0, 0, 0, 0, group + base_vertex, false,
+                           wave_size, true, threads});
+        }
+      }
+    }
+  }
   for (const auto &test : cases) {
     for (const uint32_t slice_group : {0u, test.group}) {
       ShaderVertexInputInfo input{};
       auto &mesh = input.mesh;
       mesh.input_primitive = static_cast<uint32_t>(test.topology);
       mesh.wave_size = test.wave_size;
+      mesh.fast_launch = test.fast_launch;
       mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
       mesh.vertices_per_group =
           mesh.InputVertexCount(mesh.primitives_per_group);
-      mesh.threads_num[0] = 256;
+      mesh.threads_num[0] = test.threads;
       mesh.threads_num[1] = mesh.threads_num[2] = 1;
       Decoder::Program decoded;
       CFG::Graph graph;
@@ -10430,19 +10486,24 @@ void TestMeshInputAssembly() {
         }
       }
       ConstantPropagationPass(program.blocks);
-      Check(load != nullptr &&
-                load->Arg(1).Resolve().U32() == test.byte_offset &&
-                load->Arg(3).Resolve().U1() == test.fetch,
-            "mesh index fetch address or active-lane predicate is wrong");
-      const auto *resource = load->Arg(0).ResolveInstruction();
-      Check(resource != nullptr &&
-                resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-                resource->Arg(1).Resolve().U32() == 0x12 &&
-                program.memory_info[load->Flags<MemoryFlags>().index].kind ==
-                    ResourceKind::Global,
-            "mesh index fetch lost its aligned guest address resource");
-      load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
-      ConstantPropagationPass(program.blocks);
+      if (test.fast_launch) {
+        Check(load == nullptr && program.memory_info.empty(),
+              "fast launch emitted an ordinary input-assembly index resource");
+      } else {
+        Check(load != nullptr &&
+                  load->Arg(1).Resolve().U32() == test.byte_offset &&
+                  load->Arg(3).Resolve().U1() == test.fetch,
+              "mesh index fetch address or active-lane predicate is wrong");
+        const auto *resource = load->Arg(0).ResolveInstruction();
+        Check(resource != nullptr &&
+                  resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+                  resource->Arg(1).Resolve().U32() == 0x12 &&
+                  program.memory_info[load->Flags<MemoryFlags>().index].kind ==
+                      ResourceKind::Global,
+              "mesh index fetch lost its aligned guest address resource");
+        load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
+        ConstantPropagationPass(program.blocks);
+      }
       std::array<uint32_t, 9> vgprs{};
       uint32_t sgpr3 = 0;
       for (const auto &inst : *program.blocks.front()) {
@@ -10456,7 +10517,7 @@ void TestMeshInputAssembly() {
       Check(sgpr3 == test.wave_info &&
                 vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
                 vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-                vgprs[8] == 9,
+                vgprs[test.fast_launch ? 6 : 8] == 9u,
             "mesh prolog changed input assembly, wave counts, vertex ID, or "
             "instance ID");
     }
