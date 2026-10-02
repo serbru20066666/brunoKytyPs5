@@ -187,11 +187,10 @@ size_t Inst::NumPhiBlocks() const {
 }
 
 Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= NumArgs());
 	if (num_args <= InlineArity) {
-		EXIT_IF(index >= num_args);
 		return fixed_args[index];
 	}
-	EXIT_IF(index >= NumArgs());
 	return num_args == PhiArity ? phi_args[index].second : large_args[index];
 }
 
