@@ -254,100 +254,114 @@ struct CompiledRoots {
 template <typename Roots>
 bool MaterializeIndirectImage(const ResourcePlan& program, const Roots& roots, uint32_t source,
                               const DescriptorSource::IndirectImage& indirect,
-                              const DescriptorValue& material_value,
-                              const DescriptorValue& table_value, uint32_t image_index,
+                              uint32_t image_index,
                               const SrtRuntime& runtime, typename Roots::Walker& clean,
                               ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
+	const auto& sources = indirect.sources;
+	auto& keys = program.ThreadScratch().material_keys;
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
-	ShaderBufferResource table;
-	if (table_value.dword_count == 2u) {
-		table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
-	} else if (DecodeBufferDescriptor(table_value, table)) {
-		table_base = table.Base48();
-		table_size = table.GetSize();
-	} else {
-		return false;
-	}
-	auto& keys = program.ThreadScratch().material_keys;
-	keys.clear();
-	if (indirect.material_source == UINT32_MAX) {
-		uint32_t key_count = 0;
-		const bool evaluated = clean.Evaluate(roots.KeyCount(source), key_count);
-		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
-		if (table_value.dword_count != 2u || !evaluated ||
-		    key_count > MaxIndirectImageProbes ||
-		    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
+	if (sources.empty()) {
+		keys.clear();
+		DescriptorValue material_value;
+		DescriptorValue table_value;
+		if ((indirect.material_source != UINT32_MAX &&
+		     !clean.EvaluateDescriptor(indirect.material_source, material_value)) ||
+		    !clean.EvaluateDescriptor(indirect.table_source, table_value)) {
 			return false;
 		}
-		keys.resize(key_count);
-		std::iota(keys.begin(), keys.end(), 0u);
-	} else if (!indirect.selector_mask.IsEmpty()) {
-		uint32_t mask = 0;
-		uint32_t count = 0;
-		if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
-		    !clean.Evaluate(roots.SelectorMask(source), mask) ||
-		    !clean.Evaluate(roots.KeyCount(source), count) || count == 0u || count > 32u) {
+		ShaderBufferResource table;
+		if (table_value.dword_count == 2u) {
+			table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
+		} else if (DecodeBufferDescriptor(table_value, table)) {
+			table_base = table.Base48();
+			table_size = table.GetSize();
+		} else {
 			return false;
 		}
-		if (count < 32u) mask &= (1u << count) - 1u;
-		const auto material_base =
-		    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
-		keys.reserve(std::popcount(mask));
-		while (mask != 0u) {
-			const auto index = std::countr_zero(mask);
-			const auto offset = static_cast<uint64_t>(indirect.selector_offset) +
-			                    static_cast<uint64_t>(index) * indirect.selector_stride;
-			if (offset > UINT32_MAX) return false;
-			uint32_t key = 0;
-			if (!ReadScalarTable(material_base, UINT64_MAX, static_cast<uint32_t>(offset),
-			                     runtime, {&key, 1})) return false;
-			keys.push_back(key);
-			mask &= mask - 1u;
-		}
-		std::ranges::sort(keys);
-		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-	} else {
-		ShaderBufferResource material;
-		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-		    material.Stride() != indirect.selector_stride) {
-			return false;
-		}
-		// The first aligned offset includes the immediate added after shader U32 arithmetic.
-		const auto step = std::max<uint64_t>(4u,
-		    std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u));
-		const uint64_t first = indirect.selector_offset;
-		const auto size = material.GetSize();
-		const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
-		const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
-		if (probe_count > MaxIndirectImageProbes) {
-			return false;
-		}
-		keys.reserve(static_cast<size_t>(probe_count) + 1u);
-		keys.push_back(0u);
-		for (uint64_t probe = 0, offset = first; probe < probe_count; ++probe, offset += step) {
-			uint32_t key = 0;
-			if (!ReadScalarTable(material.Base48(), size, offset, runtime, {&key, 1})) {
+		if (indirect.material_source == UINT32_MAX) {
+			uint32_t key_count = 0;
+			const bool evaluated = clean.Evaluate(roots.KeyCount(source), key_count);
+			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
+			if (table_value.dword_count != 2u || !evaluated ||
+			    key_count > MaxIndirectImageProbes ||
+			    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
 				return false;
 			}
-			keys.push_back(key);
+			keys.resize(key_count);
+			std::iota(keys.begin(), keys.end(), 0u);
+		} else if (!indirect.selector_mask.IsEmpty()) {
+			uint32_t mask = 0;
+			uint32_t count = 0;
+			if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
+			    !clean.Evaluate(roots.SelectorMask(source), mask) ||
+			    !clean.Evaluate(roots.KeyCount(source), count) || count == 0u || count > 32u) {
+				return false;
+			}
+			if (count < 32u) mask &= (1u << count) - 1u;
+			const auto material_base =
+			    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
+			keys.reserve(std::popcount(mask));
+			while (mask != 0u) {
+				const auto index = std::countr_zero(mask);
+				const auto offset = static_cast<uint64_t>(indirect.selector_offset) +
+				                    static_cast<uint64_t>(index) * indirect.selector_stride;
+				if (offset > UINT32_MAX) return false;
+				uint32_t key = 0;
+				if (!ReadScalarTable(material_base, UINT64_MAX, static_cast<uint32_t>(offset),
+				                     runtime, {&key, 1})) return false;
+				keys.push_back(key);
+				mask &= mask - 1u;
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		} else {
+			ShaderBufferResource material;
+			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
+			    material.Stride() != indirect.selector_stride) {
+				return false;
+			}
+			// The first aligned offset includes the immediate added after shader U32 arithmetic.
+			const auto step = std::max<uint64_t>(4u,
+			    std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u));
+			const uint64_t first = indirect.selector_offset;
+			const auto size = material.GetSize();
+			const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
+			const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
+			if (probe_count > MaxIndirectImageProbes) {
+				return false;
+			}
+			keys.reserve(static_cast<size_t>(probe_count) + 1u);
+			keys.push_back(0u);
+			for (uint64_t probe = 0, offset = first; probe < probe_count; ++probe, offset += step) {
+				uint32_t key = 0;
+				if (!ReadScalarTable(material.Base48(), size, offset, runtime, {&key, 1})) {
+					return false;
+				}
+				keys.push_back(key);
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}
-		std::ranges::sort(keys);
-		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
 
 	const auto children_begin = snapshot.images.size();
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto root_image = specialization.images[image_index];
-	snapshot.flattened_srt.resize(mapping_offset + 1u + keys.size() * 2u);
-	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys.size());
-	for (uint32_t entry = 0; entry < keys.size(); ++entry) {
-		const auto key = keys[entry];
+	const auto key_count = sources.empty() ? keys.size() : sources.size();
+	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
+	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
+	for (uint32_t entry = 0; entry < key_count; ++entry) {
+		const auto key = sources.empty() ? keys[entry] : entry;
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
-		const auto table_offset = (key << 5u) + indirect.table_offset;
-		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
+		if (sources.empty()) {
+			const auto table_offset = (key << 5u) + indirect.table_offset;
+			if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
+				return false;
+			}
+		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
 			return false;
 		}
 		if (NullImageDescriptor(candidate) ||
@@ -380,7 +394,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program, const Roots& roots, u
 		auto& root = specialization.images[image_index];
 		root.indirect_root = image_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(keys.size());
+		root.indirect_search_iterations = std::bit_width(key_count);
 	}
 	return true;
 }
@@ -963,24 +977,31 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
-	bool masked_image = false;
+	bool capture_image_reads = false;
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
 		if (source == nullptr || !source->indirect_image.has_value()) {
 			continue;
 		}
 		plan.requires_specialization_memory = true;
-		masked_image |= !source->indirect_image->selector_mask.IsEmpty();
+		capture_image_reads |= !source->indirect_image->selector_mask.IsEmpty() ||
+		                       !source->indirect_image->sources.empty();
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
 		                   plan.clean_flat_slots, source->indirect_image->selector_mask);
-		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
-		                   plan.clean_flat_slots);
+		if (source->indirect_image->sources.empty()) {
+			MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
+			                   plan.clean_flat_slots);
+		} else {
+			for (const auto candidate: source->indirect_image->sources) {
+				MarkCleanFlatSlots(plan, Source(plan, candidate), plan.clean_flat_slots);
+			}
+		}
 	}
 	// The renderer checks the captured reads against what the draw's shaders and targets write.
 	// A plan that writes nothing was already free to follow its branches, and capturing costs it
 	// the refresh memo and the block reads: capture for the plans that write.
 	plan.capture_specialization_reads =
-	    masked_image ||
+	    capture_image_reads ||
 	    (!plan.control_flow.empty() &&
 	     (std::ranges::any_of(plan.info.buffers, &BufferResource::written) ||
 	      std::ranges::any_of(plan.info.images, &ImageResource::written)));
@@ -991,7 +1012,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& image: plan.info.images) {
 		if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
 	}
-	if (masked_image) plan.resource_tracking_complete &= !program.has_address_writes;
+	if (capture_image_reads) plan.resource_tracking_complete &= !program.has_address_writes;
 	return plan;
 }
 
@@ -1291,13 +1312,8 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 				continue;
 			}
 			const auto& indirect = *source->indirect_image;
-			DescriptorValue material;
-			DescriptorValue table;
-			if ((indirect.material_source != UINT32_MAX &&
-			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
-			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
-			    !MaterializeIndirectImage(program, roots, image.source, indirect, material, table,
-			                              i, observed, clean, snapshot, specialization)) {
+			if (!MaterializeIndirectImage(program, roots, image.source, indirect, i, observed, clean,
+			                              snapshot, specialization)) {
 				return false;
 			}
 		} else {

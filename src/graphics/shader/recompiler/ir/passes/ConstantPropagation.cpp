@@ -1253,8 +1253,8 @@ void CollapseIndexedSelects(const BlockList& blocks, PossibleValues& possible) {
 // Keep that identity through scalar EXEC operations and their loop-carried mask Phis.
 class LaneMaskProjection {
 public:
-	explicit LaneMaskProjection(std::unordered_set<Inst*>& lowered_ancillary)
-	    : m_lowered_ancillary(lowered_ancillary) {}
+	LaneMaskProjection(std::unordered_set<Inst*>& lowered_ancillary, PossibleValues& possible)
+	    : m_lowered_ancillary(lowered_ancillary), m_possible(possible) {}
 
 	void Fold(Inst& inst) {
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
@@ -1335,11 +1335,12 @@ private:
 			if (op == ValueOpcode::Phi) result->AddPhiOperand(source->PhiBlock(arg), projected);
 			else result->SetArg(arg, projected);
 		}
-		FoldInstruction(*block, result, m_lowered_ancillary);
+		FoldInstruction(*block, result, m_lowered_ancillary, m_possible);
 		return Value(&*result).Resolve();
 	}
 
 	std::unordered_set<Inst*>& m_lowered_ancillary;
+	PossibleValues&            m_possible;
 	std::unordered_set<const Inst*> m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
 	bool m_grounded = false;
@@ -1350,7 +1351,7 @@ private:
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::unordered_set<Inst*> lowered_ancillary;
 	PossibleValues            possible;
-	LaneMaskProjection mask_projection(lowered_ancillary);
+	LaneMaskProjection mask_projection(lowered_ancillary, possible);
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
 			if (wave_size == 32u) mask_projection.Fold(*inst);
