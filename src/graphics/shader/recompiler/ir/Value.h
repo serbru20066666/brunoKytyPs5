@@ -157,12 +157,12 @@ private:
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;
 	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
