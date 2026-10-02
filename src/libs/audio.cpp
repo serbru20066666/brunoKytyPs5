@@ -428,6 +428,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 }
 
 Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
+	if (freq == 0) {
+		return Id::Invalid();
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	for (int id = 0; id < OUT_PORTS_MAX; id++) {
@@ -552,12 +556,15 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		auto& port = m_out_ports[params[i].handle.GetId()];
 
 		uint64_t controller_queued_us = 0;
+		bool controller_uses_bluetooth = false;
 		if (port.haptics != nullptr) {
 			// Keep the stream alive against close and volume changes.
 			Common::LockGuard lock(m_mutex);
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume);
+			controller_uses_bluetooth =
+			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
@@ -568,12 +575,16 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			}
 		} else {
 			port.queue_primed = false;
-			if (port.type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+			// Bluetooth HID has its own sender. Let the sample clock pace a batch
+			// without another audio device, instead of waiting on the HID queue.
+			if (port.type == AUDIO_OUT_PORT_TYPE_PADSPK && !controller_uses_bluetooth) {
 				any_device = true;
 				if (blocking && controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
-					deadline =
-					    std::max(deadline, LibKernel::KernelGetProcessTime() +
-					                           controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US);
+					// Limit a stalled USB endpoint to one audio block of waiting.
+					const uint64_t block_us = 1000000ULL * port.samples_num / port.freq;
+					deadline = std::max(deadline, LibKernel::KernelGetProcessTime() +
+					                                  std::min(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US,
+					                                           block_us));
 				}
 			}
 		}
@@ -841,6 +852,9 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 
 	if (!audio_out_port_type_is_valid(type)) {
 		return AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+	}
+	if (freq == 0) {
+		return AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
 	}
 	EXIT_NOT_IMPLEMENTED(index != 0);
 
