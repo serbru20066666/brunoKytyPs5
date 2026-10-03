@@ -2183,6 +2183,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("wtkt-teR1so", Posix::pthread_attr_init);
 	LIB_FUNC("zHchY8ft5pk", Posix::pthread_attr_destroy);
 	LIB_FUNC("vQm4fDEsWi8", Posix::pthread_attr_getstack);
+	LIB_FUNC("-SrbXpGR1f0", Posix::pthread_attr_setstack);
 	LIB_FUNC("2Q0z6rnBrTE", Posix::pthread_attr_setstacksize);
 	LIB_FUNC("Ucsu-OK+els", Posix::pthread_attr_get_np);
 	LIB_FUNC("RtLRV-pBTTY", Posix::pthread_attr_getschedpolicy);
