@@ -1451,7 +1451,7 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 		if (DrainStats::Enabled() && range.Valid()) {
 			m_dcc_metadata_seen.Add(range.address, range.size);
 		}
-		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
+		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return ColorClearOutcome::NoSlices;
 		}
 	}

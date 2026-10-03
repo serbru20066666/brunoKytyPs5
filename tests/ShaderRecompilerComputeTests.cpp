@@ -10224,18 +10224,19 @@ public:
     constexpr uintptr_t base = 0x0000000204100000ull;
     constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t allocation_alignment = 0x10000;
-    constexpr uint64_t dcc_address = base + 0x100000;
     struct FillCase {
       uint32_t fill;
       std::array<uint32_t, 2> texel;
       bool reuse_unorm = false;
       bool cmask = false;
+      bool reuse_mips = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
         FillCase{0x80808080u, {0x3c003c00u, 0x00003c00u}},
         FillCase{0x40404040u, {0, 0x3c000000u}, true},
         FillCase{0, {0x804020ffu, 0}, false, true},
+        FillCase{0x40404040u, {0, 0x3c000000u}, false, false, true},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -10294,6 +10295,7 @@ public:
     for (const bool gpu_clear : {true, false}) {
     std::memset(mapped, 0, allocation_size);
     for (const auto &fill_case : cases) {
+      const uint64_t dcc_address = base + (fill_case.reuse_mips ? 0x160000 : 0x100000);
       const uint32_t selected_layer = fill_case.cmask ? 1 : 0;
       const uint64_t metadata_size = fill_case.cmask ? 0x2000 : dcc_size.size;
       const std::vector<u32> expected(
@@ -10338,20 +10340,39 @@ public:
         auto &texture_cache = resources.GetTextureCache();
         auto &executor = context.GetRenderExecutor();
         resources.MapMemory(base, allocation_size);
-        ImageId unorm_id{};
-        if (fill_case.reuse_unorm) {
+        ImageId preexisting_id{};
+        if (fill_case.reuse_unorm || fill_case.reuse_mips) {
           const auto float_info = registers.GetRenderTarget(0).info;
-          auto unorm_info = float_info;
-          unorm_info.dcc_compression_enable = false;
-          unorm_info.channel_type = Prospero::ChannelType::kUNorm;
-          registers.SetColorInfo(0, unorm_info);
-          RenderColorInfo unorm{};
+          const auto single_mip = registers.GetRenderTarget(0).attrib2;
+          auto initial_info = float_info;
+          initial_info.dcc_compression_enable = false;
+          initial_info.cmask_fast_clear_enable = false;
+          if (fill_case.reuse_unorm) {
+            initial_info.channel_type = Prospero::ChannelType::kUNorm;
+          }
+          auto initial_mips = single_mip;
+          initial_mips.num_mip_levels = fill_case.reuse_mips ? 1 : 0;
+          registers.SetColorInfo(0, initial_info);
+          registers.SetColorAttrib2(0, initial_mips);
+          RenderColorInfo preexisting{};
           RenderExecutorTestAccess::ResolveRenderColorTarget(
-              executor, scheduler.Current(), unorm, 0);
-          unorm_id = unorm.image_id;
-          (void)texture_cache.FindRenderTarget(unorm_id, unorm.desc);
+              executor, scheduler.Current(), preexisting, 0);
+          preexisting_id = preexisting.image_id;
+          (void)texture_cache.FindRenderTarget(preexisting_id, preexisting.desc);
+          if (fill_case.reuse_mips) {
+            Require(name, "mip chain excludes metadata",
+                    preexisting.desc.info.data.address + preexisting.desc.info.data.size <=
+                        dcc_address,
+                    "the mip preservation fixture overlaps its color metadata");
+            vk::ClearValue clear{};
+            clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 0.0f};
+            TextureCacheTestAccess::ClearImage(
+                texture_cache, scheduler.Current(), preexisting_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1}, clear);
+          }
           RenderExecutorTestAccess::ResetBindings(executor);
           registers.SetColorInfo(0, float_info);
+          registers.SetColorAttrib2(0, single_mip);
         }
         const auto fill_metadata = [&](uint32_t count, bool raw = false) {
           const auto *shader = &native_fill;
@@ -10384,8 +10405,8 @@ public:
             executor, scheduler.Current(), &color, 1, no_depth);
         if (fill_case.reuse_unorm) {
           Require(name, "FLOAT clear reuses UNORM image",
-                  color.image_id == unorm_id &&
-                      texture_cache.GetImage(unorm_id).backing.format ==
+                  color.image_id == preexisting_id &&
+                      texture_cache.GetImage(preexisting_id).backing.format ==
                           vk::Format::eR16G16B16A16Unorm,
                   "the aliased clear did not reuse its existing UNORM allocation");
         }
@@ -10406,6 +10427,19 @@ public:
                     ReadCachedTexel(name, context, color.image_id, {511, 255, 0},
                                     {1, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
+        if (fill_case.reuse_mips) {
+          const auto &image = texture_cache.GetImage(color.image_id);
+          Require(name, "single-mip clear reuses mip chain",
+                  color.image_id == preexisting_id && image.info.resources.levels == 2 &&
+                      color.desc.info.resources.levels == 1 &&
+                      color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
+                  "the single-mip target did not retain its cached image and view scope");
+          Require(name, "single-mip clear preserves higher mip",
+                  ReadCachedTexel(name, context, color.image_id, {255, 127, 0},
+                                  {1, 1, 1}, 0, 1) ==
+                      std::vector<u32>{0x00003c00u, 0x00003c00u},
+                  "clearing mip zero changed its higher mip");
+        }
         const auto check_expanded_metadata = [&] {
           context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
           std::vector<uint8_t> bytes(metadata_size);
