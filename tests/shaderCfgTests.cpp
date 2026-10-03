@@ -1821,28 +1821,71 @@ void TestNggVertexEntryState() {
   }
 }
 
-void TestNewShaderRecompilerSopkWaitcntMarkers() {
-  const uint32_t shader[] = {
-      EncodeSopk(0x17, 125, 0xffff), // s_waitcnt_vscnt null, 0xffff
-      EncodeSopk(0x18, 125, 0),      // s_waitcnt_vmcnt null, 0
-      EncodeSopk(0x19, 125, 0),      // s_waitcnt_expcnt null, 0
-      EncodeSopk(0x1a, 125, 0),      // s_waitcnt_lgkmcnt null, 0
-      EncodeSopp(0x01, 0),           // s_endpgm
-  };
+void TestNativeStoreCompletion() {
+  using namespace ShaderRecompiler;
+  const std::array register_wait = {EncodeSopk(0x17, 4, static_cast<int16_t>(0x9234)), EncodeSopp(0x01)};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(register_wait, decoded);
+  const auto &wait = decoded.instructions.front();
+  Check(wait.opcode == Decoder::Opcode::S_WAITCNT_VSCNT &&
+            wait.src0.kind == Decoder::OperandKind::Sgpr && wait.src0.reg == 4 &&
+            wait.src1.value == 0x9234u,
+        "store completion lost its counter kind, source, or unsigned immediate");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  options.input_info.compute = &compute;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    compute.threads_num[0] = compute.wave_size = options.wave_size = wave_size;
+    const std::array barrier_only = {0xbbfd0000u, EncodeSopp(0x01)};
+    const auto minimal = RecompileForTest(barrier_only, options);
+    CheckSpirvBinaryValidates(minimal.spirv);
+    Check(SpirvContainsCapability(minimal.spirv, 61),
+          "standalone store completion lacks GroupNonUniform capability");
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_waitcnt 0") != std::string::npos),
-        "new decoder did not decode SOPK waitcnt marker");
-  Check((result.decoded_dump.find("s_waitcnt 65535") != std::string::npos),
-        "SOPK waitcnt marker immediate was not kept unsigned");
-  Check((result.ir_dump.find("Waitcnt null, 0x00000000") != std::string::npos),
-        "SOPK waitcnt did not lower to an IR marker");
-  Check((result.ir_dump.find("Waitcnt null, 0x0000ffff") != std::string::npos),
-        "SOPK waitcnt marker immediate was not translated as 16-bit unsigned");
-  CheckSpirvBinaryValidates(result.spirv);
+    // Captured 5b10:0x2464 drains node stores before the next parent atomic.
+    const std::array publication = {
+        EncodeVop1(0x01, 1, 129),
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0),
+        0xbbfd0000u,
+        EncodeMubuf0(0x32, 4, false, true), EncodeMubuf1(1, 0, 0),
+        EncodeSopp(0x01),
+    };
+    const auto result = RecompileForTest(publication, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto store = result.ir_dump.find("StoreBufferU32");
+    const auto completion = result.ir_dump.find("StoreCompletion");
+    const auto atomic = result.ir_dump.find("BufferAtomicIAdd32");
+    Check(store < completion && completion < atomic && atomic != std::string::npos,
+          "store completion moved outside its native publication order");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    const auto barrier = source.find("OpControlBarrier %uint_3 %uint_1 %uint_2116");
+    Check(barrier != std::string::npos &&
+              source.find("OpStore") < barrier &&
+              barrier < source.find("OpAtomicIAdd") &&
+              source.find("OpControlBarrier", barrier + 1) == std::string::npos,
+          "store completion must synchronize the subgroup once after both wave halves");
+  }
+
+  const std::array no_store_wait = {
+      EncodeSopk(0x17, 125, 0xffff), // Effective VSCNT 63 waits for nothing.
+      EncodeSopk(0x18, 125, 0), EncodeSopk(0x19, 125, 0),
+      EncodeSopk(0x1a, 125, 0), EncodeSopp(0x01),
+  };
+  const auto no_wait = RecompileForTest(no_store_wait, options);
+  const auto source = DisassembleSpirvBinary(no_wait.spirv);
+  Check(source.find("OpControlBarrier") == std::string::npos &&
+            source.find("OpMemoryBarrier") == std::string::npos,
+        "other wait counters or VSCNT 63 became a store completion barrier");
+#ifndef _WIN32
+  for (const uint32_t word : {EncodeSopk(0x17, 125, 1), register_wait[0]}) {
+    const std::array unsupported = {word, EncodeSopp(0x01)};
+    ExpectFatal([&] { (void)RecompileForTest(unsupported, options); },
+                "unsupported partial or register-based store wait was dropped");
+  }
+#endif
 }
 
 void TestSopkCompareImmediateExtension() {
@@ -14471,6 +14514,7 @@ int main() {
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
+  TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();

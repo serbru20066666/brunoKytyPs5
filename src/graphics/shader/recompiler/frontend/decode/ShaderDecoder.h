@@ -625,6 +625,7 @@ enum class Opcode {
 
 	S_NOP,
 	S_WAITCNT,
+	S_WAITCNT_VSCNT,
 	S_WAITCNT_DEPCTR,
 	S_BARRIER,
 	S_BRANCH,

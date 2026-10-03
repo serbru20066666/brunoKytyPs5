@@ -270,7 +270,7 @@ private:
 	void ScalarMinMax32(const Decoder::Instruction& inst, IR::ValueOpcode value_opcode,
 	                    IR::ValueOpcode compare_opcode);
 	void EmitControlNop();
-	void EmitWaitcnt();
+	void S_WAITCNT_VSCNT(const Decoder::Instruction& inst);
 	void S_BARRIER();
 	void S_SENDMSG(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();

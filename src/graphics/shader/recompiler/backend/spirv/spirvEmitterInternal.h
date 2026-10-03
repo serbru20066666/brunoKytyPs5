@@ -62,6 +62,7 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 struct SpirvRequirements {
 	bool bvh                          = false;
 	bool subgroup_ballot              = false;
+	bool subgroup_barrier             = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
 	bool compute_derivatives          = false;

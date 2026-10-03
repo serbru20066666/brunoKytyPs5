@@ -30125,11 +30125,14 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
-TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
+TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
+                                  bool store_completion = false) {
   using O = ShaderOpcode;
   constexpr u32 groups = 31;
   TestCase test;
-  test.name = dlc_only ? "BufferWorkgroupPublicationDlc"
+  test.name = store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
+                                                 : "Wave32StoreCompletionPublication")
+             : dlc_only ? "BufferWorkgroupPublicationDlc"
              : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
                                : "BufferWorkgroupPublicationWave32";
   auto &code = test.code;
@@ -30144,15 +30147,21 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
   AppendVMovU32(&code, 2, 0);
   code.push_back(EncodeSMovB32(21, InlineU32(0)));
   AppendSMovLiteral(&code, 22, 1000000);
+  if (store_completion) AppendSMovLiteral(&code, 26, groups * 4);
   code.push_back(EncodeSopc(0x06, 20, InlineU32(0)));
   const auto first_ticket = code.size();
   code.push_back(0);
 
   const auto poll = code.size();
+  if (store_completion) {
+    code.push_back(EncodeVop2(0x25, 4, 26, 20));
+    AppendVMovU32(&code, 3, 0);
+    AppendBufferStoreOpcode(&code, 0x32, 3, 4, true);
+  }
   code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
   code.push_back(EncodeMubuf1(2, 12, 20));
   code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
-  code.push_back(EncodeVop1(0x02, 23, Vgpr(2)));
+  code.push_back(EncodeVop1(0x02, 23, Vgpr(store_completion ? 3 : 2)));
   code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
   const auto ready = code.size();
   code.push_back(0);
@@ -30167,15 +30176,33 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
   code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
   code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
   code.push_back(EncodeVop2(0x25, 20, InlineU32(4), 20));
+  if (store_completion) {
+    // The last lane writes the payload; lane zero publishes readiness after the
+    // native wave-wide store completion, including both emulated wave64 halves.
+    code.push_back(EncodeVop1(0x02, 24, Vgpr(2)));
+    code.push_back(EncodeVop1(0x02, 25, Vgpr(20)));
+    code.push_back(EncodeSop1(0x04, 126, 193u));
+    code.push_back(EncodeVop1(0x01, 2, 24));
+    code.push_back(EncodeVop1(0x01, 20, 25));
+    code.push_back(EncodeSop2(0x1f, 126, InlineU32(1), InlineU32(wave_size - 1)));
+  }
   // RDNA2 stores publish to L2 even without GLC/DLC on the producer.
   AppendBufferStoreDword(&code, 2, 20);
+  if (store_completion) {
+    code.push_back(0xbbfd0000u); // Captured S_WAITCNT_VSCNT null, 0 at 5b10:0x2464.
+    code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+    code.push_back(EncodeVop2(0x25, 4, 26, 20));
+    AppendVMovU32(&code, 3, 1);
+    AppendBufferStoreOpcode(&code, 0x32, 3, 4, true);
+  }
   AppendEnd(&code);
 
-  test.initial.assign(groups + 1, 0);
+  test.initial.assign(groups * (store_completion ? 2 : 1) + 1, 0);
   test.expected = {groups};
   for (u32 ticket = 0; ticket < groups; ++ticket) {
     test.expected.push_back((ticket + 1) * (ticket + 2) / 2);
   }
+  if (store_completion) test.expected.resize(groups * 2 + 1, 1);
   test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::V_MOV_B32,
                   O::BUFFER_ATOMIC_ADD, O::V_READFIRSTLANE_B32,
                   O::V_LSHLREV_B32, O::S_CMP_EQ_U32, O::S_CMP_LG_U32,
@@ -30183,6 +30210,11 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
                   O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  if (store_completion) {
+    test.opcodes.push_back(O::S_WAITCNT_VSCNT);
+    test.opcodes.push_back(O::S_LSHL_B64);
+    test.required_spirv.push_back("OpControlBarrier %uint_3 %uint_1 %uint_2116");
+  }
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -33330,6 +33362,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(32));
   cases.push_back(BufferWorkgroupPublication(64));
   cases.push_back(BufferWorkgroupPublication(32, true));
+  cases.push_back(BufferWorkgroupPublication(32, false, true));
+  cases.push_back(BufferWorkgroupPublication(64, false, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -39054,6 +39088,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferWorkgroupPublication(32));
     RunCase(&vulkan, BufferWorkgroupPublication(64));
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(64, false, true));
     RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }

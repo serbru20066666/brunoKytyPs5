@@ -18,7 +18,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
-		case O::S_WAITCNT: EmitWaitcnt(); return;
+		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
+		case O::S_WAITCNT: return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
@@ -224,7 +225,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return;
+		case O::S_WAITCNT_DEPCTR: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;

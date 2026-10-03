@@ -208,8 +208,12 @@ void Translator::EmitControlNop() {
 	ir.Emit(IR::ValueOpcode::ControlNop);
 }
 
-void Translator::EmitWaitcnt() {
-	ir.Emit(IR::ValueOpcode::Waitcnt);
+void Translator::S_WAITCNT_VSCNT(const Decoder::Instruction& inst) {
+	const auto count = inst.src1.value & 63u;
+	if (inst.src0.kind != Decoder::OperandKind::Null || (count != 0u && count != 63u)) {
+		EXIT("unsupported partial or register-based S_WAITCNT_VSCNT at 0x%08x", inst.pc);
+	}
+	if (count == 0u) ir.Emit(IR::ValueOpcode::StoreCompletion);
 }
 
 void Translator::S_BARRIER() {

@@ -316,7 +316,7 @@ VALUE_OPCODE(GetInterpolationParameter, U32, U32, U32, U32)
 VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 
 VALUE_OPCODE(ControlNop, Void)
-VALUE_OPCODE(Waitcnt, Void)
+VALUE_OPCODE(StoreCompletion, Void)
 VALUE_OPCODE(Barrier, Void)
 VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
