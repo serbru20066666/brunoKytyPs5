@@ -6046,6 +6046,91 @@ public:
         previous = id;
       }
 
+      // The game reuses a raw render target allocation for a larger BC5 mip
+      // chain. Equal block extents do not make their guest tiling compatible.
+      constexpr uint64_t bc5_alias_offset = 0x1800000;
+      TileSurfaceLayout bc5_surface{};
+      Require(name, "BC5 alias layout",
+              TileGetTiledTextureLayout(
+                  {.format = Prospero::BufferFormat::kBc5UNorm,
+                   .tile_mode = Prospero::TileMode::kStandard64KB,
+                   .width = 1024, .height = 1024, .levels = 11}, bc5_surface) &&
+                  bc5_surface.total_size == 0x160000,
+              "captured BC5 allocation no longer has its 0x160000-byte footprint");
+      std::memset(memory + bc5_alias_offset, 0, bc5_surface.total_size);
+      auto raw_alias = MakeLinearDesc(
+          base + bc5_alias_offset, 0x100000, vk::Format::eR32G32B32A32Sfloat,
+          Prospero::BufferFormat::k32_32_32_32Float, Prospero::ImageType::kColor2D,
+          {256, 256, 1}, 1, 16, 1);
+      raw_alias.type = BindingType::RenderTarget;
+      raw_alias.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      raw_alias.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto raw_alias_id = texture_cache.FindImage(raw_alias);
+      (void)texture_cache.FindRenderTarget(raw_alias_id, raw_alias);
+      vk::ClearValue raw_alias_clear{};
+      std::fill_n(raw_alias_clear.color.float32.data(), 4, 1.0f);
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), raw_alias_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, raw_alias_clear);
+      Require(name, "BC5 alias CPU overwrite",
+              resources.InvalidateMemory(base + bc5_alias_offset,
+                                         bc5_surface.total_size),
+              "new BC5 data could not invalidate the old render target");
+      std::vector<u32> bc5_guest(bc5_surface.total_size / sizeof(u32));
+      std::iota(bc5_guest.begin(), bc5_guest.end(), 0x41000000u);
+      std::memcpy(memory + bc5_alias_offset, bc5_guest.data(),
+                  bc5_surface.total_size);
+      auto bc5_alias = MakeLinearDesc(
+          base + bc5_alias_offset, bc5_surface.total_size, vk::Format::eBc5UnormBlock,
+          Prospero::BufferFormat::kBc5UNorm, Prospero::ImageType::kColor2D,
+          {1024, 1024, 1}, 1, 16, 1);
+      bc5_alias.info.resources.levels = 11;
+      bc5_alias.info.tile_mode = Prospero::TileMode::kStandard64KB;
+      bc5_alias.view_info.level_count = 11;
+      std::vector<vk::BufferImageCopy> bc5_probes;
+      std::vector<u32> bc5_expected;
+      for (u32 level = 0; level < 11; ++level) {
+        const auto &layout = bc5_surface.mips[level];
+        bc5_alias.info.mip_layout[level] = {
+            layout.offset, layout.size, layout.padded_width, layout.padded_height};
+        u32 offset = 0;
+        Require(name, "BC5 alias block address",
+                TileGetBlockOffset(bc5_surface.texture.block, layout.tail_x,
+                                   layout.tail_y, 0, offset),
+                "BC5 mip origin could not be addressed in guest memory");
+        vk::BufferImageCopy copy{};
+        copy.bufferOffset = bc5_expected.size() * sizeof(u32);
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1};
+        copy.imageExtent = {std::min(1024u >> level, 4u),
+                            std::min(1024u >> level, 4u), 1};
+        bc5_probes.push_back(copy);
+        const auto word = (layout.offset + offset) / sizeof(u32);
+        bc5_expected.insert(bc5_expected.end(), bc5_guest.begin() + word,
+                            bc5_guest.begin() + word + 4);
+      }
+      const auto bc5_alias_id = texture_cache.FindImage(bc5_alias);
+      Require(name, "BC5 alias owner separation",
+              bc5_alias_id != raw_alias_id &&
+                  TextureCacheTestAccess::Contains(texture_cache, raw_alias_id) &&
+                  !texture_cache.GetImage(bc5_alias_id).usage.render_target &&
+                  texture_cache.GetImage(bc5_alias_id).info.tile_mode ==
+                      Prospero::TileMode::kStandard64KB,
+              "BC5 image expanded the unrelated raw render target or inherited its usage");
+      (void)texture_cache.FindTexture(bc5_alias_id, bc5_alias);
+      auto bc5_readback = CreateHostBuffer(
+          name, bc5_expected.size() * sizeof(u32),
+          vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>(bc5_expected.size()));
+      texture_cache.GetImage(bc5_alias_id).Download(
+          bc5_probes, bc5_readback.buffer, 0, bc5_readback.size);
+      HostReadBarrier(bc5_readback.buffer, bc5_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "BC5 alias mip contents",
+              ReadBuffer(name, bc5_readback, bc5_expected.size()) == bc5_expected,
+              "raw render-target copying overwrote the BC5 guest mip layout");
+      DestroyBuffer(&bc5_readback);
+
       // A formatted Buffer read must use the private
       // Exercise the cache-native image-copy path. Use a request larger
       // than the stream shortcut and poison guest backing
@@ -7447,7 +7532,7 @@ public:
       std::memset(memory + layered_offset, 0, layered_guest_size);
       const auto layered_layout = TextureCalcUploadLayout(
           Prospero::BufferFormat::k32Float, 2, 2, 2, 2,
-          Prospero::TileMode::kLinear, layered_guest_size, true, false,
+          Prospero::TileMode::kLinear, layered_guest_size, false,
           "UnifiedTextureCacheFlow");
       const auto layered_upload_regions =
           TextureBuildImageCopies(layered_layout);
@@ -16655,7 +16740,7 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, 128, 128, 1, tile, &total, nullptr, nullptr);
       const auto layout = TextureCalcUploadLayout(
-          format, 128, 128, 1, 1, tile, total.size, false, false, name);
+          format, 128, 128, 1, 1, tile, total.size, false, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       Require(name, "FMASK policy",
@@ -16691,7 +16776,7 @@ public:
 
         const auto layout =
             TextureCalcUploadLayout(format, width, height, 1, 1, mode.tile,
-                                    total.size, false, false, name);
+                                    total.size, false, name);
         const auto regions = TextureBuildImageCopies(layout);
         std::vector<GpuTileInfo> infos;
         if (!TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos)) {
@@ -16788,7 +16873,7 @@ public:
                          nullptr);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, levels, 1, tile,
-                                  total.size, false, false, name);
+                                  total.size, false, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       const bool built =
@@ -16815,7 +16900,7 @@ public:
                               total);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, 1, layers, tile,
-                                  total.size, true, false, name);
+                                  total.size, false, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       const bool built =
@@ -16840,7 +16925,7 @@ public:
                          nullptr, nullptr);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
-                                  total.size, false, false, name);
+                                  total.size, false, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       Require(name, "odd mip infos",
@@ -16879,7 +16964,7 @@ public:
                          nullptr, nullptr);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
-                                  total.size, true, false, name);
+                                  total.size, false, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       Require(name, "2D mip tail seam",
@@ -16905,7 +16990,7 @@ public:
                               total);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, levels, depth, tile,
-                                  total.size, false, true, name);
+                                  total.size, true, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       const bool built =
@@ -16936,7 +17021,7 @@ public:
                               total);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, levels, depth, tile,
-                                  total.size, false, true, name);
+                                  total.size, true, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       Require(name, "3D BC mip infos",
@@ -16958,7 +17043,7 @@ public:
                          nullptr);
       const auto layout =
           TextureCalcUploadLayout(format, width, height, levels, 1, tile,
-                                  total.size, false, false, name);
+                                  total.size, false, name);
       const auto regions = TextureBuildImageCopies(layout);
       Require(name, "linear BC native regions",
               regions.size() == levels &&
@@ -17000,7 +17085,7 @@ public:
                               test.tile, true, total);
       const auto layout =
           TextureCalcUploadLayout(test.format, width, height, levels, depth,
-                                  test.tile, total.size, true, true, name);
+                                  test.tile, total.size, true, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       const bool built =
@@ -17059,7 +17144,7 @@ public:
                               true, total);
       const auto layout =
           TextureCalcUploadLayout(tail.format, width, height, levels, depth,
-                                  tile, total.size, false, true, name);
+                                  tile, total.size, true, name);
       const auto regions = TextureBuildImageCopies(layout);
       std::vector<GpuTileInfo> infos;
       bool valid = total.size == 8192 &&
@@ -17181,7 +17266,7 @@ public:
                             volume_size);
     const auto volume_layout = TextureCalcUploadLayout(
         volume_format, volume_width, volume_height, volume_levels, volume_depth,
-        volume_tile, volume_size.size, true, true, name);
+        volume_tile, volume_size.size, true, name);
     const auto volume_copies = TextureBuildImageCopies(volume_layout);
     std::vector<u32> volume_source(volume_size.size / sizeof(u32), 0);
     std::vector<std::pair<size_t, u32>> volume_probes;
@@ -35431,7 +35516,7 @@ void CheckStorageTextureLinearUploadLayout() {
   TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
   const auto layout =
       TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size,
-                              true, false, "StorageTextureLinearTest");
+                              false, "StorageTextureLinearTest");
   const auto regions = TextureBuildImageCopies(layout);
   Require("StorageTextureLinearUpload", "layout",
           pitch == width && total.size == 0x1fa4000 && total.align == 256 &&
@@ -35460,7 +35545,7 @@ void CheckStorageTextureDepthTileUploadLayout() {
   TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
   const auto layout =
       TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size,
-                              true, false, "StorageTextureDepthTileTest");
+                              false, "StorageTextureDepthTileTest");
   const auto regions = TextureBuildImageCopies(layout);
   Require("StorageTextureDepthTileUpload", "PPSA14053 layout",
           pitch == 256 && padded.width == 256 && padded.height == 256 &&
@@ -35786,7 +35871,7 @@ void CheckStorageTextureVolumeUploadLayout() {
                           Prospero::TileMode::kRenderTarget, true, total);
   const auto layout = TextureCalcUploadLayout(
       format, width, height, 1, depth, Prospero::TileMode::kRenderTarget,
-      total.size, true, true, "StorageTextureVolumeTest");
+      total.size, true, "StorageTextureVolumeTest");
   const auto regions = TextureBuildImageCopies(layout);
   Require(
       "StorageTextureVolumeUpload", "layout",
@@ -35821,7 +35906,7 @@ void CheckStorageTextureVolumeMipRegions() {
   TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                           total);
   const auto layout = TextureCalcUploadLayout(
-      format, width, height, levels, depth, tile, total.size, true, true,
+      format, width, height, levels, depth, tile, total.size, true,
       "StorageTextureVolumeMipTest");
   const auto copies = TextureBuildImageCopies(layout);
 

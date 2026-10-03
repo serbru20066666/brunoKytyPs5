@@ -994,13 +994,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
-		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			return {ExpandImage(requested, cached_id)};
-		}
-		if (requested.data.size == cached.info.data.size &&
-		    (requested.IsVolume() || cached.info.IsVolume())) {
-			return {ExpandImage(requested, cached_id)};
-		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
@@ -1011,6 +1004,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				FreeImage(cached_id);
 			}
 			return {merged_id};
+		}
+		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.data.size == cached.info.data.size &&
+		    (requested.IsVolume() || cached.info.IsVolume())) {
+			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
 		// A view cannot change the native image type or grow its extent.
@@ -1085,9 +1085,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	ChurnReason reason("expand");
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
-	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
-	expanded.usage         = source.usage;
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
@@ -1133,22 +1131,12 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	const bool  upload           = direction == TransferDirection::Upload;
 	const bool  render_target    = binding == BindingType::RenderTarget;
 	const bool  video_out        = binding == BindingType::VideoOut;
-	auto        format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
 	bool        volume           = info.IsVolume();
-	bool        allow_depth_tile = upload;
 	const char* owner            = "TextureCache readback";
 
 	TextureTransfer transfer;
-	transfer.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
-	if (render_target) {
-		format = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
-	}
-	if (video_out) {
-		allow_depth_tile = false;
-	} else if (render_target || binding == BindingType::Storage) {
-		allow_depth_tile = true;
-	}
+	transfer.swap_bgra16 = info.bgra16;
 	if (upload) {
 		if ((render_target || video_out) &&
 		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
@@ -1170,9 +1158,9 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 		}
 	}
 
-	transfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
-	                                       info.resources.levels, layers, info.tile_mode,
-	                                       info.data.size, allow_depth_tile, volume, owner);
+	transfer.layout = TextureCalcUploadLayout(info.guest_format, info.extent.width,
+	                                         info.extent.height, info.resources.levels, layers,
+	                                         info.tile_mode, info.data.size, volume, owner);
 	transfer.regions = TextureBuildImageCopies(transfer.layout);
 	if (info.IsDepth()) {
 		for (auto& region: transfer.regions) {
