@@ -551,6 +551,7 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     // partial destination may combine with any source selector.
     {Opcode::V_NOT_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::V_BFREV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_FFBL_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_FFBH_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},

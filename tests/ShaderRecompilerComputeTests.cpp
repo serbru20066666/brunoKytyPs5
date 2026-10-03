@@ -21281,6 +21281,36 @@ TestCase VectorFfbhI32NativeAndVop3OnGpu() {
   return test;
 }
 
+TestCase Vop1SdwaBfrevSourceSelectors() {
+  using O = ShaderOpcode;
+  constexpr u32 expected[2][7] = {
+      {0x8f000000u, 0xd5000000u, 0x21000000u, 0x49000000u,
+       0x8fd50000u, 0x21490000u, 0x8fd52149u},
+      {0x8fffffffu, 0xd5ffffffu, 0x21ffffffu, 0x49ffffffu,
+       0x8fd5ffffu, 0x2149ffffu, 0x8fd52149u}};
+  TestCase test;
+  test.name = "Vop1SdwaBfrevSourceSelectors";
+  for (u32 sext = 0; sext < 2; sext++) {
+    for (u32 selector = 0; selector < 7; selector++) {
+      const u32 index = static_cast<u32>(test.initial.size());
+      AppendVMovU32(&test.code, 30, index * 4u);
+      AppendBufferLoadDword(&test.code, 0, 30);
+      // selector=4, sext=0 reproduces captured words 7e0070f9, 00040600.
+      test.code.insert(test.code.end(),
+                       {0x7e0070f9u, EncodeVop1Sdwa(0, 6, 0, selector, sext)});
+      AppendStoreVgpr(&test.code, 0, index);
+      test.initial.push_back(0x9284abf1u);
+      test.expected.push_back(expected[sext][selector]);
+    }
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_BFREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_BFREV_B32 v0, v0.sdwa(sel=4,sext=0)", 1}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitReverse"};
+  return test;
+}
+
 TestCase Vop1SdwaFfbhCapturedScalarLowWordSource() {
   using O = ShaderOpcode;
 
@@ -33519,6 +33549,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
+  AddCase(Vop1SdwaBfrevSourceSelectors);
   AddCase(Vop1SdwaFfbhCapturedScalarLowWordSource);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
@@ -39266,6 +39297,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ffbh-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaBfrevSourceSelectors());
     RunCase(&vulkan, Vop1SdwaFfbhCapturedScalarLowWordSource());
     RunCase(&vulkan, VectorFfbhI32NativeAndVop3OnGpu());
     RunCase(&vulkan, Vop1SdwaFfblCapturedHighWordSource());

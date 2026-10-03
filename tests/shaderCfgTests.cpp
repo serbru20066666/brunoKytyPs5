@@ -3583,6 +3583,27 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
         "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
 }
 
+void TestNewShaderRecompilerVop1SdwaBfrev() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t captured[] = {0x7e0070f9u, 0x00040600u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.opcode == Opcode::V_BFREV_B32 && decoded.word_count == 2 &&
+            decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == 0 &&
+            decoded.dst.sdwa_sel == 6 && decoded.src0.kind == OperandKind::Vgpr &&
+            decoded.src0.reg == 0 && decoded.src0.sdwa_sel == 4 &&
+            !decoded.src0.sdwa_sext,
+        "captured V_BFREV_B32 SDWA source metadata is incorrect");
+  for (const uint32_t modifier : {0x00070600u, 0x00140600u, 0x00240600u,
+                                 0x00042600u, 0x00044600u, 0x00040400u,
+                                 0x00041e00u}) {
+    const uint32_t invalid[] = {captured[0], modifier};
+    DecodeInstruction(invalid, 0, decoded);
+    Check(decoded.word_count == 2 && decoded.opcode == Opcode::UNSUPPORTED,
+          "V_BFREV_B32 SDWA accepted unsupported selectors or modifiers");
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
@@ -14573,6 +14594,7 @@ int main() {
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
+  TestNewShaderRecompilerVop1SdwaBfrev();
   TestNewShaderRecompilerVop1SdwaNotDestination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized SPIR-V are exercised by
