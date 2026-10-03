@@ -590,7 +590,10 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	return function;
 }
 
-RedZoneMask TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
+std::optional<RedZoneMask> TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
+	if (stack_pointer_delta == 0) {
+		return mask;
+	}
 	RedZoneMask translated;
 	for (size_t bit = 0; bit < GuestRedZoneSize; ++bit) {
 		if (!mask.test(bit)) {
@@ -598,9 +601,12 @@ RedZoneMask TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delt
 		}
 		const s64 after_offset  = static_cast<s64>(bit) - static_cast<s64>(GuestRedZoneSize);
 		const s64 before_offset = after_offset + stack_pointer_delta;
-		if (before_offset >= -static_cast<s64>(GuestRedZoneSize) && before_offset < 0) {
-			translated.set(static_cast<size_t>(before_offset + static_cast<s64>(GuestRedZoneSize)));
+		if (before_offset < -static_cast<s64>(GuestRedZoneSize) || before_offset >= 0) {
+			// A later inverse RSP adjustment can bring this byte back into the red zone.
+			// Losing its stack-slot identity makes the bounded analysis inconclusive.
+			return std::nullopt;
 		}
+		translated.set(static_cast<size_t>(before_offset + static_cast<s64>(GuestRedZoneSize)));
 	}
 	return translated;
 }
@@ -610,13 +616,16 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 		return;
 	}
 
+	const auto protect_function = [&] {
+		for (auto& [_, decoded]: function.instructions) {
+			decoded.red_zone_live.set();
+		}
+	};
 	if (function.has_indirect_branch || function.requires_conservative_red_zone_tracking ||
 	    std::ranges::any_of(function.branch_targets, [&function](uintptr_t target) {
 		    return !function.instructions.contains(target);
 	    })) {
-		for (auto& [_, decoded]: function.instructions) {
-			decoded.red_zone_live.set();
-		}
+		protect_function();
 		return;
 	}
 
@@ -653,12 +662,14 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 				add_successor(next_address);
 			}
 
-			const RedZoneMask translated_live_out =
-			    decoded.stack_pointer_delta.has_value()
-			        ? TranslateRedZoneMask(live_out, *decoded.stack_pointer_delta)
-			        : live_out;
+			const auto translated_live_out =
+			    TranslateRedZoneMask(live_out, decoded.stack_pointer_delta.value_or(0));
+			if (!translated_live_out) {
+				protect_function();
+				return;
+			}
 			const RedZoneMask new_live_in =
-			    decoded.red_zone_use | (translated_live_out & ~decoded.red_zone_def);
+			    decoded.red_zone_use | (*translated_live_out & ~decoded.red_zone_def);
 			if (new_live_in != live_in[reverse_index]) {
 				live_in[reverse_index] = new_live_in;
 				changed                = true;
