@@ -249,8 +249,7 @@ private:
 	void    V_BFI_B32(const Decoder::Instruction& inst);
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
-	void    V_ALIGNBIT_B32(const Decoder::Instruction& inst);
-	void    V_ALIGNBYTE_B32(const Decoder::Instruction& inst);
+	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
 	void    V_LSHL_ADD_U32(const Decoder::Instruction& inst);
 	void    V_ADD_LSHL_U32(const Decoder::Instruction& inst);
 	void    V_XAD_U32(const Decoder::Instruction& inst);

@@ -22163,27 +22163,32 @@ TestCase VectorBfeI32SignExtendsField() {
   return test;
 }
 
-TestCase VectorAlignByteUsesFiveBitByteOffset() {
+TestCase VectorAlignByteUsesTwoBitByteOffset() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
   AppendVMovLiteral(&code, 0, 0x11223344u);
   AppendVMovLiteral(&code, 1, 0x55667788u);
-  constexpr u32 offsets[] = {0, 1, 3, 4, 5, 7, 8, 31};
+  const std::vector<u32> offsets = {0, 1, 2, 3, 4, 5, 7, 8, 31, 32, 0xffffffffu};
   for (u32 i = 0; i < static_cast<u32>(std::size(offsets)); i++) {
-    AppendVMovU32(&code, 2, offsets[i]);
+    AppendVMovU32(&code, 2, i * sizeof(u32));
+    AppendBufferLoadDword(&code, 2, 2);
     AppendVop3(&code, 0x14f, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
     AppendStoreVgpr(&code, 10u + i, i);
   }
   AppendEnd(&code);
 
-  return {
-      "VectorAlignByteUsesFiveBitByteOffset",
+  TestCase test{
+      "VectorAlignByteUsesTwoBitByteOffset",
       code,
-      {},
-      {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
-       0x00000011u, 0u, 0u},
-      {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+      offsets,
+      {0x55667788u, 0x44556677u, 0x33445566u, 0x22334455u, 0x55667788u,
+       0x44556677u, 0x22334455u, 0x55667788u, 0x22334455u, 0x55667788u,
+       0x22334455u},
+      {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_ALIGNBYTE_B32,
+       O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.forbidden_spirv = {"OpTypeInt 64"};
+  return test;
 }
 
 TestCase VectorCarryAndBitCountOps() {
@@ -33730,7 +33735,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
-  AddCase(VectorAlignByteUsesFiveBitByteOffset);
+  AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -39441,7 +39446,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
+    RunCase(&vulkan, VectorVop3IntegerOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--zero-shift-only") == 0) {

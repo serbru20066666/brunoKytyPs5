@@ -592,8 +592,8 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_BFE_U32: return V_BFE_U32(inst, false);
 		case O::V_BFE_I32: return V_BFE_U32(inst, true);
 		case O::V_BFI_B32: return V_BFI_B32(inst);
-		case O::V_ALIGNBIT_B32: return V_ALIGNBIT_B32(inst);
-		case O::V_ALIGNBYTE_B32: return V_ALIGNBYTE_B32(inst);
+		case O::V_ALIGNBIT_B32: return V_ALIGN_B32(inst, false);
+		case O::V_ALIGNBYTE_B32: return V_ALIGN_B32(inst, true);
 		case O::V_LSHL_ADD_U32: return V_LSHL_ADD_U32(inst);
 		case O::V_ADD_LSHL_U32: return V_ADD_LSHL_U32(inst);
 		case O::V_XAD_U32: return V_XAD_U32(inst);
