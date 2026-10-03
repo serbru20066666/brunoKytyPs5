@@ -1008,8 +1008,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		if (requested.data.size == cached.info.data.size &&
-		    (requested.IsVolume() || cached.info.IsVolume())) {
+		// Volume depth is not an array-layer count. A larger depth can retain the
+		// same block-slice layout while requiring a larger native image.
+		if ((requested.IsVolume() || cached.info.IsVolume()) &&
+		    (requested.data.size == cached.info.data.size ||
+		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
+		      requested.extent.width == cached.info.extent.width &&
+		      requested.extent.height == cached.info.extent.height &&
+		      requested.extent.depth > cached.info.extent.depth))) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394

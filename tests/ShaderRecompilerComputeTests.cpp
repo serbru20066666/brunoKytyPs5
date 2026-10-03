@@ -9731,9 +9731,10 @@ public:
   void CheckRenderExecutorColorVolumeDiscovery() {
     constexpr const char *name = "RenderExecutorColorVolumeDiscovery";
     constexpr uintptr_t base = 0x0000000203e00000ull;
+    constexpr uint64_t slice_size = 0x10000;
     constexpr uint64_t color_size = 0x200000;
     constexpr uint64_t metadata_size = 0x20000;
-    constexpr uint64_t allocation_size = color_size + metadata_size;
+    constexpr uint64_t allocation_size = 56 * slice_size;
     constexpr uint64_t allocation_alignment = 0x10000;
     EnsureRuntimeContext();
 
@@ -9751,7 +9752,6 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "color-volume fixed mapping failed");
     std::memset(mapped, 0x5a, allocation_size);
-    constexpr uint64_t slice_size = 0x10000;
 
     {
       RenderContext context(m_runtime_context);
@@ -9977,6 +9977,26 @@ public:
                   std::all_of(metadata_bytes.begin(), metadata_bytes.end(),
                               [](uint8_t byte) { return byte == 0xff; }),
               "full volume acquisition left an unconsumed native clear slice");
+
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 31, 1}, painted);
+      auto expanded = storage_desc;
+      expanded.info.extent.depth = 56;
+      expanded.info.data.size = allocation_size;
+      const auto expanded_id = texture_cache.FindImage(expanded);
+      Require(name, "3D storage depth expansion",
+              expanded_id != color.image_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, color.image_id) &&
+                  texture_cache.GetImage(expanded_id).backing.extent.depth == 56 &&
+                  texture_cache.GetImage(expanded_id).IsGpuModified(),
+              "a deeper storage binding reused the smaller native volume");
+      Require(name, "3D expansion preserves native prefix and guest suffix",
+              ReadCachedTexel(name, context, expanded_id, {0, 0, 31}) ==
+                  std::vector<u32>{0x3fffffffu} &&
+                  ReadCachedTexel(name, context, expanded_id, {0, 0, 55}) ==
+                      std::vector<u32>{0x5a5a5a5a},
+              "volume expansion lost GPU writes or copied beyond the old depth");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
