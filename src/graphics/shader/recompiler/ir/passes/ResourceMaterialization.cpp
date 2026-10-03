@@ -1011,12 +1011,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	    (!plan.control_flow.empty() &&
 	     (std::ranges::any_of(plan.info.buffers, &BufferResource::written) ||
 	      std::ranges::any_of(plan.info.images, &ImageResource::written)));
-	// Writable descriptor addresses must come from clean backing for the alias proof.
-	for (const auto& buffer: plan.info.buffers) {
-		if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
-	}
-	for (const auto& image: plan.info.images) {
-		if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
+	if (plan.capture_specialization_reads) {
+		// Clean writable addresses prove that shader writes cannot overlap captured reads.
+		for (const auto& buffer: plan.info.buffers) {
+			if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
+		}
+		for (const auto& image: plan.info.images) {
+			if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
+		}
 	}
 	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
 	return plan;
@@ -1280,7 +1282,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (written ? clean : walker).EvaluateDescriptor(source, value);
+			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1423,7 +1425,10 @@ bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
 		ReadCapture  capture {source, snapshot.specialization_reads};
 		const auto   observed = ObservedRuntime(source, capture_reads, capture);
 		SrtEvaluator clean(program, compiled, CleanRuntime(observed));
-		SrtEvaluator walker(program, compiled, observed, true, &clean);
+		// Only a refresh that captures its reads or needs strict memory evaluates through it.
+		SrtEvaluator walker(program, compiled, observed, true,
+		                    capture_reads || program.requires_specialization_memory ? &clean
+		                                                                             : nullptr);
 		result = Materialize(program, CompiledRoots {compiled}, runtime, observed, capture_reads,
 		                     clean, walker, snapshot, specialization, memo);
 	}
@@ -1592,7 +1597,8 @@ bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime
 	ReadCapture capture {runtime, snapshot.specialization_reads};
 	const auto  observed = ObservedRuntime(runtime, capture_reads, capture);
 	SrtWalker   clean(program, CleanRuntime(observed));
-	SrtWalker   walker(program, observed, program.clean_flat_slots, &clean);
+	SrtWalker   walker(program, observed, program.clean_flat_slots,
+	                   capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	return Materialize(program, WalkerRoots {program}, runtime, observed, capture_reads, clean,
 	                   walker, snapshot, specialization, nullptr);
 }

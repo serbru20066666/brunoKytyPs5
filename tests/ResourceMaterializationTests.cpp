@@ -228,6 +228,7 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 1;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   auto &block = AddValueBlock(program);
@@ -244,7 +245,32 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
+  // A host-evaluable branch captures resource reads and needs the writable
+  // descriptor's clean provenance for the renderer's disjointness proof.
+  auto &condition = block.AppendNewInst(ValueOpcode::IEqual32,
+                                        {Value(&offset), Value(4u)});
+  auto &store_block = AddValueBlock(program);
+  AddValueBlock(program);
+  program.block_info[0].condition = Value(&condition);
+  program.block_info[0].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  program.block_info[0].terminator.true_block = 1;
+  program.block_info[0].terminator.false_block = 2;
+  program.block_info[1].id = 1;
+  program.block_info[1].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  program.block_info[2].id = 2;
+  program.block_info[2].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
   auto plan = ExtractResourcePlan(program);
+  Check(plan.capture_specialization_reads,
+        "conditional writable descriptor lost its alias proof");
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
   const std::array<uint32_t, 1> user_data{4u};
   const SrtRuntime runtime{
@@ -270,7 +296,9 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   reads.clean = true;
   reads.strict = 0;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u,
+            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u &&
+            snapshot.specialization_reads ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}},
         "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
 }
 
@@ -314,7 +342,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
   DescriptorSource root;
   root.dword_count = 8;
   root.dwords.fill(Value(0u));
-  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1, 2, 1};
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 2, 1};
   program.descriptor_sources.push_back(root);
   program.info.images.push_back({
       .source = 3,

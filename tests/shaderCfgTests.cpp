@@ -13201,6 +13201,75 @@ void TestComputeImageFill() {
     Run(mutation);
 }
 
+void TestGpuProducedWritableDescriptor() {
+  using namespace ShaderRecompiler::IR;
+  // Reduced from 994af59d50bedca8: the GPU-built BVH header supplies a relative
+  // output address and record count. CMPX changes EXEC without clobbering VCC.
+  const uint32_t shader[] = {
+      0xf4041a81u, 0xfa000028u, // s_load_dwordx2 vcc, s[2:3], 0x28
+      0xf4000281u, 0xfa000074u, // s_load_dword s10, s[2:3], 0x74
+      0xbe8b03ffu, 0x00016204u, // s_mov_b32 s11, 0x16204
+      0xbf8cc07fu,             // s_waitcnt lgkmcnt(0)
+      0x8008026au,             // s_add_u32 s8, vcc_lo, s2
+      EncodeVopc(0xd5, 129, 0), // v_cmpx_ne_u32 1, v0
+      0x8209036bu,             // s_addc_u32 s9, vcc_hi, s3
+      0xbe891d97u,             // s_bitset1_b32 s9, 23 (stride = 128)
+      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 0),
+      EncodeSopp(0x01),
+  };
+  const std::array<uint32_t, 4> user_data{0u, 0u, 0x00315000u, 3u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written &&
+            !plan.capture_specialization_reads && plan.srt_reads.size() == 3,
+        "native GPU-built writable descriptor acquired an unnecessary alias proof");
+  struct Reads {
+    std::array<uint32_t, 3> header{0x26c0u, 0u, 151u};
+    uint32_t ordinary = 0;
+    uint32_t strict = 0;
+  } reads;
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        if (words.size() != 1) return false;
+        auto &reads = *static_cast<Reads *>(data);
+        const uint32_t index = address == 0x300315028ull ? 0u
+                             : address == 0x30031502cull ? 1u
+                             : address == 0x300315074ull ? 2u : 3u;
+        if (index == 3u) return false;
+        ++reads.ordinary;
+        words[0] = reads.header[index];
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+        ++static_cast<Reads *>(data)->strict;
+        return false; // Current GPU bytes are available only through the ordinary reader.
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto check = [&](uint32_t low, uint32_t high, uint32_t count, uint32_t reads_expected) {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "GPU-produced direct writable descriptor was rejected");
+    Check(snapshot.buffers.size() == 1 &&
+              snapshot.buffers[0].dwords[0] == low &&
+              snapshot.buffers[0].dwords[1] == high &&
+              snapshot.buffers[0].dwords[2] == count &&
+              snapshot.buffers[0].dwords[3] == 0x16204u &&
+              snapshot.specialization_reads.empty() && reads.strict == 0 &&
+              reads.ordinary == reads_expected,
+          "GPU-produced descriptor lost current scalar data or repeated its reads");
+  };
+  check(0x003176c0u, 0x00800003u, 151u, 3u);
+  const auto previous_specialization = specialization;
+  reads.header = {0xffd00000u, 0u, 302u}; // Exercise the low-address carry on refresh.
+  check(0x00015000u, 0x00800004u, 302u, 6u);
+  Check(specialization == previous_specialization,
+        "GPU-updated address or record count created a shader permutation");
+}
+
 void TestTypedDescriptorRealCarryAndScalarLoads() {
   const uint32_t carry_shader[] = {
       EncodeSop1(0x1f, 0, 0),      // s_getpc_b64 s[0:1]
@@ -14617,6 +14686,7 @@ int main() {
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
+  TestGpuProducedWritableDescriptor();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();
   TestSrtWalkerVccBaseTranslation();
