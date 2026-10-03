@@ -7898,12 +7898,11 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
       EncodeSmem0(0x08, 8, 4),
-      0u,                          // loop: s_buffer_load_dword s8, s[4:7]
+      0u,                          // loop: s_buffer_load_dword s8, s[8:11], s0
       EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
       EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
       EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
@@ -7913,13 +7912,25 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
       0xbf810000u,
   };
 
+  std::array<uint32_t, 64> user_data{};
+  for (const uint32_t base : {8u, 48u}) {
+    user_data[base] = base == 8u ? 0x1000u : 0x2000u;
+    user_data[base + 2] = 64u;
+    user_data[base + 3] = 0x30005204u;
+  }
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying scalar-buffer descriptor did not terminate "
-              "compilation");
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.program.info.uses_dma && !result.program.dispatcher_fallback &&
+            SpirvContainsOpcode(result.spirv, 246),
+        "self-modifying scalar descriptor lost its structured GPU loop");
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].written &&
+            result.resources.flattened_srt.empty(),
+        "self-modifying scalar descriptor was flattened or bound on the host");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
@@ -8980,8 +8991,7 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
 #endif
 }
 
-void TestNativeDescriptorProvenanceRejectsGpuSelection() {
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void TestNativeDescriptorProvenanceKeepsGpuSelection() {
   const std::array<uint32_t, 13> selected{
       EncodeSmem0(0x02, 8, 6), 125u << 25u,
       EncodeVop1(0x01, 1, 128),
@@ -9007,7 +9017,15 @@ void TestNativeDescriptorProvenanceRejectsGpuSelection() {
       EncodeSopp(0x07, 0xfff6u),
       EncodeSopp(0x01),
   };
+  const std::array<uint32_t, 8> table{0x1000u, 0u, 4u, 3u << 28u,
+                                     0x2000u, 0u, 4u, 3u << 28u};
   std::array<uint32_t, 14> user_data{};
+  user_data[0] = 0x3000u;
+  user_data[2] = 64u;
+  user_data[3] = 0x30005204u;
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  user_data[12] = static_cast<uint32_t>(address);
+  user_data[13] = static_cast<uint32_t>(address >> 32u);
   ShaderComputeInputInfo input_info{};
   input_info.thread_ids_num = 1;
   input_info.threads_num[0] = 64;
@@ -9016,10 +9034,23 @@ void TestNativeDescriptorProvenanceRejectsGpuSelection() {
   options.input_info.compute = &input_info;
   options.user_data = user_data;
   for (const auto &shader : {selected, partial, loop}) {
-    ExpectFatal([&] { ShaderRecompiler::TranslateProgram(shader, options); },
-                "native descriptor provenance accepted a GPU-selected or loop-carried value");
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
+    Check(result.program.info.uses_dma && result.program.info.buffers.size() == 1u &&
+              result.program.info.buffers[0].written,
+          "GPU-selected scalar descriptor was materialized as a host binding");
+    uint32_t indirect_reads = 0;
+    for (const auto *block : result.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::ReadConstBuffer) continue;
+        const auto &memory = result.program.memory_info[
+            inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index];
+        indirect_reads += memory.kind == ShaderRecompiler::IR::ResourceKind::IndirectBuffer &&
+                          !memory.planning_only;
+      }
+    }
+    Check(indirect_reads == 1u, "GPU-selected scalar read was flattened or removed");
+    CheckSpirvBinaryValidates(result.spirv);
   }
-#endif
 }
 
 void TestCfgSiblingSharedExit() {
@@ -14645,8 +14676,8 @@ int main() {
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
 #endif
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
@@ -14674,7 +14705,7 @@ int main() {
   TestNativeScalarReadDescriptorPlanning();
   TestNativeGuardedSamplerSource();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
-  TestNativeDescriptorProvenanceRejectsGpuSelection();
+  TestNativeDescriptorProvenanceKeepsGpuSelection();
   TestCfgSiblingSharedExit();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();

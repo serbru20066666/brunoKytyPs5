@@ -736,12 +736,14 @@ private:
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
 			auto& memory = m_program.memory_info[flags.index];
-			memory.planning_only = true;
 			const auto* handle = read->Arg(0).Resolve().TryInstruction();
 			auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
 				return entry.handle == handle && entry.pc == flags.pc;
 			});
 			EXIT_IF(resolved == m_resolved_handles.end());
+			uint32_t bad_dword = 0;
+			if (!ValidateSource(resolved->source, bad_dword)) continue;
+			memory.planning_only = true;
 			uint32_t slot = 0;
 			for (; slot < m_program.srt_reads.size(); ++slot) {
 				const auto* other = m_program.srt_reads[slot].value.Resolve().TryInstruction();
@@ -2073,10 +2075,12 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
+				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+				                                                        : ResourceKind::Buffer) ||
+				    !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x3/x4 load");
+					     "requires a scalar or raw DWORD x2/x3/x4 load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;

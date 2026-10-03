@@ -837,6 +837,35 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	});
 }
 
+uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&       state  = ctx.state;
+	const auto& handle = *inst.Arg(0).ResolveInstruction();
+	const auto  word1  = ctx.Arg(handle, 1);
+	const auto  stride = EmitBitFieldUExtract(state, word1, ConstantU32(state, 16),
+	                                         ConstantU32(state, 14));
+	const auto size = Binary(
+	    state, spv::OpIMul, TypeScalarU64(state),
+	    Unary(state, spv::OpUConvert, TypeScalarU64(state),
+	          EmitUMax32(state, stride, ConstantU32(state, 1))),
+	    Unary(state, spv::OpUConvert, TypeScalarU64(state), ctx.Arg(handle, 2)));
+	const auto offset = Binary(
+	    state, spv::OpIAdd, TypeScalarU64(state),
+	    Unary(state, spv::OpUConvert, TypeScalarU64(state),
+	          Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1),
+	                 ConstantU32(state, ~3u))),
+	    ConstantDeviceAddress(state, ctx.Memory(inst).offset & ~3u));
+	const auto end = Binary(state, spv::OpIAdd, TypeScalarU64(state), offset,
+	                        ConstantDeviceAddress(state, sizeof(uint32_t)));
+	return EmitValueOrZeroIfCondition(
+	    state, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size), [&]() {
+		    const auto base = DeviceAddressFromWords(
+		        state, Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(handle, 0),
+		                      ConstantU32(state, ~3u)),
+		        Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, 0xffffu)));
+		    return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), base, offset));
+	    });
+}
+
 uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto&       state   = ctx.state;
 	const auto& handle  = *inst.Arg(0).ResolveInstruction();
@@ -1293,6 +1322,10 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		ctx.Define(inst, LoadIndirectScalarBuffer(ctx, inst));
+		return;
+	}
 	auto& state        = ctx.state;
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),

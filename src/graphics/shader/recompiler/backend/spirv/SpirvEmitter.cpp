@@ -240,7 +240,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind == IR::ResourceKind::IndirectBuffer) {
+				if (memory.kind == IR::ResourceKind::IndirectBuffer &&
+				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
 				if (memory.kind == IR::ResourceKind::Buffer) {

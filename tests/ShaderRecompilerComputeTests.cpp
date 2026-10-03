@@ -28974,6 +28974,80 @@ TestCase ScalarLoadAlignsDynamicBase() {
   return test;
 }
 
+TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 GuestBase = 0x10000;
+  constexpr u32 DescriptorCount = 5;
+  constexpr u32 PayloadBase = GuestBase + DescriptorCount * 32;
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 2, 1);
+  AppendSMovLiteral(&code, 8, GuestBase + 3);
+  AppendSMovLiteral(&code, 9, 0);
+  AppendSMovLiteral(&code, 28, 0);
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0))); // SMEM ignores EXEC.
+  code.push_back(EncodeSmem0(0x03, 16, 4)); // descriptor and runtime soffset
+  code.push_back(EncodeSmem1(3, 125)); // null keeps this a flattening candidate.
+  code.push_back(EncodeSmem0(0x0a, 32, 8));
+  code.push_back(EncodeSmem1(7, 20));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  code.push_back(EncodeVop1(0x01, 3, 28));
+  code.push_back(EncodeVop2(0x1a, 31, InlineU32(4), 3));
+  for (u32 component = 0; component < 4; ++component) {
+    code.push_back(EncodeVop1(0x01, 4, 32 + component));
+    AppendBufferStoreDword(&code, 4, 31);
+    code.push_back(EncodeVop2(0x25, 31, InlineU32(4), 31));
+  }
+  code.push_back(EncodeSop1(0x04, 126, 193));
+  code.push_back(EncodeSop2(0x00, 29, 28, InlineU32(wave_size == 64 ? 32 : 0)));
+  AppendVop3(&code, 0x360, 8, Vgpr(2), 29);
+  code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 28, InlineU32(DescriptorCount)));
+  code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 32 ? "ScalarBufferFromLoopReadlane32"
+                             : "ScalarBufferFromLoopReadlane64";
+  test.code = std::move(code);
+  test.initial.resize(128 + DescriptorCount * 8 + 8);
+  constexpr u32 records[] = {20, 5, 3, 0x40000005u, 20};
+  for (u32 i = 0; i < DescriptorCount; ++i) {
+    test.initial[(wave_size == 64 ? 32 : 0) + i] =
+        GuestBase + ((i + 1) % DescriptorCount) * 32 + 3;
+    const auto row = 128 + i * 8;
+    test.initial[row] = PayloadBase + 3;
+    test.initial[row + 1] = (i == 1 || i == 3 ? 4u << 16u : 0u) |
+                            (i == 1 ? 1u << 31u : 0u);
+    test.initial[row + 2] = records[i];
+    // Scalar addressing ignores FORMAT, swizzle, ADD_TID, INDEX_STRIDE and OOB_SELECT.
+    test.initial[row + 3] = i == 1 ? (3u << 21u) | (1u << 23u) | (3u << 28u) : 0u;
+    test.initial[row + 4] = i == 4 ? 0xffffffffu : 11u;
+  }
+  for (u32 i = 0; i < 8; ++i)
+    test.initial[128 + DescriptorCount * 8 + i] = 0x11111111u * (i + 1u);
+  test.expected = {0x44444444u, 0x55555555u, 0, 0,
+                   0x44444444u, 0x55555555u, 0, 0,
+                   0, 0, 0, 0,
+                   0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u,
+                   0, 0, 0, 0};
+  test.bda_mappings = {{GuestBase, 512}};
+  test.required_spirv = {"get_bda_pointer", "OpLoopMerge", "OpGroupNonUniformShuffle"};
+  test.forbidden_spirv = {"flattened_srt"};
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B32,
+                  O::S_MOV_B64, O::S_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX4,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::V_ADD_NC_U32,
+                  O::S_ADD_U32, O::V_READLANE_B32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase FlatVirtualAddressRebasesGuestAllocation() {
   using O = ShaderOpcode;
 
@@ -33868,6 +33942,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(ScalarLoadAlignsDynamicBase);
+  cases.push_back(ScalarBufferFromLoopReadlane(32));
+  cases.push_back(ScalarBufferFromLoopReadlane(64));
   AddCase(BufferLoadStore);
   AddCase(BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset);
@@ -39224,6 +39300,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
+    RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckIndirectBufferStore(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
