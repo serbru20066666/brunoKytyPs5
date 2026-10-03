@@ -708,8 +708,16 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageGatherRaw, {resource, sampler, address},
-	                              AddMemoryInfo(memory, inst.pc));
+	const bool has_lod = (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
+	// LOD selection consumes these words on the GPU after descriptor handles are stripped.
+	const auto result = ir.Emit(
+	    IR::ValueOpcode::ImageGatherRaw,
+	    {resource, sampler, address,
+	     has_lod ? resource.Instruction()->Arg(1) : IR::Value(0u),
+	     has_lod ? resource.Instruction()->Arg(3) : IR::Value(0u),
+	     has_lod ? sampler.Instruction()->Arg(1) : IR::Value(0u),
+	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u)},
+	    AddMemoryInfo(memory, inst.pc));
 	for (uint32_t index = 0; index < memory.data_dwords; index++) {
 		WriteOperand(OffsetOperand(inst.dst, index),
 		             ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(index)}));

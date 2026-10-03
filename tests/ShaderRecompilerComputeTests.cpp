@@ -1416,6 +1416,7 @@ struct TestCase {
   vk::ImageType sampled_image_type = vk::ImageType::e2D;
   vk::ImageViewType sampled_image_view_type = vk::ImageViewType::e2D;
   u32 sampled_image_layers = 1;
+  u32 sampled_image_view_base_mip = 0;
   u32 sampled_image_view_base_layer = 0;
   u32 sampled_image_view_layers = 0;
   std::vector<u32> storage_image_rgba;
@@ -1448,7 +1449,7 @@ struct TestCase {
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
-  u32 expected_storage_mip_descriptors = 0;
+  u32 expected_mip_descriptors = 0;
   // Opt-in alternate for a documented host-format conversion, never a general
   // numerical tolerance. Every word still has to match one complete result.
   std::vector<u32> alternate_expected;
@@ -1774,28 +1775,26 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
   }
-  if (test.expected_storage_mip_descriptors != 0) {
+  if (test.expected_mip_descriptors != 0) {
     const auto image = std::ranges::find_if(
         result.program.info.images, [](const auto &resource) {
           return resource.mip_mode ==
-                 ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+                 ShaderRecompiler::IR::ImageMipMode::Dynamic;
         });
-    Require(test.name, "dynamic storage mip specialization",
+    Require(test.name, "dynamic mip specialization",
             image != result.program.info.images.end() &&
-                image->mip_count == test.expected_storage_mip_descriptors,
+                image->mip_count == test.expected_mip_descriptors,
             "runtime descriptor range did not specialize the mip count");
     const auto resource =
         static_cast<u32>(image - result.program.info.images.begin());
-    const auto binding = std::ranges::find_if(
-        result.program.bindings.descriptors, [&](const auto &group) {
-          return std::ranges::find(group.resources, resource) !=
-                 group.resources.end();
-        });
-    Require(test.name, "dynamic storage mip binding",
-            binding != result.program.bindings.descriptors.end() &&
+    const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(*image);
+    const auto *binding = kind ? ShaderRecompiler::IR::FindBinding(
+                                     result.program.bindings, *kind) : nullptr;
+    Require(test.name, "dynamic mip binding",
+            binding != nullptr &&
                 std::ranges::count(binding->resources, resource) ==
-                    test.expected_storage_mip_descriptors,
-            "dynamic storage image did not receive one descriptor per mip");
+                    test.expected_mip_descriptors,
+            "dynamic image did not receive one descriptor per mip");
   }
   if (test.expand_shader_data_storage) {
     auto &block = *result.program.blocks.front();
@@ -11961,7 +11960,7 @@ public:
               "IMAGE_STORE expanded an inaccessible mip and shifted physical storage");
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
-          ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+          ShaderRecompiler::IR::ImageMipMode::Dynamic;
       mipped_storage_resource.mip_count = 3;
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
       ExpectFatal("MipViewPhysicalLayoutChange", [&] {
@@ -12250,6 +12249,33 @@ public:
                     views[2] != views[3] && views[1] == views.back(),
                 "different texture clamps aliased or identical clamped views "
                 "were not reused");
+        ShaderRecompiler::IR::CompiledShaderInfo gather_info{};
+        gather_info.stage = ShaderType::Compute;
+        gather_info.info = lod_program.program.info;
+        gather_info.info.images[0].mip_mode =
+            ShaderRecompiler::IR::ImageMipMode::Dynamic;
+        gather_info.info.images[0].mip_count = 4;
+        auto gather_snapshot = lod_program.resources;
+        gather_snapshot.images[0] = lod_descriptor;
+        ShaderStageRuntime gather_runtime{&gather_info, &gather_snapshot};
+        PreparedBindings gather_bindings;
+        executor.PrepareBindings(gather_runtime, gather_bindings);
+        executor.RebindImages(gather_bindings);
+        const auto &gather_binding = gather_bindings.images[0];
+        Require(lod_test.name, "dynamic sampled mip views",
+                gather_binding.desc.view_info.min_lod == 256u &&
+                    gather_binding.mip_views.size() == 4,
+                "dynamic gather lost the guest minimum or accessible mip range");
+        for (uint32_t mip = 0; mip < 4; ++mip) {
+          auto single_mip = gather_binding.desc;
+          single_mip.view_info.base_level = mip;
+          single_mip.view_info.level_count = 1;
+          single_mip.view_info.min_lod = 0;
+          Require(lod_test.name, "gather minimum applied once",
+                  gather_binding.mip_views[mip] == texture_cache.FindTexture(
+                      gather_binding.image_id, single_mip),
+                  "the gather mip view reapplied the shader's streaming clamp");
+        }
         DestroyBuffer(&output);
         RenderExecutorTestAccess::ResetBindings(executor);
       }
@@ -14522,7 +14548,8 @@ public:
                         u32 layers, u32 view_base_layer = 0,
                         u32 view_layers = 0,
                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
-                        vk::Format view_format = vk::Format::eUndefined) {
+                        vk::Format view_format = vk::Format::eUndefined,
+                        u32 view_base_mip = 0) {
     Image ret;
     ret.format = format;
     ret.width = width;
@@ -14581,8 +14608,10 @@ public:
     view_info.viewType = view_type;
     view_info.format = view_format == vk::Format::eUndefined ? format : view_format;
     view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-    view_info.subresourceRange.baseMipLevel = 0;
-    view_info.subresourceRange.levelCount = ret.mip_levels;
+    Require(shader_name, "dispatch", view_base_mip < ret.mip_levels,
+            "image view base mip is out of bounds");
+    view_info.subresourceRange.baseMipLevel = view_base_mip;
+    view_info.subresourceRange.levelCount = ret.mip_levels - view_base_mip;
     Require(shader_name, "dispatch", view_base_layer < layers,
             "image view base layer is out of bounds");
     if (view_layers == 0) {
@@ -14870,6 +14899,7 @@ public:
     std::vector<vk::WriteDescriptorSet> writes;
     std::vector<vk::DescriptorBufferInfo> buffer_infos;
     std::vector<vk::DescriptorImageInfo> sampled_infos;
+    std::vector<vk::ImageView> sampled_mip_views;
     std::vector<vk::DescriptorImageInfo> storage_infos;
     std::vector<vk::DescriptorImageInfo> storage_uint_infos;
     std::vector<vk::DescriptorImageInfo> storage_atomic_infos;
@@ -15007,9 +15037,32 @@ public:
               "sampled image descriptor requested but no sampled image was "
               "provided");
       sampled_infos.resize(sampled->resources.size());
-      for (auto &info : sampled_infos) {
+      std::vector<u32> mip_indices(compiled.program.info.images.size());
+      for (u32 slot = 0; slot < sampled_infos.size(); slot++) {
+        auto &info = sampled_infos[slot];
         info.imageView = sampled_image->view;
         info.imageLayout = sampled_image->layout;
+        const auto resource = sampled->resources[slot];
+        if (compiled.program.info.images[resource].mip_mode ==
+            ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+          const auto mip = test.sampled_image_view_base_mip + mip_indices[resource]++;
+          Require(test.name, "dispatch", mip < sampled_image->mip_levels,
+                  "sampled mip descriptor exceeds the supplied image");
+          vk::ImageViewCreateInfo view{};
+          view.image = sampled_image->image;
+          view.viewType = test.sampled_image_view_type;
+          view.format = sampled_image->format;
+          view.subresourceRange = {
+              vk::ImageAspectFlagBits::eColor, mip, 1,
+              test.sampled_image_view_base_layer,
+              test.sampled_image_view_layers != 0
+                  ? test.sampled_image_view_layers
+                  : sampled_image->layers - test.sampled_image_view_base_layer};
+          RequireVk(test.name, "dispatch",
+                    m_device.createImageView(&view, nullptr, &info.imageView),
+                    "vkCreateImageView(sampled mip)");
+          sampled_mip_views.push_back(info.imageView);
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -15164,6 +15217,9 @@ public:
                           &barrier, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    for (const auto view : sampled_mip_views) {
+      m_device.destroyImageView(view, nullptr);
+    }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
     }
@@ -18367,7 +18423,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         sampled_dwords_per_pixel, vk::ImageLayout::eShaderReadOnlyOptimal,
         test.sampled_image_type, test.sampled_image_view_type,
         test.sampled_image_layers, test.sampled_image_view_base_layer,
-        test.sampled_image_view_layers);
+        test.sampled_image_view_layers, vk::SampleCountFlagBits::e1,
+        vk::Format::eUndefined, test.sampled_image_view_base_mip);
   }
   if (needs_storage_image) {
     const bool atomic64 = std::ranges::any_of(
@@ -18386,7 +18443,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
   }
   if (needs_sampler) {
-    sampler = vulkan->CreateNearestSampler(test.name, sampled_image.mip_levels);
+    sampler = vulkan->CreateNearestSampler(
+        test.name, sampled_image.mip_levels - test.sampled_image_view_base_mip);
   }
 
   vulkan->Dispatch(test, compiled, buffer, needs_gds ? &gds_buffer : nullptr,
@@ -31263,31 +31321,132 @@ TestCase ImageCubeGradientsPreserveDerivatives() {
   return test;
 }
 
-TestCase ImageGatherLodApproximatesLevelZero() {
+TestCase ImageGatherExplicitLod() {
   using O = ShaderOpcode;
   std::vector<u32> code;
-  AppendVMovLiteral(&code, 20, 0x3f000000u);
-  AppendVMovLiteral(&code, 21, 0x3f000000u);
-  AppendVMovLiteral(&code, 22, 0x3f800000u);
-  code.push_back(EncodeMimg0(0x44, 0x1));
-  code.push_back(EncodeMimg1(0, 20));
-  code.push_back(EncodeMimg0(0x24, 0x1));
-  code.push_back(EncodeMimg1(4, 20));
+  // PPSA29343 uses NSA coordinates v81/v84 with its explicit LOD in v78.
+  AppendVMovLiteral(&code, 81, 0x3f000000u);
+  AppendVMovLiteral(&code, 84, 0x3f000000u);
+  AppendVMovLiteral(&code, 78, 0x3f800000u);
+  code.push_back(EncodeMimg0(0x44, 0x1, 1));
+  code.push_back(EncodeMimg1(9, 81, 0, 2));
+  code.push_back(84u | (78u << 8u));
+  code.push_back(EncodeMimg0(0x24, 0x1, 1));
+  code.push_back(EncodeMimg1(13, 81, 0, 2));
+  code.push_back(84u | (78u << 8u));
   for (u32 i = 0; i < 5u; i++) {
-    AppendStoreVgpr(&code, i, i);
+    AppendStoreVgpr(&code, i + 9, i);
   }
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "ImageGatherLodApproximatesLevelZero";
+  test.name = "ImageGatherExplicitLod";
   test.code = std::move(code);
   test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_L, O::IMAGE_SAMPLE,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  // Explicit sampling proves mip 1 is accessible; the gather must still read mip 0.
-  test.expected = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u, 0x41000000u};
+  // A gather's single-mip descriptors must not replace the ordinary sample's
+  // full mip chain when both instructions use the same guest descriptor.
+  test.expected = std::vector<u32>(5, 0x41000000u);
   test.sampled_image_rgba_mips = {std::vector<u32>(4 * 4 * 4, 0x3f800000u),
                                  std::vector<u32>(2 * 2 * 4, 0x41000000u)};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[1] |= 3u << 30u;
+  test.user_data[2] = 3u << 14u;
+  test.user_data[3] |= 1u << 16u;
+  test.user_data[8] = 0x92u;
+  test.user_data[9] = 0xfff000u;
+  test.user_data[10] = 0x05000000u; // Captured point sampler, preclamp disabled.
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.expected_mip_descriptors = 2;
   test.required_spirv = {"OpImageGather", "OpImageSampleExplicitLod"};
+  return test;
+}
+
+template <u32 mode> TestCase ImageGatherLodPerLane() {
+  using O = ShaderOpcode;
+  constexpr std::array names{
+      "ImageGatherLodPerLane", "ImageGatherLodBaseMip",
+      "ImageGatherLodSamplerBounds", "ImageGatherLodTextureMinimum",
+      "ImageGatherLodMipNone", "ImageGatherLodPointPostclampMaximum",
+      "ImageGatherLodPointPreclampMaximum", "ImageGatherLodPointPostclampMinimum",
+      "ImageGatherLodPointPreclampMinimum"};
+  constexpr std::array lods = mode < 5
+      ? std::array{-1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 9.0f}
+      : std::array{-1.0f, 0.0f, 0.25f, 0.75f, 1.25f, 1.75f, 2.75f, 9.0f};
+  constexpr std::array<std::array<u32, 8>, 9> selected_mips{{
+      {0, 0, 1, 2, 3, 4, 4, 4},
+      {1, 1, 2, 3, 4, 4, 4, 4},
+      {2, 2, 2, 3, 3, 3, 3, 3},
+      {3, 3, 3, 3, 3, 3, 3, 3},
+      {1, 1, 1, 1, 1, 1, 1, 1},
+      {0, 0, 0, 1, 1, 2, 2, 2},
+      {0, 0, 0, 1, 1, 1, 1, 1},
+      {2, 2, 2, 2, 2, 2, 3, 4},
+      {1, 1, 1, 1, 1, 2, 3, 4},
+  }};
+  constexpr u32 lanes = lods.size();
+  constexpr u32 sampler_min = mode == 2 ? 256 : mode >= 7 ? 448 : 0;
+  constexpr u32 sampler_max = mode == 2 ? 512 : mode == 3 ? 256
+      : mode == 5 || mode == 6 ? 448 : 1024;
+  TestCase test;
+  test.name = names[mode];
+  test.image_width = test.image_height = 16;
+  test.sampled_image_view_base_mip = mode > 0 && mode < 5 ? 1 : 0;
+  for (u32 mip = 0; mip < 5; mip++) {
+    test.sampled_image_rgba_mips.emplace_back(
+        (16u >> mip) * (16u >> mip) * 4u,
+        std::bit_cast<u32>(static_cast<float>(mip + 1)));
+  }
+  for (const auto lod : lods) {
+    test.initial.push_back(std::bit_cast<u32>(lod));
+  }
+  test.expected = test.initial;
+  for (u32 component = 0; component < 4; component++) {
+    for (const auto mip : selected_mips[mode]) {
+      test.expected.push_back(std::bit_cast<u32>(static_cast<float>(mip + 1)));
+    }
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop1(0x01, 16, Vgpr(0)));
+  code.push_back(EncodeVop2(0x1a, 31, InlineU32(2), 16));
+  code.push_back(EncodeMubuf0(0x0c));
+  code.push_back(EncodeMubuf1(22, 4, 31));
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f000000u);
+  code.push_back(EncodeMimg0(0x44, 0x1));
+  code.push_back(EncodeMimg1(0, 20, 0, 2));
+  for (u32 component = 0; component < 4; component++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, component, 16, lanes * (component + 1));
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD,
+                  O::IMAGE_GATHER4_L, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[1] |= (3u << 30u) | (mode == 3 ? 768u << 8u : 0u);
+  test.user_data[2] = 3u | (15u << 14u);
+  test.user_data[3] |= (test.sampled_image_view_base_mip << 12u) | (4u << 16u);
+  test.user_data[8] = 0x92u;
+  test.user_data[9] = sampler_min | (sampler_max << 12u);
+  // Point preclamp selects whether the half-level rounding adjustment precedes
+  // or follows the clamps. The streaming T# minimum follows the sampler bounds.
+  test.user_data[10] = mode == 4 ? 0x4001u : (1u << 26u);
+  if constexpr (mode == 6 || mode == 8) {
+    test.user_data[10] |= 1u << 28u;
+  }
+  test.user_data[18] = lanes * sizeof(u32);
+  test.user_data[19] = 3u << 28u;
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.expected_mip_descriptors = 5 - test.sampled_image_view_base_mip;
+  test.required_spirv = {"OpImageGather"};
   return test;
 }
 
@@ -31723,8 +31882,39 @@ TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   std::copy(descriptor.begin(), descriptor.end(), test.user_data.begin());
   test.has_user_data = true;
   test.compile_only = true;
-  test.expected_storage_mip_descriptors = 3;
+  test.expected_mip_descriptors = 3;
   test.required_spirv = {"OpSwitch", "OpImageWrite"};
+  return test;
+}
+
+template <u32 mode> TestCase ImageStoreSingleMipBounds() {
+  using O = ShaderOpcode;
+  constexpr std::array names{"ImageStoreSingleMipValid", "ImageStoreSingleMipBeyondEnd",
+                             "ImageStoreSingleMipNegative"};
+  constexpr std::array lods{0u, 1u, UINT32_MAX};
+  TestCase test;
+  test.name = names[mode];
+  AppendVMovU32(&test.code, 20, 0);
+  AppendVMovU32(&test.code, 21, 0);
+  AppendVMovU32(&test.code, 22, lods[mode]);
+  for (u32 component = 0; component < 4; component++) {
+    AppendVMovLiteral(&test.code, component, 0x40000000u);
+  }
+  test.code.push_back(EncodeMimg0(0x09, 0xf));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE_MIP, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.has_user_data = true;
+  test.storage_image_rgba = std::vector<u32>(4 * 4 * 4, 0x3f800000u);
+  test.expected_storage_image_rgba = test.storage_image_rgba;
+  if constexpr (mode == 0) {
+    std::fill_n(test.expected_storage_image_rgba.begin(), 4, 0x40000000u);
+  }
+  test.expected_mip_descriptors = 1;
+  if constexpr (mode == 0) {
+    test.required_spirv = {"OpImageWrite"};
+  }
   return test;
 }
 
@@ -33380,7 +33570,16 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
   AddCase(ImageCubeGradientsPreserveDerivatives);
-  AddCase(ImageGatherLodApproximatesLevelZero);
+  AddCase(ImageGatherExplicitLod);
+  AddCase(ImageGatherLodPerLane<0>);
+  AddCase(ImageGatherLodPerLane<1>);
+  AddCase(ImageGatherLodPerLane<2>);
+  AddCase(ImageGatherLodPerLane<3>);
+  AddCase(ImageGatherLodPerLane<4>);
+  AddCase(ImageGatherLodPerLane<5>);
+  AddCase(ImageGatherLodPerLane<6>);
+  AddCase(ImageGatherLodPerLane<7>);
+  AddCase(ImageGatherLodPerLane<8>);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
@@ -33390,6 +33589,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
   AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
+  AddCase(ImageStoreSingleMipBounds<0>);
+  AddCase(ImageStoreSingleMipBounds<1>);
+  AddCase(ImageStoreSingleMipBounds<2>);
   AddCase(ImageStoreRgbOneUsesInverseSwizzle);
   AddCase(ImageStoreDuplicateSelectorUsesInverseSwizzle);
   AddCase(ImageStoreBgraUsesInverseSwizzle);
@@ -34431,7 +34633,7 @@ void CheckSampledColorViews() {
           "atomic uint storage resource was rejected");
   storage_resource.atomic = false;
   storage_resource.mip_mode =
-      ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+      ShaderRecompiler::IR::ImageMipMode::Dynamic;
   storage_resource.mip_count = 3;
   Require("SampledColorViews", "dynamic storage mip resource",
           IsSupportedStorageImageResource(storage_resource),
@@ -34504,10 +34706,15 @@ void CheckSampledDepthResource() {
           !IsSupportedSampledDepthResource(resource),
           "atomic depth resource was accepted");
   resource = basic;
-  resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-  Require("SampledDepthResource", "dynamic mip rejected",
-          !IsSupportedSampledDepthResource(resource),
-          "dynamic-storage mip depth resource was accepted");
+  resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::Dynamic;
+  resource.mip_count = 3;
+  Require("SampledDepthResource", "dynamic mip read",
+          IsSupportedSampledDepthResource(resource),
+          "dynamic sampled depth mip resource was rejected");
+  resource.depth_compare = true;
+  Require("SampledDepthResource", "dynamic comparison mip read",
+          IsSupportedSampledDepthResource(resource),
+          "dynamic comparison depth mip resource was rejected");
   resource = basic;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   Require("SampledDepthResource", "singleton array accepted",
@@ -38553,6 +38760,23 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-gather-lod-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageGatherExplicitLod());
+    RunCase(&vulkan, ImageGatherLodPerLane<0>());
+    RunCase(&vulkan, ImageGatherLodPerLane<1>());
+    RunCase(&vulkan, ImageGatherLodPerLane<2>());
+    RunCase(&vulkan, ImageGatherLodPerLane<3>());
+    RunCase(&vulkan, ImageGatherLodPerLane<4>());
+    RunCase(&vulkan, ImageGatherLodPerLane<5>());
+    RunCase(&vulkan, ImageGatherLodPerLane<6>());
+    RunCase(&vulkan, ImageGatherLodPerLane<7>());
+    RunCase(&vulkan, ImageGatherLodPerLane<8>());
+    RunCase(&vulkan, ImageStoreSingleMipBounds<0>());
+    RunCase(&vulkan, ImageStoreSingleMipBounds<1>());
+    RunCase(&vulkan, ImageStoreSingleMipBounds<2>());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     CheckWave64WholeWaveResults();
     VulkanHarness vulkan;
@@ -38589,7 +38813,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
-    RunCase(&vulkan, ImageGatherLodApproximatesLevelZero());
+    RunCase(&vulkan, ImageGatherExplicitLod());
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
     RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
     return 0;
