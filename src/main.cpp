@@ -76,6 +76,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf(
+	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -250,6 +252,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--fullscreen") {
 			options.config.fullscreen_enabled = true;
+			continue;
+		}
+
+		if (arg == "--hide-cursor") {
+			options.config.hide_cursor_enabled = true;
 			continue;
 		}
 

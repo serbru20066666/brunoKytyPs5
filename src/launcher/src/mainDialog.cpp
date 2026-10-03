@@ -242,6 +242,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
 	}
+	if (info.hide_cursor_enabled) {
+		args << "--hide-cursor";
+	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--relaxed-readback" << BoolArg(info.relaxed_readback_enabled);
 	args << "--frame-generation" << BoolArg(info.frame_generation_enabled);

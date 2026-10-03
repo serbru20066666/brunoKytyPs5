@@ -77,6 +77,10 @@ bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }
 
+bool HideCursorEnabled() {
+	return g_config->hide_cursor_enabled;
+}
+
 bool VrEnabled() {
 	return g_config->vr_enabled;
 }

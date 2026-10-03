@@ -119,6 +119,7 @@ public:
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   relaxed_readback_enabled    = false;
@@ -153,6 +154,7 @@ public:
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
+		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
 		relaxed_readback_enabled    = other.relaxed_readback_enabled;
@@ -235,6 +237,7 @@ public:
 		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
+		KYTY_CFG_SET(hide_cursor_enabled);
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
 		KYTY_CFG_SET(relaxed_readback_enabled);
@@ -280,6 +283,7 @@ public:
 			present_mode = PresentMode::Mailbox;
 		}
 		KYTY_CFG_GET(fullscreen_enabled);
+		KYTY_CFG_GET(hide_cursor_enabled);
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
 		relaxed_readback_enabled =
