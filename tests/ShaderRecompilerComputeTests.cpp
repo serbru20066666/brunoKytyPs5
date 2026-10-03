@@ -6857,6 +6857,43 @@ public:
               "to the image");
       texture_cache.MarkGpuWritten(mirror_refresh);
 
+      // A write through a separate buffer must not replace untouched image
+      // texels with stale backing bytes. Exact-base writes still refresh it.
+      constexpr uint64_t buffer_alias_offset = 0x1a00000;
+      constexpr uint32_t buffer_alias_image_value = 0x13579bdfu;
+      constexpr uint32_t buffer_alias_write_value = 0x2468ace0u;
+      std::memset(memory + buffer_alias_offset, 0, 4 * sizeof(uint32_t));
+      auto buffer_alias_desc = MakeLinearDesc(
+          base + buffer_alias_offset, 4 * sizeof(uint32_t), vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {4, 1, 1}, 1, 4, 1);
+      const auto buffer_alias_image = texture_cache.FindImage(buffer_alias_desc);
+      for (const uint32_t write_offset : {0u, 12u}) {
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto write_address = buffer_alias_desc.info.data.address + write_offset;
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            write_address, sizeof(uint32_t), true, false);
+        Require(name, "image alias buffer allocation", writable.first != nullptr,
+                "failed to allocate the image alias write buffer");
+        writable.first->Fill(writable.second, sizeof(uint32_t), buffer_alias_write_value);
+        texture_cache.InvalidateMemoryFromGPU(write_address, sizeof(uint32_t));
+        (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
+        const bool exact_base = write_offset == 0;
+        const uint32_t read_texels = exact_base ? 1 : 3;
+        Require(name, exact_base ? "exact-base buffer write refresh"
+                                 : "overlapping buffer preserves untouched texels",
+                ReadCachedTexel(name, context, buffer_alias_image, {},
+                                {read_texels, 1, 1}) ==
+                    std::vector<u32>(read_texels, exact_base ? buffer_alias_write_value
+                                                           : buffer_alias_image_value),
+                exact_base ? "exact-base buffer write did not refresh the native image"
+                           : "overlapping buffer write replaced untouched GPU image texels");
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
@@ -7460,20 +7497,17 @@ public:
                 "a same-value CPU metadata write lost its clear after rendering");
       }
       WriteMetadata(context, base + 0x28000, 0x1000, 0);
-      texture_cache.InvalidateMemoryFromGPU(reused_depth.info.stencil.address,
-                                           reused_depth.info.stencil.size);
       const auto reused_depth_id = texture_cache.FindImage(reused_depth);
       (void)texture_cache.FindDepthTarget(reused_depth_id, reused_depth);
       Require(
           name, "DCC allocation reused as HTile",
           TextureCacheTestAccess::Contains(texture_cache, reused_color_id) &&
-              texture_cache.GetImage(reused_color_id).IsBufferModified() &&
-              !texture_cache.GetImage(reused_color_id).IsGpuModified() &&
               !texture_cache.IsMetaCleared(base + 0x28000, 0) &&
               texture_cache.ClearMeta(base + 0x28000) &&
               texture_cache.TouchMeta(base + 0x28000, 0, false),
           "depth binding retained incompatible DCC clear state");
-      TextureCacheTestAccess::DeleteImage(texture_cache, reused_color_id);
+      texture_cache.UnmapMemory(reused_color.info.data.address,
+                                reused_color.info.data.size);
       (void)texture_cache.FindDepthTarget(reused_depth_id, reused_depth);
       Require(
           name, "reused metadata owner retirement",

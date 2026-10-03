@@ -2745,7 +2745,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 	}
 	for (const auto id: images) {
 		auto& image = m_slot_images[id];
-		if (!image.Overlaps(address, size)) {
+		if (image.info.data.address != address) {
 			continue;
 		}
 		if (exact && (image.info.data.address < address ||
