@@ -18694,6 +18694,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CVT_F64_F32:
   case Opcode::V_CVT_F64_U32:
   case Opcode::V_RCP_F64:
+  case Opcode::V_FRACT_F64:
   case Opcode::V_MUL_F64:
   case Opcode::V_FMA_F64:
   case Opcode::V_CVT_F32_I32:
@@ -24781,6 +24782,67 @@ TestCase VectorF64CapturedScreenSpaceShadows() {
   Require(test.name, "pipeline identity",
           normal_key != other_key && normal_key.size() == other_key.size(),
           "FP64 rounding modes must not share a compiled shader key");
+  return test;
+}
+
+TestCase VectorFractF64CapturedAndEdges() {
+  using O = ShaderOpcode;
+  constexpr std::array<std::array<uint64_t, 2>, 17> cases{{
+      {0x400a000000000000ull, 0x3fd0000000000000ull}, // 3.25 -> .25
+      {0xbff4000000000000ull, 0x3fe8000000000000ull}, // -1.25 -> .75
+      {0x3ff0000000000001ull, 0x3cb0000000000000ull}, // 1 + 2^-52
+      {0xbff0000000000001ull, 0x3feffffffffffffeull},
+      {0x4320000000000001ull, 0x3fe0000000000000ull}, // 2^51 + .5
+      {0, 0}, {0x8000000000000000ull, 0},
+      {0x401c000000000000ull, 0}, {0xc01c000000000000ull, 0},
+      {1, 1}, {0x8000000000000001ull, 0x3ff0000000000000ull},
+      {0x000fffffffffffffull, 0x000fffffffffffffull},
+      {0x7fefffffffffffffull, 0},
+      {0x7ff0000000000000ull, 0x7ff8000000000000ull},
+      {0xfff0000000000000ull, 0x7ff8000000000000ull},
+      {0x7ff8123456789abcull, 0x7ff8000000000000ull},
+      {0x7ff0000000000001ull, 0x7ff8000000000000ull}}};
+  TestCase test;
+  test.name = "VectorFractF64CapturedAndEdges";
+  const auto store_pair = [&](u32 reg, uint64_t expected) {
+    const auto index = static_cast<u32>(test.expected.size());
+    AppendStoreVgpr(&test.code, reg, index);
+    AppendStoreVgpr(&test.code, reg + 1, index + 1);
+    test.expected.insert(test.expected.end(), {u32(expected), u32(expected >> 32)});
+  };
+  for (u32 i = 0; i < cases.size(); i++) {
+    const auto [source, expected] = cases[i];
+    test.initial.insert(test.initial.end(), {u32(source), u32(source >> 32)});
+    for (u32 word = 0; word < 2; word++) {
+      AppendVMovU32(&test.code, 30, (i * 2 + word) * 4);
+      AppendBufferLoadDword(&test.code, 4 + word, 30);
+    }
+    test.code.push_back(0x7e087d04u); // Captured v_fract_f64 v[4:5], v[4:5].
+    if ((source & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) {
+      // Classify quiet NaNs without requiring a particular payload or sign.
+      AppendVMovU32(&test.code, 4, 0);
+      AppendVMovLiteral(&test.code, 6, 0x7ff80000u);
+      test.code.push_back(EncodeVop2(0x1b, 5, Vgpr(6), 5));
+    }
+    store_pair(4, expected);
+  }
+  AppendVMovU32(&test.code, 1, 0);
+  AppendVMovLiteral(&test.code, 2, 0xbff40000u);
+  AppendVop3(&test.code, 0x1be, 1, Vgpr(1), 0, 0, 1, 0, false, 0, 1);
+  store_pair(1, 0x3fe8000000000000ull); // Odd pair; ABS precedes NEG.
+  AppendVMovU32(&test.code, 4, 1);
+  AppendVMovLiteral(&test.code, 5, 0x3ff00000u);
+  test.code.push_back(EncodeSop1(0x04, 12, 126));
+  test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  test.code.push_back(0x7e087d04u);
+  test.code.push_back(EncodeSop1(0x04, 126, 12));
+  store_pair(4, 0x3ff0000000000001ull); // Both words survive inactive EXEC.
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F64,
+                  O::V_AND_B32, O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FRACT_F64 v4, v4", cases.size() + 1}};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Fract"};
   return test;
 }
 
@@ -33747,6 +33809,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorCompareF64WaveMasks(32));
   cases.push_back(VectorCompareF64WaveMasks(64));
   AddCase(VectorF64CapturedScreenSpaceShadows);
+  AddCase(VectorFractF64CapturedAndEdges);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorF64WideningConversions);
   AddCase(VectorSinCosMaxFiniteSpecialCases);
@@ -39090,6 +39153,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF64WaveMasks(32));
     RunCase(&vulkan, VectorCompareF64WaveMasks(64));
     RunCase(&vulkan, VectorF64CapturedScreenSpaceShadows());
+    RunCase(&vulkan, VectorFractF64CapturedAndEdges());
     RunCase(&vulkan, VectorF64ModesModifiersAndExec());
     return 0;
   }

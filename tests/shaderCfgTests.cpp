@@ -3583,6 +3583,27 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
         "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
 }
 
+void TestNewShaderRecompilerCapturedFractF64() {
+  using namespace ShaderRecompiler::Decoder;
+  const uint32_t captured[] = {0x7e087d04u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.family == Family::VOP1 && decoded.opcode == Opcode::V_FRACT_F64 &&
+            decoded.opcode_id == 0x3e && decoded.word_count == 1 &&
+            decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == 4 &&
+            decoded.src0.kind == OperandKind::Vgpr && decoded.src0.reg == 4,
+        "captured V_FRACT_F64 did not decode its in-place register pair");
+  for (const uint32_t opcode : {0x3eu, 0x2fu}) {
+    for (const uint32_t source : {249u, 250u}) {
+      const uint32_t invalid[] = {EncodeVop1(opcode, 4, source),
+          source == 249u ? 0x00060604u : EncodeVop1Dpp(4, 0xe4)};
+      DecodeInstruction(invalid, 0, decoded);
+      Check(decoded.opcode == Opcode::UNSUPPORTED,
+            "FP64 VOP1 accepted an unsupported SDWA or DPP encoding");
+    }
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaBfrev() {
   using namespace ShaderRecompiler::Decoder;
   const uint32_t captured[] = {0x7e0070f9u, 0x00040600u};
@@ -14594,6 +14615,7 @@ int main() {
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
+  TestNewShaderRecompilerCapturedFractF64();
   TestNewShaderRecompilerVop1SdwaBfrev();
   TestNewShaderRecompilerVop1SdwaNotDestination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();

@@ -123,6 +123,7 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x39u, Opcode::V_FFBH_U32},
     {0x3au, Opcode::V_FFBL_B32},
     {0x3bu, Opcode::V_FFBH_I32},
+    {0x3eu, Opcode::V_FRACT_F64},
     {0x3fu, Opcode::V_FREXP_EXP_I32_F32},
     {0x40u, Opcode::V_FREXP_MANT_F32},
     {0x42u, Opcode::V_MOVRELD_B32},
@@ -182,6 +183,7 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x39u, Opcode::V_FFBH_U32},
     {0x3au, Opcode::V_FFBL_B32},
     {0x3bu, Opcode::V_FFBH_I32},
+    {0x3eu, Opcode::V_FRACT_F64},
     {0x3fu, Opcode::V_FREXP_EXP_I32_F32},
     {0x40u, Opcode::V_FREXP_MANT_F32},
     {0x42u, Opcode::V_MOVRELD_B32},
@@ -472,11 +474,18 @@ bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
 bool IsVop1FloatResultOpcode(Opcode opcode);
 bool IsVopcCompareExec(Opcode opcode);
 
+bool IsVop1Float64Opcode(Opcode opcode) {
+	return opcode == Opcode::V_CVT_F64_I32 || opcode == Opcode::V_CVT_F32_F64 ||
+	       opcode == Opcode::V_CVT_F64_F32 || opcode == Opcode::V_CVT_F64_U32 ||
+	       opcode == Opcode::V_RCP_F64 || opcode == Opcode::V_FRACT_F64;
+}
+
 bool IsVop1FloatSourceOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_CVT_F32_F64:
 		case Opcode::V_CVT_F64_F32:
 		case Opcode::V_RCP_F64:
+		case Opcode::V_FRACT_F64:
 		case Opcode::V_MOV_B32:
 		case Opcode::V_CVT_F32_F16:
 		case Opcode::V_CVT_U32_F32:
@@ -648,6 +657,10 @@ bool SupportsVop1Clamp(Opcode opcode) {
 }
 
 bool ValidateVop1Sdwa(Instruction& inst, uint32_t opcode, uint32_t modifier) {
+	if (IsVop1Float64Opcode(inst.opcode)) {
+		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support SDWA");
+		return false;
+	}
 	const auto dst_sel   = (modifier >> 8u) & 0x7u;
 	const auto dst_u     = (modifier >> 11u) & 0x3u;
 	const auto clamp     = (modifier >> 13u) & 0x1u;
@@ -736,9 +749,7 @@ void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 
 void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, Instruction& inst) {
-	if (inst.opcode == Opcode::V_CVT_F64_I32 || inst.opcode == Opcode::V_CVT_F32_F64 ||
-	    inst.opcode == Opcode::V_CVT_F64_F32 || inst.opcode == Opcode::V_CVT_F64_U32 ||
-	    inst.opcode == Opcode::V_RCP_F64) {
+	if (IsVop1Float64Opcode(inst.opcode)) {
 		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
 		return;
 	}

@@ -186,6 +186,7 @@ enum class Opcode {
 	V_RCP_F32,
 	V_RCP_IFLAG_F32,
 	V_FRACT_F32,
+	V_FRACT_F64,
 	V_TRUNC_F32,
 	V_CEIL_F32,
 	V_RNDNE_F32,

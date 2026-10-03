@@ -453,6 +453,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
 		case O::V_RCP_IFLAG_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecipIFlag32);
 		case O::V_FRACT_F32: return FloatUnary(inst, IR::ValueOpcode::FPFract32);
+		case O::V_FRACT_F64: return FloatUnary(inst, IR::ValueOpcode::FPFract64);
 		case O::V_TRUNC_F32: return FloatUnary(inst, IR::ValueOpcode::FPTrunc32);
 		case O::V_CEIL_F32: return FloatUnary(inst, IR::ValueOpcode::FPCeil32);
 		case O::V_RNDNE_F32: return FloatUnary(inst, IR::ValueOpcode::FPRoundEven32);
