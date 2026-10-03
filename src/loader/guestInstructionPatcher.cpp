@@ -132,7 +132,14 @@ struct DecodedFunction {
 	bool                                        requires_conservative_red_zone_tracking {};
 };
 
-enum class InstructionReplacement { None, ReciprocalSquareRoot, ExtractQ };
+enum class InstructionReplacement {
+	None,
+	ReciprocalSquareRoot,
+	ExtractQ,
+	InsertQ,
+	ReadProcessorId,
+	CacheLineWriteBack
+};
 
 struct InstructionRewrite {
 	bool                   protect_red_zone {};
@@ -143,8 +150,19 @@ struct InstructionRewrite {
 InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
                                           InstructionReplacement       replacement) {
 	ASSERT(replacement != InstructionReplacement::None);
-	return replacement == InstructionReplacement::ReciprocalSquareRoot ? result.reciprocal_sqrt
-	                                                                   : result.extrq;
+	switch (replacement) {
+		case InstructionReplacement::ReciprocalSquareRoot: return result.reciprocal_sqrt;
+		case InstructionReplacement::ExtractQ: return result.extrq;
+		case InstructionReplacement::InsertQ: return result.insertq;
+		case InstructionReplacement::ReadProcessorId: return result.rdpid;
+		default: return result.clwb;
+	}
+}
+
+bool UsesInstructionTrap(InstructionReplacement replacement, bool trap_replacements) {
+	return replacement != InstructionReplacement::None &&
+	       (trap_replacements || replacement == InstructionReplacement::InsertQ ||
+	        replacement == InstructionReplacement::ReadProcessorId);
 }
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -216,10 +234,11 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 
 	if (decoded.changes_stack_pointer) {
 		const auto& operands = decoded.operands;
-		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
-		    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
 		    IsStackPointerRegister(operands[0].reg.value) &&
-		    operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+		    (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_RDPID ||
+		     (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+		      operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY))) {
 			decoded.replaces_stack_pointer = true;
 		} else if ((decoded.instruction.mnemonic == ZYDIS_MNEMONIC_ADD ||
 		            decoded.instruction.mnemonic == ZYDIS_MNEMONIC_SUB) &&
@@ -653,12 +672,16 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 }
 
 bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
-                                Xbyak::CodeGenerator&         generator) {
+                                Xbyak::CodeGenerator& generator, s64 stack_adjustment = 0,
+                                ZydisMnemonic replacement = ZYDIS_MNEMONIC_INVALID) {
 	ZydisEncoderRequest request;
 	if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(
 	        &decoded.instruction, decoded.operands.data(),
 	        decoded.instruction.operand_count_visible, &request))) {
 		return false;
+	}
+	if (replacement != ZYDIS_MNEMONIC_INVALID) {
+		request.mnemonic = replacement;
 	}
 
 	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
@@ -679,6 +702,9 @@ bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
 				return false;
 			}
 			request.operands[index].mem.displacement = static_cast<ZyanI64>(absolute_address);
+		} else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+		           IsStackPointerRegister(operand.mem.base)) {
+			request.operands[index].mem.displacement += stack_adjustment;
 		}
 	}
 
@@ -823,8 +849,9 @@ void GenerateReciprocalSquareRoot(const DecodedCodeInstruction& decoded,
 	generator.L(done);
 }
 
-bool IsSupportedExtractQ(const DecodedCodeInstruction& decoded) {
-	if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) {
+bool IsSupportedBitFieldInstruction(const DecodedCodeInstruction& decoded) {
+	const bool insert = decoded.instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ;
+	if (!insert && decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) {
 		return false;
 	}
 	const auto is_xmm = [](const ZydisDecodedOperand& operand) {
@@ -832,18 +859,20 @@ bool IsSupportedExtractQ(const DecodedCodeInstruction& decoded) {
 		       operand.reg.value >= ZYDIS_REGISTER_XMM0 &&
 		       operand.reg.value <= ZYDIS_REGISTER_XMM15;
 	};
-	const bool immediate = decoded.instruction.operand_count_visible == 3 &&
-	                       decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-	                       decoded.operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
-	if (!is_xmm(decoded.operands[0]) ||
+	const size_t immediate_index = insert ? 2 : 1;
+	const bool   immediate =
+	    decoded.instruction.operand_count_visible == immediate_index + 2 &&
+	    decoded.operands[immediate_index].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+	    decoded.operands[immediate_index + 1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+	if (!is_xmm(decoded.operands[0]) || (insert && !is_xmm(decoded.operands[1])) ||
 	    (!immediate &&
 	     !(decoded.instruction.operand_count_visible == 2 && is_xmm(decoded.operands[1])))) {
 		return false;
 	}
-	// Match the trap handler's encoding support: 66 [REX] 0F 78/79 ModRM [imm8 imm8].
+	// Match the trap handler's encoding support: 66/F2 [REX] 0F 78/79 ModRM [imm8 imm8].
 	const auto*  code   = reinterpret_cast<const u8*>(decoded.address);
 	const size_t opcode = (code[1] & 0xf0u) == 0x40u ? 2 : 1;
-	return code[0] == 0x66 && code[opcode] == 0x0f &&
+	return code[0] == (insert ? 0xf2 : 0x66) && code[opcode] == 0x0f &&
 	       code[opcode + 1] == (immediate ? 0x78 : 0x79) &&
 	       decoded.instruction.length == opcode + (immediate ? 5 : 3);
 }
@@ -890,8 +919,8 @@ void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerato
 
 void CollectAmdInstructions(const DecodedFunction&                   function,
                             std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                            GuestInstructionPatchResult&             result) {
-	static const bool host_lacks_sse4a = !Xbyak::util::Cpu().has(Xbyak::util::Cpu::tSSE4a);
+                            GuestInstructionPatchResult&             result,
+                            GuestInstructionHostFeatures             host_features) {
 	for (const auto& [address, decoded]: function.instructions) {
 		const auto&            instruction = decoded.instruction;
 		InstructionReplacement replacement {};
@@ -900,8 +929,14 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
 		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
 			replacement = InstructionReplacement::ReciprocalSquareRoot;
-		} else if (host_lacks_sse4a && IsSupportedExtractQ(decoded)) {
-			replacement = InstructionReplacement::ExtractQ;
+		} else if (!host_features.sse4a && IsSupportedBitFieldInstruction(decoded)) {
+			replacement = instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ
+			                  ? InstructionReplacement::ExtractQ
+			                  : InstructionReplacement::InsertQ;
+		} else if (!host_features.rdpid && instruction.mnemonic == ZYDIS_MNEMONIC_RDPID) {
+			replacement = InstructionReplacement::ReadProcessorId;
+		} else if (!host_features.clwb && instruction.mnemonic == ZYDIS_MNEMONIC_CLWB) {
+			replacement = InstructionReplacement::CacheLineWriteBack;
 		} else {
 			continue;
 		}
@@ -916,16 +951,21 @@ void MarkInstructionTrap(u8* code, const ZydisDecodedInstruction& instruction,
 		// Clear a reserved VEX.vvvv bit, retaining both register operands for the handler.
 		code[instruction.raw.vex.size - 1] &= ~0x08u;
 	}
-	// EXTRQ already raises #UD on hosts without SSE4a; keep its original encoding.
+	// Other replacements already raise #UD on hosts without their CPU feature.
 }
 
-void GenerateInstructionTrap(const DecodedCodeInstruction& decoded,
-                             InstructionReplacement replacement, Xbyak::CodeGenerator& generator) {
+bool GenerateInstructionTrap(const DecodedCodeInstruction& decoded,
+                             InstructionReplacement replacement, Xbyak::CodeGenerator& generator,
+                             s64 stack_adjustment) {
+	if (replacement == InstructionReplacement::CacheLineWriteBack) {
+		return EncodeRelocatedInstruction(decoded, generator, stack_adjustment);
+	}
 	std::array<u8, ZYDIS_MAX_INSTRUCTION_LENGTH> code {};
 	std::memcpy(code.data(), reinterpret_cast<const void*>(decoded.address),
 	            decoded.instruction.length);
 	MarkInstructionTrap(code.data(), decoded.instruction, replacement);
 	generator.db(code.data(), decoded.instruction.length);
+	return true;
 }
 
 bool NeedsTrapRedZoneProtection(const DecodedCodeInstruction& decoded) {
@@ -946,11 +986,11 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 		}
 		const auto& decoded = function.instructions.at(address);
 		if (NeedsTrapRedZoneProtection(decoded)) {
-			if (rewrite.replacement == InstructionReplacement::ExtractQ) {
-				// Unlike VRSQRTPS, leaving EXTRQ unchanged would still trap and corrupt the red
-				// zone.
-				EXIT("AMD CPU compatibility: cannot safely trap EXTRQ at %p (guest red zone is "
+			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
+				// Leaving an unsupported instruction unchanged still traps with a live red zone.
+				EXIT("AMD CPU compatibility: cannot safely trap %s at %p (guest red zone is "
 				     "live)\n",
+				     ZydisMnemonicGetString(decoded.instruction.mnemonic),
 				     reinterpret_cast<void*>(address));
 			}
 			continue;
@@ -990,23 +1030,31 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				const auto replacement = rewrite != rewrite_sites.end()
 				                             ? rewrite->second.replacement
 				                             : InstructionReplacement::None;
+				const bool uses_trap   = UsesInstructionTrap(replacement, trap_replacements);
 				const bool protected_indirect_call =
 				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
 				const bool protect_red_zone =
 				    (rewrite != rewrite_sites.end() && rewrite->second.protect_red_zone &&
 				     !protected_indirect_call) ||
-				    (replacement != InstructionReplacement::None && trap_replacements &&
+				    ((uses_trap || replacement == InstructionReplacement::CacheLineWriteBack) &&
 				     NeedsTrapRedZoneProtection(*decoded));
 				if (protect_red_zone) {
 					generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
 				if (replacement != InstructionReplacement::None) {
-					if (trap_replacements) {
-						GenerateInstructionTrap(*decoded, replacement, generator);
+					if (uses_trap) {
+						encoded = GenerateInstructionTrap(*decoded, replacement, generator,
+						                                  protect_red_zone ? GuestRedZoneSize : 0);
 					} else if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
 						GenerateReciprocalSquareRoot(*decoded, generator);
-					} else {
+					} else if (replacement == InstructionReplacement::ExtractQ) {
 						GenerateExtractQ(*decoded, generator);
+					} else {
+						// CLFLUSH writes back dirty data too; invalidation is a permitted stronger
+						// action.
+						encoded = EncodeRelocatedInstruction(
+						    *decoded, generator, protect_red_zone ? GuestRedZoneSize : 0,
+						    ZYDIS_MNEMONIC_CLFLUSH);
 					}
 				} else if (protected_indirect_call) {
 					encoded = GenerateProtectedIndirectCall(*decoded, generator);
@@ -1053,7 +1101,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			}
 			if (rewrite->second.replacement != InstructionReplacement::None) {
 				auto& counts = ReplacementCounts(result, rewrite->second.replacement);
-				if (span.trap_replacements) {
+				if (UsesInstructionTrap(rewrite->second.replacement, span.trap_replacements)) {
 					++counts.trapped;
 				} else {
 					++counts.native;
@@ -1425,9 +1473,26 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 }
 } // namespace
 
+GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
+	static const auto features = [] {
+		const Xbyak::util::Cpu cpu;
+		uint32_t               leaf[4] {};
+		Xbyak::util::Cpu::getCpuid(0, leaf);
+		bool rdpid = false;
+		if (leaf[0] >= 7) {
+			Xbyak::util::Cpu::getCpuidEx(7, 0, leaf);
+			rdpid = (leaf[2] & (1u << 22)) != 0;
+		}
+		return GuestInstructionHostFeatures {cpu.has(Xbyak::util::Cpu::tSSE4a), rdpid,
+		                                     cpu.has(Xbyak::util::Cpu::tCLWB)};
+	}();
+	return features;
+}
+
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
-                                                   bool protect_memory, bool emulate_amd) {
+                                                   bool protect_memory, bool emulate_amd,
+                                                   GuestInstructionHostFeatures host_features) {
 	GuestInstructionPatchResult result {};
 	if (!protect_memory && !emulate_amd) {
 		return result;
@@ -1480,7 +1545,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
 		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result);
+			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result);
@@ -1499,8 +1564,12 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 
 #else
 
-GuestInstructionPatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool,
-                                                   bool) {
+GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
+	return {};
+}
+
+GuestInstructionPatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool,
+                                                   GuestInstructionHostFeatures) {
 	return {};
 }
 

@@ -26,16 +26,25 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#include <Zydis/Zydis.h>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #endif
 
 #if defined(__linux__)
+#include <asm/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -3041,6 +3050,140 @@ struct InstructionTestScope {
 	}
 };
 
+struct SavedInstructionContext {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	CONTEXT native {};
+	auto&   Gpr(size_t index) {
+		const std::array registers {&native.Rax, &native.Rcx, &native.Rdx, &native.Rbx,
+		                            &native.Rsp, &native.Rbp, &native.Rsi, &native.Rdi,
+		                            &native.R8,  &native.R9,  &native.R10, &native.R11,
+		                            &native.R12, &native.R13, &native.R14, &native.R15};
+		return *registers[index];
+	}
+	auto& Rip() { return native.Rip; }
+	auto& Flags() { return native.EFlags; }
+	void* Xmm() { return &native.Xmm0; }
+#else
+	ucontext_t    native {};
+	_libc_fpstate fpstate {};
+	SavedInstructionContext() { native.uc_mcontext.fpregs = &fpstate; }
+	auto& Gpr(size_t index) {
+		constexpr std::array registers {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
+		                                REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
+		                                REG_R12, REG_R13, REG_R14, REG_R15};
+		return native.uc_mcontext.gregs[registers[index]];
+	}
+	auto& Rip() { return native.uc_mcontext.gregs[REG_RIP]; }
+	auto& Flags() { return native.uc_mcontext.gregs[REG_EFL]; }
+	void* Xmm() { return fpstate._xmm; }
+#endif
+};
+
+void TestCpuExtensionContexts() {
+	const char*              test = "CpuExtensionContexts";
+	SavedInstructionContext  context;
+	constexpr uint64_t       sentinel = 0x8192a3b4c5d6e700ull;
+	std::array<uint8_t, 256> xmm;
+	for (size_t i = 0; i < xmm.size(); ++i) {
+		xmm[i] = static_cast<uint8_t>(i);
+	}
+	std::memcpy(context.Xmm(), xmm.data(), xmm.size());
+	const auto check_state = [&](const std::array<uint64_t, 16>& expected) {
+		for (size_t reg = 0; reg < expected.size(); ++reg) {
+			Check(test, static_cast<uint64_t>(context.Gpr(reg)) == expected[reg],
+			      "CPU extension changed an unexpected GPR");
+		}
+		Check(test,
+		      context.Flags() == 0x897 && std::memcmp(context.Xmm(), xmm.data(), xmm.size()) == 0,
+		      "CPU extension changed RFLAGS or XMM state");
+	};
+	for (uint8_t encoding = 0; encoding < 32; ++encoding) {
+		const uint8_t destination = encoding & 15;
+		bool          checked     = false;
+		for (size_t attempt = 0; attempt < 100 && !checked; ++attempt) {
+			std::array<uint64_t, 16> expected;
+			for (size_t reg = 0; reg < expected.size(); ++reg) {
+				context.Gpr(reg) = expected[reg] = sentinel | reg;
+			}
+			context.Flags() = 0x897;
+			std::array<uint8_t, 16> instruction {
+			    0xf3, static_cast<uint8_t>(0x40 | ((encoding >> 4) << 3) | (destination >> 3)),
+			    0x0f, 0xc7, static_cast<uint8_t>(0xf8 | (destination & 7))};
+			context.Rip()   = reinterpret_cast<uintptr_t>(instruction.data());
+			uint32_t before = 0;
+			uint32_t after  = 0;
+			__rdtscp(&before);
+			Check(test, EmulateInstructionContext(&context.native), "RDPID fallback was rejected");
+			__rdtscp(&after);
+			Check(test, context.Rip() == reinterpret_cast<uintptr_t>(instruction.data() + 5),
+			      "RDPID advanced RIP incorrectly");
+			if (before == after) {
+				expected[destination] = before;
+				check_state(expected);
+				checked = true;
+			}
+		}
+		Check(test, checked, "thread migrated repeatedly during RDPID comparison");
+	}
+
+	constexpr uint64_t size    = 0x4000;
+	const auto         mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x30000000, size, Common::VirtualMemory::Mode::ReadWrite, "clwb_context_test");
+	Check(test, mapping != 0 && mapping + size <= UINT32_MAX,
+	      "failed to allocate low CLWB fixture");
+	InstructionTestScope restore {mapping, size};
+	auto*                instruction = reinterpret_cast<uint8_t*>(mapping);
+	auto*                data        = instruction + 0x200;
+	std::memset(data, 0xa5, 64);
+	const auto flush = [&](std::initializer_list<uint8_t> bytes, int base, uint64_t value,
+	                       int index = -1, uint64_t index_value = 0) {
+		std::array<uint64_t, 16> expected;
+		for (size_t reg = 0; reg < expected.size(); ++reg) {
+			context.Gpr(reg) = expected[reg] = sentinel | reg;
+		}
+		if (base >= 0) {
+			context.Gpr(base) = expected[base] = value;
+		}
+		if (index >= 0) {
+			context.Gpr(index) = expected[index] = index_value;
+		}
+		context.Flags() = 0x897;
+		std::fill_n(instruction, 16, 0);
+		std::copy(bytes.begin(), bytes.end(), instruction);
+		context.Rip() = mapping;
+		Check(test, EmulateInstructionContext(&context.native), "CLWB fallback was rejected");
+		Check(test, static_cast<uint64_t>(context.Rip()) == mapping + bytes.size(),
+		      "CLWB advanced RIP incorrectly");
+		check_state(expected);
+		Check(test, std::all_of(data, data + 64, [](uint8_t byte) { return byte == 0xa5; }),
+		      "CLWB changed guest memory");
+	};
+	const auto address = reinterpret_cast<uintptr_t>(data);
+	flush({0x66, 0x0f, 0xae, 0x37}, 7, address);                 // [rdi]
+	flush({0x66, 0x0f, 0xae, 0x74, 0x24, 0xf8}, 4, address + 8); // [rsp-8]
+	flush({0x66, 0x41, 0x0f, 0xae, 0x34, 0x24}, 12, address);    // [r12]
+	flush({0x66, 0x43, 0x0f, 0xae, 0x74, 0xac, 0x20}, 12, address - 0x20 - 12, 13,
+	      3);                                                    // [r12+r13*4+32]
+	flush({0x66, 0x41, 0x0f, 0xae, 0x35, 0xf7, 1, 0, 0}, -1, 0); // RIP+503; REX.B ignored
+	flush({0x67, 0x66, 0x0f, 0xae, 0x37}, 7, address | (uint64_t {1} << 32)); // [edi]
+	const auto byte = [&](int shift) { return static_cast<uint8_t>(address >> shift); };
+	flush({0x67, 0x66, 0x0f, 0xae, 0x35, 0xf7, 1, 0, 0}, -1, 0); // EIP+503
+	flush({0x66, 0x41, 0x0f, 0xae, 0x34, 0x25, byte(0), byte(8), byte(16), byte(24)}, -1,
+	      0); // SIB absolute; REX.B ignored
+#if defined(__linux__)
+	for (const auto segment:
+	     {std::pair {ARCH_GET_FS, uint8_t {0x64}}, std::pair {ARCH_GET_GS, uint8_t {0x65}}}) {
+		unsigned long base = 0;
+		Check(test, syscall(SYS_arch_prctl, segment.first, &base) == 0,
+		      "failed to read segment base");
+		flush({segment.second, 0x66, 0x0f, 0xae, 0x37}, 7, address - base);
+	}
+#else
+	flush({0x65, 0x66, 0x0f, 0xae, 0x37}, 7, address - reinterpret_cast<uintptr_t>(NtCurrentTeb()));
+#endif
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestPackedReciprocalSquareRoot() {
 	const char* test = "PackedReciprocalSquareRoot";
 	constexpr uint64_t code_size = 0x4000;
@@ -3370,12 +3513,12 @@ void TestPackedReciprocalSquareRoot() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestPackedBitFieldExtract() {
-	const char*        test      = "PackedBitFieldExtract";
+void TestPackedBitField(bool insert) {
+	const char*        test      = insert ? "PackedBitFieldInsert" : "PackedBitFieldExtract";
 	constexpr uint64_t code_size = 0x80000;
 	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0x904000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "extrq_test");
-	Check(test, mapping != 0, "failed to allocate EXTRQ test code");
+	    0x904000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "bitfield_test");
+	Check(test, mapping != 0, "failed to allocate SSE4a bitfield test code");
 	InstructionTestScope restore {mapping, code_size * 2};
 	restore.InstallHandler(test);
 	const bool host_sse4a      = Xbyak::util::Cpu().has(Xbyak::util::Cpu::tSSE4a);
@@ -3384,19 +3527,23 @@ void TestPackedBitFieldExtract() {
 		                                            reinterpret_cast<void*>(mapping + code_size),
 		                                            capacity);
 	};
-	// Xbyak has no EXTRQ mnemonic. Emit the two canonical SSE4a encodings directly.
-	const auto extrq = [](Xbyak::CodeGenerator& code, int destination, int source,
-	                      uint8_t length = 0, uint8_t index = 0) {
-		code.db(0x66);
+	// Xbyak has no SSE4a bitfield mnemonics. A negative source selects the immediate form.
+	const auto emit_bit_field = [insert](Xbyak::CodeGenerator& code, int destination, int source,
+	                                     uint8_t length = 0, uint8_t index = 0) {
+		const bool immediate = source < 0;
+		if (insert && immediate) {
+			source = 9;
+		}
+		code.db(insert ? 0xf2 : 0x66);
 		const int rex = source < 0 ? (destination >> 3) : ((destination >> 3) << 2) | (source >> 3);
 		if (rex != 0) {
 			code.db(0x40 | rex);
 		}
 		code.db(0x0f);
-		code.db(source < 0 ? 0x78 : 0x79);
+		code.db(immediate ? 0x78 : 0x79);
 		code.db(source < 0 ? 0xc0 | (destination & 7)
 		                   : 0xc0 | ((destination & 7) << 3) | (source & 7));
-		if (source < 0) {
+		if (immediate) {
 			code.db(length);
 			code.db(index);
 		}
@@ -3410,6 +3557,16 @@ void TestPackedBitFieldExtract() {
 			result |= ((value >> (first + bit)) & 1u) << bit;
 		}
 		return result;
+	};
+	const auto insert_bits = [](uint64_t destination, uint64_t source, uint32_t length,
+	                            uint32_t index) {
+		const uint32_t count = (length & 63u) == 0 ? 64 : length & 63u;
+		const uint32_t first = index & 63u;
+		for (uint32_t bit = 0; bit < count && first + bit < 64; ++bit) {
+			const uint64_t mask = uint64_t {1} << (first + bit);
+			destination         = (destination & ~mask) | (((source >> bit) & 1u) << (first + bit));
+		}
+		return destination;
 	};
 	struct Result {
 		std::array<uint64_t, 4>  destination;
@@ -3440,7 +3597,8 @@ void TestPackedBitFieldExtract() {
 	for (const auto registers: {std::array {1, 8}, std::array {8, 9}, std::array {3, 3},
 	                            std::array {15, 0}, std::array {8, -1}}) {
 		const auto           destination = registers[0];
-		const auto           source      = registers[1];
+		const auto           source      = insert && registers[1] < 0 ? 9 : registers[1];
+		const bool           immediate   = registers[1] < 0;
 		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
 		const std::array     saved {code.rbx, code.rbp, code.r12, code.r13, code.r14, code.r15};
 		const std::array gprs {code.rax, code.rcx, code.rdx, code.rbx, code.rbp, code.r8, code.r9,
@@ -3463,7 +3621,7 @@ void TestPackedBitFieldExtract() {
 			code.mov(gprs[index], gpr_sentinel | index);
 		}
 		code.mov(code.qword[code.rsi + offsetof(Result, stack_before)], code.rsp);
-		extrq(code, destination, source, 0xc8, 0xc4);
+		emit_bit_field(code, destination, registers[1], 0xc8, 0xc4);
 		code.mov(code.qword[code.rsi + offsetof(Result, stack_after)], code.rsp);
 		for (size_t index = 0; index < gprs.size(); ++index) {
 			code.mov(code.qword[code.rsi + offsetof(Result, gprs) + index * 8], gprs[index]);
@@ -3485,7 +3643,7 @@ void TestPackedBitFieldExtract() {
 			code.pop(*reg);
 		}
 		code.ret();
-		Check(test, Xbyak::GetError() == 0, "failed to generate EXTRQ state fixture");
+		Check(test, Xbyak::GetError() == 0, "failed to generate SSE4a bitfield state fixture");
 		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
 		register_module(code_size);
 		const std::vector<uint8_t> trampoline(code.getCode() + code_size,
@@ -3493,45 +3651,51 @@ void TestPackedBitFieldExtract() {
 		const auto                 disabled =
 		    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, false);
 		Check(test,
-		      disabled.extrq.found == 0 &&
+		      disabled.extrq.found == 0 && disabled.insertq.found == 0 &&
 		          std::equal(original.begin(), original.end(), code.getCode()) &&
 		          std::equal(trampoline.begin(), trampoline.end(), code.getCode() + code_size),
-		      "disabled AMD patching changed EXTRQ code or trampolines");
+		      "disabled AMD patching changed SSE4a bitfield code or trampolines");
 		for (const bool fallback: {false, true}) {
+			if (insert && fallback) {
+				continue; // INSERTQ always uses the trap path.
+			}
 			std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
 			register_module(fallback ? 32 : code_size);
-			const auto counts = Loader::PatchGuestInstructions(mapping, code.getSize(),
-			                                                   function_starts, false, true)
-			                        .extrq;
+			const auto patched = Loader::PatchGuestInstructions(mapping, code.getSize(),
+			                                                    function_starts, false, true);
+			const auto counts  = insert ? patched.insertq : patched.extrq;
 			if (host_sse4a) {
 				Check(test,
 				      counts.found == 0 &&
 				          std::equal(original.begin(), original.end(), code.getCode()),
-				      "SSE4a host received unnecessary EXTRQ patches");
+				      "SSE4a host received unnecessary SSE4a bitfield patches");
 				std::printf("[host]    %-48s skipped (native SSE4a host)\n", test);
 				return;
 			}
-			std::printf("[host]    EXTRQ xmm%d,%d %s found=%" PRIu64 " native=%" PRIu64
+			std::printf("[host]    bitfield xmm%d,%d %s found=%" PRIu64 " native=%" PRIu64
 			            " trapped=%" PRIu64 "\n",
 			            destination, source, fallback ? "fallback" : "replacement", counts.found,
 			            counts.native, counts.trapped);
 			Check(test,
 			      Xbyak::GetError() == 0 && counts.found == 1 && counts.Skipped() == 0 &&
-			          counts.native == (fallback ? 0u : 1u) &&
-			          counts.trapped == (fallback ? 1u : 0u),
-			      "EXTRQ native/fallback patch counts differ");
+			          counts.native == (fallback || insert ? 0u : 1u) &&
+			          counts.trapped == (fallback || insert ? 1u : 0u),
+			      "SSE4a bitfield native/fallback patch counts differ");
 			const auto traps_before = g_instruction_traps;
 			uint64_t   calls        = 0;
 			for (uint32_t length = 0; length < 64; ++length) {
 				for (uint32_t index = 0; index < 64; ++index) {
-					if (source < 0 && (length != 8 || index != 4)) {
+					if (immediate && (length != 8 || index != 4)) {
 						continue;
 					}
 					for (const uint64_t pattern: {UINT64_MAX, uint64_t {0x0123456789abcdef}}) {
 						const uint64_t controls = (pattern & ~uint64_t {0xffff}) |
 						                          ((index | 0xc0u) << 8) | (length | 0xc0u);
-						input[0]                = source == destination ? controls : pattern;
-						input[4]                = controls;
+						input[0] = !insert && source == destination ? controls : pattern;
+						input[4] = insert ? ~pattern : controls;
+						if (insert) {
+							input[source == destination ? 1 : 5] = controls;
+						}
 						Result output {};
 						_mm_setcsr(0x5fa5);
 						function(input.data(), &output);
@@ -3539,37 +3703,46 @@ void TestPackedBitFieldExtract() {
 						_mm_setcsr(restore.mxcsr);
 						++calls;
 						Check(test,
-						      output.destination[0] == extract(input[0], length, index) &&
-						          output.destination[1] == 0 && output.destination[2] == input[2] &&
+						      output.destination[0] ==
+						              (insert ? insert_bits(input[0],
+						                                    input[source == destination ? 0 : 4],
+						                                    length, index)
+						                      : extract(input[0], length, index)) &&
+						          output.destination[1] == (insert ? input[1] : 0) &&
+						          output.destination[2] == input[2] &&
 						          output.destination[3] == input[3],
-						      "EXTRQ result or destination lanes differ");
+						      "SSE4a bitfield result or destination lanes differ");
 						Check(test,
 						      source < 0 || source == destination
 						          ? output.source == output.destination
 						          : std::equal(output.source.begin(), output.source.end(),
 						                       input.begin() + 4),
-						      "EXTRQ changed its separate source register");
+						      "SSE4a bitfield changed its separate source register");
 						Check(test,
 						      mxcsr == 0x5fa5 && (output.flags & 0x8d5u) == 0x895u &&
 						          output.stack_before == output.stack_after,
-						      "EXTRQ changed MXCSR, RFLAGS or RSP");
+						      "SSE4a bitfield changed MXCSR, RFLAGS or RSP");
 						for (size_t reg = 0; reg < output.gprs.size(); ++reg) {
 							Check(test, output.gprs[reg] == (gpr_sentinel | reg),
-							      "EXTRQ corrupted a guest GPR");
+							      "SSE4a bitfield corrupted a guest GPR");
 						}
 						for (size_t slot = 0; slot < output.red_zone.size(); ++slot) {
 							Check(test,
 							      output.red_zone[slot] == (red_zone_sentinel | ((slot + 1) * 8)),
-							      "EXTRQ corrupted the guest red zone");
+							      "SSE4a bitfield corrupted the guest red zone");
 						}
 					}
 				}
 			}
 			Check(test,
 			      static_cast<uint64_t>(g_instruction_traps - traps_before) ==
-			          (fallback ? calls : 0),
-			      "EXTRQ execution did not match native/fallback selection");
+			          (fallback || insert ? calls : 0),
+			      "SSE4a bitfield execution did not match native/fallback selection");
 		}
+	}
+	if (insert) {
+		std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
+		return;
 	}
 
 	// Cover every immediate length/index pair without re-decoding thousands of large fixtures.
@@ -3579,7 +3752,7 @@ void TestPackedBitFieldExtract() {
 		for (uint32_t index = 0; index < 64; ++index) {
 			starts.push_back(mapping + code.getSize());
 			code.vmovups(code.ymm8, code.ptr[code.rdi]);
-			extrq(code, 8, -1, length | 0xc0, index | 0xc0);
+			emit_bit_field(code, 8, -1, length | 0xc0, index | 0xc0);
 			code.vmovups(code.ptr[code.rsi], code.ymm8);
 			code.vzeroupper();
 			code.ret();
@@ -3621,7 +3794,7 @@ void TestPackedBitFieldExtract() {
 	code.vmovups(code.ymm1, code.ptr[code.rdi]);
 	code.vmovups(code.ymm2, code.ptr[code.rdi + 32]);
 	code.lea(code.rax, code.ptr[code.rip + continuation]);
-	extrq(code, 1, 2);
+	emit_bit_field(code, 1, 2);
 	code.jmp(code.rax);
 	code.L(continuation);
 	code.vmovups(code.ptr[code.rsi], code.ymm1);
@@ -3649,7 +3822,7 @@ void TestPackedBitFieldExtract() {
 	code.vmovups(code.ymm1, code.ptr[code.rdi]);
 	code.vmovups(code.ymm2, code.ptr[code.rdi + 32]);
 	code.vmovups(code.ymm3, code.ptr[code.rdi + 64]);
-	extrq(code, 1, 2);
+	emit_bit_field(code, 1, 2);
 	code.vrsqrtps(code.xmm4, code.xmm3);
 	code.vmovups(code.ptr[code.rsi], code.ymm1);
 	code.vmovups(code.ptr[code.rsi + 32], code.ymm4);
@@ -3677,6 +3850,170 @@ void TestPackedBitFieldExtract() {
 		      "mixed native/fallback AMD instructions lost their results");
 	}
 	std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
+}
+
+void TestPackedBitFieldExtract() {
+	TestPackedBitField(false);
+}
+
+void TestPackedBitFieldInsert() {
+	TestPackedBitField(true);
+}
+
+void TestCpuExtensionPatches() {
+	const char*        test      = "CpuExtensionPatches";
+	constexpr uint64_t code_size = 0x4000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x906000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "cpu_extension_test");
+	Check(test, mapping != 0, "failed to allocate CPU extension fixture");
+	InstructionTestScope restore {mapping, code_size * 2};
+	restore.InstallHandler(test);
+	const auto                     host = Loader::GetGuestInstructionHostFeatures();
+	const std::array<uintptr_t, 1> starts {mapping};
+	const auto                     register_module = [&](uint64_t capacity) {
+		std::memset(reinterpret_cast<void*>(mapping + code_size), 0, code_size);
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                            reinterpret_cast<void*>(mapping + code_size),
+		                                            capacity);
+	};
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint64_t*, uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	for (const bool writes_rsp: {false, true}) {
+		code.reset();
+		code.push(code.r12);
+		code.mov(code.r12, code.rsp);
+		code.vmovups(code.ymm8, code.ptr[code.rdi]);
+		code.vmovups(code.ymm9, code.ptr[code.rdi + 32]);
+		code.mov(code.r10, 0x123456789abcdef0ull);
+		code.mov(code.qword[code.rsp - 8], code.r10);
+		code.clwb(code.ptr[code.rsp - 8]);
+		for (const uint8_t byte: {0xf2, 0x45, 0x0f, 0x79, 0xc1}) {
+			code.db(byte); // INSERTQ xmm8,xmm9
+		}
+		code.db(0xf3); // RDPID rax/rsp
+		code.db(0x48);
+		code.db(0x0f);
+		code.db(0xc7);
+		code.db(writes_rsp ? 0xfc : 0xf8);
+		if (writes_rsp) {
+			code.mov(code.rax, code.rsp);
+			code.mov(code.rsp, code.r12);
+		}
+		code.mov(code.qword[code.rsi], code.rax);
+		code.mov(code.rax, code.qword[code.rsp - 8]);
+		code.mov(code.qword[code.rsi + 8], code.rax);
+		code.vmovups(code.ptr[code.rsi + 16], code.ymm8);
+		code.vzeroupper();
+		code.pop(code.r12);
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate mixed CPU extension fixture");
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+		register_module(code_size);
+		const auto disabled =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, false, {});
+		Check(test,
+		      disabled.insertq.found == 0 && disabled.rdpid.found == 0 &&
+		          disabled.clwb.found == 0 &&
+		          std::equal(original.begin(), original.end(), code.getCode()) &&
+		          std::all_of(code.getCode() + code_size, code.getCode() + code_size * 2,
+		                      [](uint8_t byte) { return byte == 0; }),
+		      "disabled AMD option changed CPU extension code or trampolines");
+		const auto supported = Loader::PatchGuestInstructions(mapping, code.getSize(), starts,
+		                                                      false, true, {true, true, true});
+		Check(test,
+		      supported.insertq.found == 0 && supported.rdpid.found == 0 &&
+		          supported.clwb.found == 0 &&
+		          std::equal(original.begin(), original.end(), code.getCode()),
+		      "available host CPU extensions were unnecessarily patched");
+		const auto enabled =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {});
+		Check(test,
+		      enabled.clwb.found == 1 && enabled.clwb.native == 1 && enabled.clwb.trapped == 0 &&
+		          enabled.insertq.found == 1 && enabled.insertq.native == 0 &&
+		          enabled.insertq.trapped == 1 && enabled.rdpid.found == 1 &&
+		          enabled.rdpid.native == 0 && enabled.rdpid.trapped == 1,
+		      "mixed native CLWB and trapped INSERTQ/RDPID counts differ");
+		// Verify the actual stack-relative CLFLUSH operand, since flushing the wrong mapped
+		// cache line would otherwise leave the sentinel unchanged too.
+		ZydisDecoder decoder {};
+		Check(test,
+		      ZYAN_SUCCESS(
+		          ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)),
+		      "failed to initialize decoder");
+		bool found_flush = false;
+		for (size_t offset = 0; offset < 512 && !found_flush;) {
+			ZydisDecodedInstruction instruction {};
+			ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+			Check(test,
+			      ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code.getCode() + code_size + offset,
+			                                          code_size - offset, &instruction, operands)),
+			      "failed to decode CPU extension trampoline");
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_CLFLUSH) {
+				found_flush = true;
+				Check(test,
+				      operands[0].mem.base == ZYDIS_REGISTER_RSP &&
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				          operands[0].mem.disp.value == 120,
+#else
+				          operands[0].mem.disp.value == -8,
+#endif
+				      "CLWB replacement did not preserve its guest stack address");
+			}
+			offset += instruction.length;
+		}
+		Check(test, found_flush, "CLWB native replacement did not emit CLFLUSH");
+		const std::array<uint64_t, 8> input {0x1111, 0xdeadbeef, 0x12345678, 0x87654321,
+		                                     0xab,   0xffffc4c8, 0,          0};
+		std::array<uint64_t, 6>       output {};
+		bool                          checked_aux = false;
+		for (size_t attempt = 0; attempt < 100 && !checked_aux; ++attempt) {
+			uint32_t   before = 0;
+			uint32_t   after  = 0;
+			const auto traps  = g_instruction_traps;
+			__rdtscp(&before);
+			function(input.data(), output.data());
+			__rdtscp(&after);
+			Check(test, g_instruction_traps == traps + !host.sse4a + !host.rdpid,
+			      "mixed CPU extension fixture used an unexpected trap path");
+			Check(test,
+			      output[1] == 0x123456789abcdef0ull && output[2] == 0x1ab1 &&
+			          (host.sse4a || output[3] == input[1]) &&
+			          std::equal(output.begin() + 4, output.end(), input.begin() + 2),
+			      "mixed CPU extensions corrupted INSERTQ state or the guest red zone");
+			if (before == after) {
+				Check(test, output[0] == before,
+				      "RDPID patch lost TSC_AUX or adjusted its RSP destination");
+				checked_aux = true;
+			}
+		}
+		Check(test, checked_aux, "thread migrated repeatedly during patched RDPID comparison");
+	}
+
+	code.reset();
+	code.clwb(code.ptr[code.rdi]);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate exhausted CLWB fixture");
+	const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+	register_module(1);
+	const auto exhausted =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true, {}).clwb;
+	Check(test,
+	      exhausted.found == 1 && exhausted.native == 0 && exhausted.trapped == 1 &&
+	          std::equal(original.begin(), original.end(), code.getCode()) &&
+	          Xbyak::GetError() == 0,
+	      "exhausted CLWB replacement did not retain its natural trap fallback");
+	std::array<uint64_t, 8> data;
+	data.fill(0x123456789abcdef0ull);
+	const auto traps = g_instruction_traps;
+	function(data.data(), nullptr);
+	Check(test,
+	      g_instruction_traps == traps + !host.clwb &&
+	          std::all_of(data.begin(), data.end(),
+	                      [](uint64_t value) { return value == 0x123456789abcdef0ull; }),
+	      "CLWB direct fallback changed memory or used an unexpected trap path");
+	std::printf("[host]    %-48s ok\n", test);
 }
 
 #endif
@@ -3855,6 +4192,12 @@ int main(int argc, char** argv) {
 	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
+		RunTest(TestCpuExtensionContexts);
+		RunTest(TestPackedBitFieldInsert);
+		RunTest(TestCpuExtensionPatches);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
 		RunTest(TestPackedBitFieldExtract);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -3875,6 +4218,9 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
 	RunTest(TestPackedBitFieldExtract);
+	RunTest(TestCpuExtensionContexts);
+	RunTest(TestPackedBitFieldInsert);
+	RunTest(TestCpuExtensionPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);

@@ -1951,6 +1951,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                                           protect_memory_faults, emulate_amd);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
+			totals.insertq += result.insertq;
+			totals.rdpid += result.rdpid;
+			totals.clwb += result.clwb;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -1965,18 +1968,26 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			}
 		}
 		if (emulate_amd && have_function_starts) {
-			const auto  found   = totals.reciprocal_sqrt.found + totals.extrq.found;
-			const auto  skipped = totals.reciprocal_sqrt.Skipped() + totals.extrq.Skipped();
+			InstructionPatchCounts combined {};
+			std::string            details;
+			for (const auto& [name, counts]: {std::pair {"VRSQRTPS", totals.reciprocal_sqrt},
+			                                  {"EXTRQ", totals.extrq},
+			                                  {"INSERTQ", totals.insertq},
+			                                  {"RDPID", totals.rdpid},
+			                                  {"CLWB", totals.clwb}}) {
+				combined += counts;
+				if (!details.empty()) details += "; ";
+				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
+				                       counts.trapped, counts.Skipped());
+			}
+			const auto  found   = combined.found;
+			const auto  skipped = combined.Skipped();
 			const char* status  = found == 0         ? "no matching instructions"
 			                      : skipped == found ? "not patched"
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "AMD CPU compatibility: {} {} (VRSQRTPS: native={}, trapped={}, skipped={}; "
-			    "EXTRQ: native={}, trapped={}, skipped={})\n",
-			    module_name, status, totals.reciprocal_sqrt.native, totals.reciprocal_sqrt.trapped,
-			    totals.reciprocal_sqrt.Skipped(), totals.extrq.native, totals.extrq.trapped,
-			    totals.extrq.Skipped()));
+			Log::WriteToConsoleAndLog(
+			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
 	}
 
