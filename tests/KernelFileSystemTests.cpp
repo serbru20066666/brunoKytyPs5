@@ -30,7 +30,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <utility>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -813,6 +813,210 @@ void CheckAprPaths(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+std::array<int, 2> CreateTcpPair() {
+  namespace Net = Libs::Network::Net;
+  // Guest sockaddr_in: length, family, network-order port/address, padding.
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int listener = Net::Socket(2, 1, 0);
+  Check(listener >= 0, "create loopback listener");
+  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
+  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
+  uint32_t address_size = address.size();
+  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
+        "get assigned loopback port");
+  const int writer = Net::Socket(2, 1, 0);
+  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
+        "connect wake socket");
+  const int reader = Net::Accept(listener, nullptr, nullptr);
+  Check(reader >= 0, "accept wake socket");
+  Check(Net::SocketClose(listener) == 0, "close listener");
+  return {reader, writer};
+}
+
+#if defined(_WIN32)
+void CheckSocketReceiveConcurrency() {
+  namespace Net = Libs::Network::Net;
+  const auto [reader, writer] = CreateTcpPair();
+  const int timeout_ms = 3000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+        "bound the blocked receive concurrency fixture");
+  std::promise<void> entered;
+  std::promise<int64_t> completed;
+  auto entered_future = entered.get_future();
+  auto completed_future = completed.get_future();
+  std::jthread receiver([&] {
+    char byte = 0;
+    entered.set_value();
+    completed.set_value(Net::Recv(reader, &byte, 1, 0x42));
+  });
+  Check(entered_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+        "start blocked reader");
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  char byte = 0;
+  const auto before_nonblocking = std::chrono::steady_clock::now();
+  Check(Net::Recv(reader, &byte, 1, 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+            std::chrono::steady_clock::now() - before_nonblocking < std::chrono::milliseconds(500) &&
+            completed_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
+        "DONTWAIT does not wait behind another blocked reader");
+  const auto before_close = std::chrono::steady_clock::now();
+  Check(Net::SocketClose(reader) == 0, "close succeeds while another thread receives");
+  Check(std::chrono::steady_clock::now() - before_close < std::chrono::seconds(1),
+        "close does not wait for the blocked receive timeout");
+  Check(completed_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+        "close wakes the blocked receive within one second");
+  Check(completed_future.get() <= 0, "closed receive reports EOF or error");
+  Check(std::chrono::steady_clock::now() - before_close < std::chrono::seconds(1),
+        "closing a socket wakes its blocked receive before the receive timeout");
+  receiver.join();
+  Check(Net::SocketClose(writer) == 0, "close blocked receive writer");
+
+  const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
+  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+            Net::Send(shutdown_writer, "x", 1, 0) == 1 &&
+            Net::Recv(shutdown_reader, &byte, 1, 0x42) == 1 && byte == 'x' &&
+            Net::Shutdown(shutdown_reader, 0) == 0 &&
+            Net::Recv(shutdown_reader, &byte, 1, 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ESHUTDOWN,
+        "receive shutdown rejects bytes retained by an earlier peek");
+  Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
+        "close receive shutdown fixture");
+}
+
+void CheckSocketReceiveBuffer(int reader, int writer) {
+  namespace Net = Libs::Network::Net;
+  constexpr int PeekWaitAll = 0x42;
+  constexpr char Payload[] = "abcdef";
+  const int timeout_ms = 2000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+        "bound blocking receive regressions with SO_RCVTIMEO");
+  Check(Net::Send(writer, Payload, 2, 0) == 2, "send first TCP fragment");
+  std::jthread sender([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Check(Net::Send(writer, Payload + 2, 4, 0) == 4, "send second TCP fragment");
+  });
+  std::array<char, 8> received {};
+  Check(Net::Recv(reader, received.data(), 6, PeekWaitAll) == 6 &&
+            std::memcmp(received.data(), Payload, 6) == 0,
+        "combined peek waits for fragmented TCP bytes");
+  sender.join();
+  received.fill(0);
+  Check(Net::Recv(reader, received.data(), 6, PeekWaitAll) == 6 &&
+            std::memcmp(received.data(), Payload, 6) == 0,
+        "repeated combined peek preserves all bytes");
+
+  const int epoll = Net::EpollCreate("buffered receive", 0);
+  Net::NetEpollEvent registration {};
+  registration.events = 1;
+  registration.data.u64 = 0x12345678;
+  Check(epoll >= 0 && Net::EpollControl(epoll, 1, reader, &registration) == 0,
+        "register buffered socket readability");
+  const auto check_readable = [&](bool expected) {
+    std::array<uint64_t, 16> readable {};
+    const auto bit = uint64_t {1} << (reader % 64);
+    readable[reader / 64] = bit;
+    const std::array<int64_t, 2> timeout {expected ? 1 : 0, 0};
+    Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr, timeout.data()) ==
+              (expected ? 1 : 0) && readable[reader / 64] == (expected ? bit : 0),
+          "select reflects buffered bytes and their removal");
+    if (expected) {
+      auto writable = readable;
+      Check(Net::Select(reader + 1, readable.data(), writable.data(), nullptr,
+                        timeout.data()) == 2 && readable[reader / 64] == bit &&
+                writable[reader / 64] == bit,
+            "select counts readable and writable bits once each");
+    }
+    Net::NetEpollEvent event {};
+    Check(Net::EpollWait(epoll, &event, 1, expected ? 1000000 : 0) ==
+              (expected ? 1 : 0) &&
+              (!expected || (event.events == 1 && event.data.u64 == registration.data.u64)),
+          "epoll reflects buffered bytes and preserves registration data");
+  };
+  check_readable(true);
+  std::array<uint8_t, 16> peer {}, expected_peer {};
+  uint32_t peer_size = peer.size(), expected_peer_size = expected_peer.size();
+  Check(Net::Getsockname(writer, expected_peer.data(), &expected_peer_size) == 0 &&
+            Net::Recv(reader, received.data(), 0, PeekWaitAll) == 0 &&
+            Net::Recvfrom(reader, received.data(), 2, 0, peer.data(), &peer_size) == 2 &&
+            peer_size == expected_peer_size && peer == expected_peer &&
+            std::memcmp(received.data(), Payload, 2) == 0 &&
+            FileSystem::KernelRead(reader, received.data(), 2) == 2 &&
+            std::memcmp(received.data(), Payload + 2, 2) == 0,
+        "zero-length peek preserves bytes; recvfrom returns peer and shares kernel read buffer");
+  check_readable(true);
+  Check(Net::Send(writer, "gh", 2, 0) == 2 &&
+            Net::Recv(reader, received.data(), 4, 0x40) == 4 &&
+            std::memcmp(received.data(), "efgh", 4) == 0,
+        "waitall joins buffered bytes with newly received bytes");
+  check_readable(false);
+  Check(Net::Send(writer, "mn", 2, 0) == 2, "send plain peek fixture");
+  const auto before_peek = std::chrono::steady_clock::now();
+  Check(Net::Recv(reader, received.data(), 4, 2) == 2 &&
+            std::memcmp(received.data(), "mn", 2) == 0 &&
+            std::chrono::steady_clock::now() - before_peek < std::chrono::milliseconds(500) &&
+            Net::Recv(reader, received.data(), 4, 0) == 2 &&
+            std::memcmp(received.data(), "mn", 2) == 0,
+        "plain peek returns available bytes promptly and preserves them for ordinary receive");
+
+  const int enabled = 1, disabled = 0;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recv(reader, received.data(), 4, PeekWaitAll) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty nonblocking combined peek returns would-block");
+  Check(Net::Send(writer, "ij", 2, 0) == 2, "send nonblocking receive fixture");
+  check_readable(true);
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  for (int i = 0; i < 2; ++i) {
+    Check(Net::Recv(reader, received.data(), 4, PeekWaitAll) == 2 &&
+              std::memcmp(received.data(), "ij", 2) == 0 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+          "nonblocking combined peek preserves a short result and successful errno");
+  }
+  Check(Net::Recv(reader, received.data(), 4, 0) == 2 &&
+            std::memcmp(received.data(), "ij", 2) == 0,
+        "ordinary receive consumes a short buffered result");
+  check_readable(false);
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &disabled, sizeof(disabled)) == 0 &&
+            Net::EpollDestroy(epoll) == 0,
+        "restore blocking receives and destroy epoll");
+  Check(Net::Recv(reader, received.data(), 4, PeekWaitAll | 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "per-call nonblocking combined peek returns would-block on a blocking socket");
+  Check(Net::Send(writer, "kl", 2, 0) == 2 && Net::Shutdown(writer, 1) == 0,
+        "send a final partial payload and EOF");
+  for (int i = 0; i < 2; ++i) {
+    Check(Net::Recv(reader, received.data(), 4, PeekWaitAll) == 2 &&
+              std::memcmp(received.data(), "kl", 2) == 0,
+          "EOF ends waitall while repeated peeks preserve the short payload");
+  }
+  Check(Net::Recv(reader, received.data(), 4, 0x40) == 2 &&
+            std::memcmp(received.data(), "kl", 2) == 0 &&
+            Net::Recv(reader, received.data(), 4, PeekWaitAll) == 0,
+        "draining the final buffered payload exposes EOF");
+
+  const int datagram = Net::Socket(2, 2, 0);
+  const int datagram_writer = Net::Socket(2, 2, 0);
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  uint32_t address_size = address.size();
+  Check(datagram >= 0 && datagram_writer >= 0 &&
+            Net::Bind(datagram, address.data(), address.size()) == 0 &&
+            Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+            Net::Sendto(datagram_writer, Payload, 6, 0, address.data(), address_size) == 6,
+        "create bounded UDP truncation fixture");
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  Check(Net::Recvfrom(datagram, received.data(), 2, 0, nullptr, nullptr) == 2 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL &&
+            std::memcmp(received.data(), Payload, 2) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recv(datagram, received.data(), received.size(), 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "UDP truncation returns its prefix and discards the rest of the datagram");
+  Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
+        "close UDP truncation fixture");
+}
+#endif
+
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
@@ -831,21 +1035,7 @@ void CheckSocketWakeup() {
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
-  // Guest sockaddr_in: length, family, network-order port/address, padding.
-  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
-  const int listener = Net::Socket(2, 1, 0);
-  Check(listener >= 0, "create loopback listener");
-  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
-  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
-  uint32_t address_size = address.size();
-  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
-        "get assigned loopback port");
-  const int writer = Net::Socket(2, 1, 0);
-  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
-        "connect wake socket");
-  const int reader = Net::Accept(listener, nullptr, nullptr);
-  Check(reader >= 0, "accept wake socket");
-  Check(Net::SocketClose(listener) == 0, "close listener");
+  const auto [reader, writer] = CreateTcpPair();
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
         "enable TCP_NODELAY");
@@ -914,6 +1104,10 @@ void CheckSocketWakeup() {
         "Net send reports a broken pipe without raising host SIGPIPE");
   Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
 #endif
+#if defined(_WIN32)
+  CheckSocketReceiveBuffer(reader, writer);
+  CheckSocketReceiveConcurrency();
+#endif
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
@@ -927,311 +1121,6 @@ void CheckSocketWakeup() {
             readable[reader / 64] == bit,
         "closed descriptor fails without clearing input fd_set");
 }
-
-#if defined(_WIN32)
-namespace Net = Libs::Network::Net;
-
-void SetReceiveTimeout(int socket, int milliseconds) {
-  const std::array<int64_t, 2> timeout{milliseconds / 1000,
-                                       (milliseconds % 1000) * 1000};
-  Check(Net::Setsockopt(socket, 0xffff, 0x1006, timeout.data(),
-                        sizeof(timeout)) == 0,
-        "set guest timeval receive timeout");
-}
-
-void SetSocketNonblocking(int socket, bool enabled) {
-  const int value = enabled ? 1 : 0;
-  Check(Net::Setsockopt(socket, 0xffff, 0x1200, &value, sizeof(value)) == 0,
-        "set guest socket blocking mode");
-  int actual = -1;
-  uint32_t size = sizeof(actual);
-  Check(Net::Getsockopt(socket, 0xffff, 0x1200, &actual, &size) == 0 &&
-            actual == value,
-        "shared transport reports its blocking mode");
-}
-
-void WaitSocketReadable(int socket) {
-  std::array<uint64_t, 16> readable{};
-  readable[socket / 64] = uint64_t{1} << (socket % 64);
-  const std::array<int64_t, 2> timeout{2, 0};
-  Check(Net::Select(socket + 1, readable.data(), nullptr, nullptr,
-                    timeout.data()) == 1,
-        "loopback fixture becomes readable");
-}
-
-class LoopbackConnection {
-public:
-  explicit LoopbackConnection(bool nonblocking_listener = false) {
-    std::array<uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
-    const int listener = Net::Socket(2, 1, 0);
-    Check(listener >= 0 &&
-              Net::Bind(listener, address.data(), address.size()) == 0 &&
-              Net::Listen(listener, 1) == 0,
-          "create receive regression listener");
-    uint32_t size = address.size();
-    Check(Net::Getsockname(listener, address.data(), &size) == 0,
-          "get receive regression listener address");
-    writer = Net::Socket(2, 1, 0);
-    Check(writer >= 0 && Net::Connect(writer, address.data(), size) == 0,
-          "connect receive regression writer");
-    WaitSocketReadable(listener);
-    if (nonblocking_listener) {
-      SetSocketNonblocking(listener, true);
-    }
-    reader = Net::Accept(listener, nullptr, nullptr);
-    Check(reader >= 0 && Net::SocketClose(listener) == 0,
-          "accept receive regression connection");
-    const int enabled = 1;
-    Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
-          "disable Nagle for gated chunk arrivals");
-    SetReceiveTimeout(reader, 2000);
-  }
-
-  ~LoopbackConnection() {
-    if (reader >= 0) {
-      Check(Net::SocketClose(reader) == 0, "close receive regression reader");
-    }
-    if (writer >= 0) {
-      Check(Net::SocketClose(writer) == 0, "close receive regression writer");
-    }
-  }
-
-  void Send(std::string_view bytes) const {
-    Check(Net::Send(writer, bytes.data(), bytes.size(), 0x20000) ==
-              bytes.size(),
-          "send receive regression bytes");
-  }
-
-  KYTY_CLASS_NO_COPY(LoopbackConnection);
-  int reader = -1;
-  int writer = -1;
-};
-
-void CheckWindowsReceiveFlags() {
-  using namespace std::chrono_literals;
-  constexpr std::string_view payload = "abcdef";
-
-  // The existing wake test covers a prefilled Recv. Exercise Recvfrom as well:
-  // Winsock does not fill the source address itself for a stream receive.
-  {
-    LoopbackConnection connection;
-    connection.Send(payload);
-    WaitSocketReadable(connection.reader);
-    std::array<char, 6> bytes{};
-    std::array<uint8_t, 16> peer{}, expected_peer{};
-    uint32_t peer_size = peer.size(), expected_size = expected_peer.size();
-    Check(Net::Getsockname(connection.writer, expected_peer.data(),
-                           &expected_size) == 0,
-          "get expected receive peer address");
-    Check(Net::Recvfrom(connection.reader, bytes.data(), bytes.size(), 0x42,
-                        peer.data(), &peer_size) == bytes.size() &&
-              std::string_view(bytes.data(), bytes.size()) == payload &&
-              peer == expected_peer,
-          "stream Recvfrom PEEK WAITALL preserves bytes and reports peer");
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
-                  bytes.size() &&
-              std::string_view(bytes.data(), bytes.size()) == payload,
-          "consume bytes after stream Recvfrom peek");
-    Check(Net::Recv(connection.reader, bytes.data(), 0, 0x42) == 0,
-          "zero-length stream PEEK WAITALL returns immediately");
-  }
-
-  for (const int flags : {0x40, 0x42}) {
-    LoopbackConnection connection;
-    connection.Send(payload.substr(0, 2));
-    WaitSocketReadable(connection.reader);
-    std::array<char, 6> bytes{};
-    std::promise<void> entered;
-    auto entry = entered.get_future();
-    auto receive = std::async(std::launch::async, [&] {
-      entered.set_value();
-      return Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
-    });
-    Check(entry.wait_for(2s) == std::future_status::ready,
-          "start chunked receive");
-    Check(receive.wait_for(50ms) == std::future_status::timeout,
-          "WAITALL remains pending with only the first queued chunk");
-    connection.Send(payload.substr(2, 2));
-    Check(receive.wait_for(50ms) == std::future_status::timeout,
-          "WAITALL remains pending with only two chunks");
-    connection.Send(payload.substr(4));
-    Check(receive.wait_for(2s) == std::future_status::ready &&
-              receive.get() == bytes.size() &&
-              std::string_view(bytes.data(), bytes.size()) == payload,
-          "WAITALL returns all three gated chunks in order");
-    if ((flags & 2) != 0) {
-      bytes.fill(0);
-      Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
-                    bytes.size() &&
-                std::string_view(bytes.data(), bytes.size()) == payload,
-            "chunked PEEK leaves the complete stream queued");
-    }
-  }
-
-  {
-    LoopbackConnection connection(true);
-    std::array<char, 6> bytes{};
-    int inherited = 0;
-    uint32_t size = sizeof(inherited);
-    Check(Net::Getsockopt(connection.reader, 0xffff, 0x1200, &inherited,
-                          &size) == 0 &&
-              inherited == 1,
-          "accepted Windows socket inherits nonblocking mode");
-    for (const int flags : {0x40, 0x42, 0x80, 0xc2}) {
-      Check(
-          Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
-                  -1 &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
-          "empty nonblocking receive ignores WAITALL and reports would-block");
-    }
-    connection.Send(payload.substr(0, 2));
-    WaitSocketReadable(connection.reader);
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0xc2) == 2 &&
-              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
-          "nonblocking PEEK WAITALL returns the queued prefix");
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) == 2 &&
-              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
-          "nonblocking WAITALL consumes only the queued prefix");
-    SetSocketNonblocking(connection.reader, false);
-    Check(
-        Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x80) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
-        "blocking transport explicitly rejects unsupported per-call DONTWAIT");
-  }
-
-  for (const int flags : {0x40, 0x42}) {
-    LoopbackConnection connection;
-    SetReceiveTimeout(connection.reader, 80);
-    std::array<int64_t, 2> timeout{};
-    uint32_t size = sizeof(timeout);
-    Check(Net::Getsockopt(connection.reader, 0xffff, 0x1006, timeout.data(),
-                          &size) == 0 &&
-              timeout == std::array<int64_t, 2>{0, 80'000},
-          "receive timeout round-trips through the guest timeval ABI");
-    const std::array<int64_t, 2> invalid_timeout{0, 1'000'000};
-    Check(Net::Setsockopt(connection.reader, 0xffff, 0x1006,
-                          invalid_timeout.data(),
-                          sizeof(invalid_timeout)) == -1 &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-          "invalid timeval does not change the receive timeout");
-    std::array<char, 6> bytes{};
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
-                  -1 &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
-          "empty WAITALL receive expires with would-block");
-    connection.Send(payload.substr(0, 2));
-    WaitSocketReadable(connection.reader);
-    *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-    const auto start = std::chrono::steady_clock::now();
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
-                  2 &&
-              std::string_view(bytes.data(), 2) == payload.substr(0, 2) &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-          "WAITALL timeout returns the prefix without replacing guest errno");
-    Check(std::chrono::steady_clock::now() - start >= 70ms,
-          "partial WAITALL receive honors the configured deadline");
-    if ((flags & 2) != 0) {
-      Check(Net::Recv(connection.reader, bytes.data(), 2, 0) == 2 &&
-                std::string_view(bytes.data(), 2) == payload.substr(0, 2),
-            "timed-out PEEK leaves its prefix available to consume");
-    }
-    SetSocketNonblocking(connection.reader, true);
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0) == -1 &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
-          "timeout path does not duplicate consumed bytes");
-  }
-
-  for (const int flags : {0x40, 0x42}) {
-    LoopbackConnection connection;
-    SetReceiveTimeout(connection.reader, 0);
-    connection.Send(payload.substr(0, 2));
-    Check(Net::Shutdown(connection.writer, 1) == 0,
-          "send FIN after a partial payload");
-    std::array<char, 6> bytes{};
-    auto receive = std::async(std::launch::async, [&] {
-      return Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
-    });
-    Check(receive.wait_for(2s) == std::future_status::ready &&
-              receive.get() == 2 &&
-              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
-          "partial WAITALL completes on EOF without a receive timeout");
-    if ((flags & 2) != 0) {
-      Check(
-          Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x42) == 2 &&
-              Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
-                  2,
-          "EOF PEEK preserves the prefix for another peek and consumption");
-    }
-    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) == 0,
-          "drained stream reports EOF with WAITALL flags");
-  }
-
-  for (const int flags : {0x40, 0x42}) {
-    LoopbackConnection connection;
-    connection.Send(payload.substr(0, 2));
-    WaitSocketReadable(connection.reader);
-    std::array<char, 6> bytes{};
-    std::promise<void> entered;
-    auto entry = entered.get_future();
-    auto receive = std::async(std::launch::async, [&] {
-      *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-      entered.set_value();
-      const auto result =
-          Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
-      return std::pair{result, *Libs::Posix::GetErrorAddr()};
-    });
-    Check(entry.wait_for(2s) == std::future_status::ready &&
-              receive.wait_for(50ms) == std::future_status::timeout,
-          "partial receive is waiting before peer reset");
-    // This Windows backend also accepts the native SO_LINGER representation.
-    const std::array<uint16_t, 2> abortive_linger{1, 0};
-    Check(Net::Setsockopt(connection.writer, 0xffff, 0x80,
-                          abortive_linger.data(),
-                          sizeof(abortive_linger)) == 0 &&
-              Net::SocketClose(connection.writer) == 0,
-          "reset peer after partial receive");
-    connection.writer = -1;
-    Check(receive.wait_for(2s) == std::future_status::ready,
-          "peer reset releases partial WAITALL");
-    const auto result = receive.get();
-    Check(result.first == 2 && result.second == Libs::Posix::POSIX_EINVAL &&
-              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
-          "peer reset returns already received bytes without replacing errno");
-  }
-
-  {
-    std::array<char, 6> bytes{};
-    const int unconnected = Net::Socket(2, 1, 0);
-    Check(unconnected >= 0, "create unconnected receive fixture");
-    SetReceiveTimeout(unconnected, 100);
-    Check(Net::Recv(unconnected, bytes.data(), bytes.size(), 0x42) == -1 &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOTCONN,
-          "WAITALL preserves unconnected stream error");
-    Check(Net::SocketClose(unconnected) == 0,
-          "close unconnected receive fixture");
-    LoopbackConnection connection;
-    SetReceiveTimeout(connection.reader, 0);
-    std::promise<void> entered;
-    auto entry = entered.get_future();
-    auto receive = std::async(std::launch::async, [&] {
-      entered.set_value();
-      const auto result =
-          Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x42);
-      return std::pair{result, *Libs::Posix::GetErrorAddr()};
-    });
-    Check(entry.wait_for(2s) == std::future_status::ready &&
-              receive.wait_for(50ms) == std::future_status::timeout,
-          "empty WAITALL is pending before local shutdown");
-    Check(Net::Shutdown(connection.reader, 0) == 0,
-          "shut down a pending receive");
-    Check(receive.wait_for(2s) == std::future_status::ready,
-          "local shutdown cancels WAITALL without a receive timeout");
-    const auto result = receive.get();
-    Check(result.first == -1 && result.second == Libs::Posix::POSIX_ESHUTDOWN,
-          "WAITALL preserves local receive-shutdown error");
-  }
-}
-#endif
 
 } // namespace
 
@@ -1269,9 +1158,6 @@ int main(int, char**) {
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
-#if defined(_WIN32)
-  CheckWindowsReceiveFlags();
-#endif
   TestNpWebApi2Memory();
   graphics.reset();
   subsystems.Destroy();
