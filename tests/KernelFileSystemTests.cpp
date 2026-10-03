@@ -49,6 +49,10 @@ namespace Libs::LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibNpWebApi2 {
+void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
+}
+
 namespace {
 
 namespace FileSystem = Libs::LibKernel::FileSystem;
@@ -212,6 +216,43 @@ void TestAioBatches() {
           "maximum-sized batch returns all invalid-ID errors");
   }
   Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
+}
+
+void TestNpWebApi2Memory() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpWebApi2::InitNet_1_NpWebApi2(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "NpWebApi2 library and memory exports resolve");
+    return symbol->vaddr;
+  };
+  struct Stats { size_t pool, maximum, current; int32_t reserved; };
+  static_assert(sizeof(Stats) == 32 && offsetof(Stats, reserved) == 24);
+  using Initialize = int (KYTY_SYSV_ABI *)(int, size_t);
+  using GetStats = int (KYTY_SYSV_ABI *)(int, Stats *);
+  using Terminate = int (KYTY_SYSV_ABI *)(int);
+  const auto initialize = reinterpret_cast<Initialize>(find("+o9816YQhqQ"));
+  const auto get_stats = reinterpret_cast<GetStats>(find("Xweb+naPZ8Y"));
+  const auto terminate = reinterpret_cast<Terminate>(find("bEvXpcEk200"));
+  const int first = initialize(1, 65537);
+  const int second = initialize(1, 16384);
+  Stats stats {1, 2, 3, 4};
+  Check(first > 0 && second > 0 && first != second &&
+            get_stats(first, &stats) == OK && stats.pool == 81920 &&
+            stats.maximum == 0 && stats.current == 0 && stats.reserved == 0 &&
+            get_stats(second, &stats) == OK && stats.pool == 16384,
+        "NpWebApi2 statistics retain each context's rounded pool capacity");
+  Check(get_stats(first, nullptr) == static_cast<int32_t>(0x80553402) &&
+            get_stats(0, &stats) == static_cast<int32_t>(0x80553403) &&
+            initialize(1, std::numeric_limits<size_t>::max()) == static_cast<int32_t>(0x80553402),
+        "NpWebApi2 statistics validate output, context ID, and pool rounding");
+  Check(terminate(first) == OK &&
+            get_stats(first, &stats) == static_cast<int32_t>(0x80553404) &&
+            terminate(first) == static_cast<int32_t>(0x80553404) &&
+            terminate(-1) == static_cast<int32_t>(0x80553403) &&
+            get_stats(second, &stats) == OK && stats.pool == 16384 &&
+            terminate(second) == OK,
+        "NpWebApi2 termination removes only the selected library context");
 }
 
 void CheckMountRoot(const std::filesystem::path &root) {
@@ -1231,6 +1272,7 @@ int main(int, char**) {
 #if defined(_WIN32)
   CheckWindowsReceiveFlags();
 #endif
+  TestNpWebApi2Memory();
   graphics.reset();
   subsystems.Destroy();
 
