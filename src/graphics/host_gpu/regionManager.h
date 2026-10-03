@@ -190,13 +190,8 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
-		if constexpr (source == DirtySource::Cpu) {
-			// Every CPU-dirty change updates the write protection, so with no dirty page in the
-			// range, clearing it and updating the protection would change nothing. Buffers are
-			// bound per draw, usually clean.
-			if (!bits.AnyInRange(start, end)) {
-				return;
-			}
+		if (bits.FirstRangeFrom(start).first >= end) {
+			return;
 		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
