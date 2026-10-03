@@ -1217,7 +1217,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	g_draw_phases.Mark(DrawPhaseTimer::StageTextures);
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+		prepared.samplers.push_back(NativeSampler(
+		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::StageSamplers);
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());

@@ -96,29 +96,33 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   return ExtractResourcePlan(program);
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
+Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
-  AddValueBlock(program);
+  auto &block = AddValueBlock(program);
 
-  const auto AddSource = [&program](uint32_t dword_count, uint32_t first) {
+  const auto AddSource = [&program](uint32_t dword_count) {
     DescriptorSource source;
     source.dword_count = dword_count;
-    source.dwords[0] = Value(first);
-    for (uint32_t i = 1; i < dword_count; i++) {
+    for (uint32_t i = 0; i < dword_count; i++) {
       source.dwords[i] = Value(0u);
     }
     program.descriptor_sources.push_back(source);
     return static_cast<uint32_t>(program.descriptor_sources.size() - 1u);
   };
 
-  const auto image0 = AddSource(8, 0);
-  const auto image1 = AddSource(8, 0);
-  const auto sampler0 = AddSource(4, 0x11111111u);
-  const auto sampler1 = AddSource(4, 0x22222222u);
+  const auto image0 = AddSource(8);
+  const auto image1 = AddSource(8);
+  const auto sampler0 = AddSource(4);
+  const auto sampler1 = AddSource(4);
+  for (uint32_t index = 0; index < 2; ++index) {
+    auto &value = block.AppendNewInst(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
+    program.descriptor_sources[sampler0 + index].dwords[0] = Value(&value);
+  }
   program.info.images.push_back(
       {.source = image0,
        .resource_class = ImageResourceClass::Sampled,
@@ -138,7 +142,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
-  return ExtractResourcePlan(program);
+  return program;
 }
 
 void TestMappedSrtUsesDirectReaderByDefault() {
@@ -374,18 +378,35 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
-void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
+void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto plan = MixedSamplerPlan();
+  auto program = MixedSamplerProgram();
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, {}, snapshot, specialization),
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed sampler materialization failed");
-  Check(snapshot.samplers.size() == 3,
-        "mixed sampler materialization appended unrelated samplers");
-  Check(snapshot.samplers[2] == snapshot.samplers[1] &&
-            snapshot.samplers[2] != snapshot.samplers[0],
-        "point sampler variant duplicated the wrong runtime descriptor");
+  ApplyResourceSpecialization(program, specialization);
+  const auto &samplers = program.info.samplers;
+  Check(snapshot.samplers.size() == 2 && samplers.size() == 3 &&
+            samplers[0].snapshot_index == 0 && samplers[1].snapshot_index == 1 &&
+            samplers[2].snapshot_index == 1 &&
+            samplers[0].source == plan.info.samplers[0].source &&
+            samplers[1].source == plan.info.samplers[1].source &&
+            samplers[2].source == samplers[1].source &&
+            !samplers[1].force_point_filtering && samplers[2].force_point_filtering &&
+            program.info.sampled_pairs[2].sampler == 2,
+        "native sampler variants lost their source identity or binding order");
+  const auto capacity = snapshot.samplers.capacity();
+  user_data[1] = 0x33333333u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.samplers.size() == 2 && snapshot.samplers.capacity() == capacity &&
+            snapshot.samplers[samplers[0].snapshot_index].dwords[0] == user_data[0] &&
+            snapshot.samplers[samplers[1].snapshot_index].dwords[0] == user_data[1] &&
+            snapshot.samplers[samplers[2].snapshot_index].dwords[0] == user_data[1],
+        "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
 // Guest memory for the memo tests: 64 dwords at a fake GPU address.
@@ -754,7 +775,7 @@ int main() {
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
-  TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestMemoTracksDescriptorInputs();
   TestMemoTracksActiveSources();
   TestMemoRejectsUntrackedInputs();

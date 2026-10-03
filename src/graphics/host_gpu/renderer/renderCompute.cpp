@@ -333,7 +333,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     static_cast<uint32_t>(r.TileMode()));
 		}
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i]);
+			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(
+			    resources.samplers[program.info.samplers[i].snapshot_index]);
 			LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
 			     "lod=%u-%u bias=%d\n",
 			     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),

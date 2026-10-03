@@ -36061,7 +36061,11 @@ void CheckImageSamplerSpecialization() {
               mixed_sampler_program.info.sampled_pairs[2].sampler == 2u &&
               mixed_sampler_program.info.sampled_pairs[3].sampler == 1u &&
               mixed_sampler_program.memory_info[0].sampler == 2u &&
-              mixed_sampler_snapshot.samplers.size() == 3u,
+              mixed_sampler_snapshot.samplers.size() == 1u &&
+              std::ranges::all_of(mixed_sampler_program.info.samplers,
+                  [](const auto& sampler) {
+                    return sampler.source == 4u && sampler.snapshot_index == 0u;
+                  }),
           "a shared float/unsigned/signed sampler lost its border or filtering "
           "class in the compiled bindings, instruction or descriptor snapshot");
 

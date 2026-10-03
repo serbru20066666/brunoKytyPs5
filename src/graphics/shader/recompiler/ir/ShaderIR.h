@@ -150,6 +150,8 @@ struct ImageResource {
 struct SamplerResource {
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
+	// Native filtering/border variants share the original sampler's runtime descriptor.
+	uint32_t snapshot_index        = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
 	bool     integer_border        = false;

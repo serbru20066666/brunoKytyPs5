@@ -111,8 +111,7 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 
 enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 
-template <typename Image>
-SamplerClass ClassifySampler(const Image& image) {
+SamplerClass ClassifySampler(const ImageResource& image) {
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
 		return SamplerClass::PointInteger;
@@ -445,9 +444,6 @@ private:
 	uint32_t                                    count = 0;
 };
 
-template <typename Images>
-bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
-
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -590,30 +586,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
-	SamplerPlan sampler_plan;
-	if (!BuildSamplerPlan(program.info, specialization.images, sampler_plan)) {
-		return SpecializationFail("specialized sampler layout exceeds its resource limit");
-	}
-	for (uint32_t index = static_cast<uint32_t>(program.info.samplers.size());
-	     index < sampler_plan.sampler_count; index++) {
-		snapshot.samplers.push_back(snapshot.samplers[sampler_plan.bindings[index].source]);
-	}
 	ImageRemap(specialization).Apply(snapshot.images);
 	return true;
 }
 
-template <typename Images>
-bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan) {
+bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 	if (base.samplers.size() > plan.mapping.size()) {
 		return false;
 	}
 	std::array<uint8_t, ShaderInfo::MaxSamplers> usage {};
 	plan.sampler_count = static_cast<uint32_t>(base.samplers.size());
 	for (const auto& pair: base.sampled_pairs) {
-		if (pair.image >= images.size() || pair.sampler >= base.samplers.size()) {
+		if (pair.image >= base.images.size() || pair.sampler >= base.samplers.size()) {
 			return false;
 		}
-		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(images[pair.image]));
+		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -1603,7 +1590,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 
 	SamplerPlan sampler_plan;
-	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
+	EXIT_IF(!BuildSamplerPlan(program.info, sampler_plan));
 	auto& samplers      = program.info.samplers;
 	auto& sampled_pairs = program.info.sampled_pairs;
 	const auto original_sampler_count = samplers.size();
@@ -1613,6 +1600,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		if (index >= original_sampler_count) {
 			samplers.push_back(samplers[binding.source]);
 		}
+		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
