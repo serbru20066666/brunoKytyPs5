@@ -14277,14 +14277,16 @@ public:
   Image CreateImage2D(const char *shader_name, u32 width, u32 height,
                       vk::Format format, vk::ImageUsageFlags usage,
                       const std::vector<u32> &initial, u32 dwords_per_pixel,
-                      vk::ImageLayout final_layout) {
+                      vk::ImageLayout final_layout,
+                      vk::Format view_format = vk::Format::eUndefined) {
     std::vector<std::vector<u32>> mips;
     if (!initial.empty()) {
       mips.push_back(initial);
     }
     return CreateImageMips(shader_name, width, height, format, usage, mips,
                            dwords_per_pixel, final_layout, vk::ImageType::e2D,
-                           vk::ImageViewType::e2D, 1);
+                           vk::ImageViewType::e2D, 1, 0, 0,
+                           vk::SampleCountFlagBits::e1, view_format);
   }
 
   static u32 MipExtent(u32 value, u32 level) {
@@ -14308,7 +14310,8 @@ public:
                         vk::ImageType image_type, vk::ImageViewType view_type,
                         u32 layers, u32 view_base_layer = 0,
                         u32 view_layers = 0,
-                        vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
+                        vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                        vk::Format view_format = vk::Format::eUndefined) {
     Image ret;
     ret.format = format;
     ret.width = width;
@@ -14332,6 +14335,9 @@ public:
                        vk::ImageUsageFlagBits::eTransferSrc;
     image_info.sharingMode = vk::SharingMode::eExclusive;
     image_info.initialLayout = vk::ImageLayout::eUndefined;
+    if (view_format != vk::Format::eUndefined && view_format != format) {
+      image_info.flags |= vk::ImageCreateFlagBits::eMutableFormat;
+    }
     RequireVk(shader_name, "dispatch",
               m_device.createImage(&image_info, nullptr, &ret.image),
               "vkCreateImage");
@@ -14362,7 +14368,7 @@ public:
     view_info.sType = vk::StructureType::eImageViewCreateInfo;
     view_info.image = ret.image;
     view_info.viewType = view_type;
-    view_info.format = format;
+    view_info.format = view_format == vk::Format::eUndefined ? format : view_format;
     view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
     view_info.subresourceRange.baseMipLevel = 0;
     view_info.subresourceRange.levelCount = ret.mip_levels;
@@ -17277,6 +17283,7 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled =
         m_feedback_loop_supported;
     m_runtime_context.attachment_feedback_loop_dynamic_enabled =
@@ -17374,6 +17381,8 @@ private:
           features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
           vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
           features12.pNext = &workgroup_layout;
+          vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
+          workgroup_layout.pNext = &image_atomic64;
           vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
           barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
           barycentric.pNext = &features12;
@@ -17390,6 +17399,7 @@ private:
               features12.shaderOutputViewportIndex != true ||
               features12.shaderBufferInt64Atomics != true ||
               features12.shaderSharedInt64Atomics != true ||
+              image_atomic64.shaderImageInt64Atomics != true ||
               workgroup_layout.workgroupMemoryExplicitLayout != true ||
               features12.bufferDeviceAddress != true) {
             continue;
@@ -17567,6 +17577,9 @@ private:
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &workgroup_layout;
+    vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
+    image_atomic64.shaderImageInt64Atomics = true;
+    workgroup_layout.pNext = &image_atomic64;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -17645,7 +17658,8 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME};
+        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
+        VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME};
     if (m_min_lod_supported) {
       device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     }
@@ -18145,15 +18159,20 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         test.sampled_image_view_layers);
   }
   if (needs_storage_image) {
+    const bool atomic64 = std::ranges::any_of(
+        compiled.program.info.images,
+        [](const auto &image) { return image.atomic64; });
     storage_image = vulkan->CreateImage2D(
         test.name, test.image_width, test.image_height,
         test.storage_image_format, vk::ImageUsageFlagBits::eStorage,
         test.storage_image_rgba, test.storage_image_dwords_per_pixel,
         vk::ImageLayout::eGeneral);
     storage_image_uint = vulkan->CreateImage2D(
-        test.name, test.image_width, test.image_height, vk::Format::eR32Uint,
-        vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, 1,
-        vk::ImageLayout::eGeneral);
+        test.name, test.image_width, test.image_height,
+        atomic64 ? vk::Format::eR32G32Uint : vk::Format::eR32Uint,
+        vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, atomic64 ? 2 : 1,
+        vk::ImageLayout::eGeneral,
+        atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
   }
   if (needs_sampler) {
     sampler = vulkan->CreateNearestSampler(test.name, sampled_image.mip_levels);
@@ -31983,6 +32002,76 @@ TestCase ImageAtomicVariants() {
   return test;
 }
 
+template <bool wide> TestCase ImageAtomicUMaxGlcAndExec() {
+  // Input and old texel: high DWORD ordering, unsigned sign boundary, and
+  // equal-high-DWORD ordering must all survive the RG32_UINT -> R64_UINT view.
+  constexpr uint64_t values[][2] = {
+      {0x0000000100000001ull, 0x00000000ffffffffull},
+      {0x00000000ffffffffull, 0x0000000100000001ull},
+      {0x8000000000000000ull, 0x7fffffffffffffffull},
+      {0x12345678ffffffffull, 0x1234567800000001ull},
+      {0xffffffffffffffffull, 0x8000000000000000ull},
+  };
+  constexpr u32 texel_dwords = wide ? 2 : 1;
+  TestCase test;
+  test.name = wide ? "ImageAtomicUMax64CapturedGlcAndExec"
+                   : "ImageAtomicUMax32GlcAndExec";
+  test.user_data = MakeStorageTextureData(wide ? Prospero::BufferFormat::k32_32UInt
+                                              : Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  test.storage_image_r32ui.assign(16 * texel_dwords, 0);
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126)); // Preserve EXEC.
+  for (u32 i = 0; i < std::size(values); ++i) {
+    const auto input = values[i][0];
+    const auto old = values[i][1];
+    const bool glc = i != 0 && i != 4;
+    AppendVMovU32(&code, 0, i & 3u);
+    AppendVMovU32(&code, 1, i >> 2u);
+    AppendVMovLiteral(&code, 2, static_cast<u32>(input));
+    AppendVMovLiteral(&code, 3, static_cast<u32>(input >> 32u));
+    // Captured PS5 instruction: f05c0308 00000200, DMASK=3, VDATA=v[2:3].
+    code.insert(code.end(), {0xf05c0108u | (wide ? 0x200u : 0u) |
+                                (glc ? 0x2000u : 0u),
+                            0x00000200u});
+    AppendStoreVgpr(&code, 2, i * 2);
+    AppendStoreVgpr(&code, 3, i * 2 + 1);
+    test.expected.push_back(static_cast<u32>(glc ? old : input));
+    test.expected.push_back(static_cast<u32>((wide && glc ? old : input) >> 32u));
+    const uint64_t result = wide ? std::max(input, old)
+                                 : std::max(static_cast<u32>(input),
+                                            static_cast<u32>(old));
+    for (u32 word = 0; word < texel_dwords; ++word) {
+      test.storage_image_r32ui[i * texel_dwords + word] =
+          static_cast<u32>(old >> (word * 32u));
+      test.expected_storage_image_r32ui[i * texel_dwords + word] =
+          static_cast<u32>(result >> (word * 32u));
+    }
+  }
+  AppendVMovU32(&code, 0, 1);
+  AppendVMovU32(&code, 1, 1); // Untouched zero texel, so an EXEC leak is observable.
+  AppendVMovLiteral(&code, 2, 0xabcdef01u);
+  AppendVMovLiteral(&code, 3, 0x87654321u);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), {0xf05c2108u | (wide ? 0x200u : 0u), 0x00000200u});
+  code.push_back(EncodeSop1(0x04, 126, 12));
+  AppendStoreVgpr(&code, 2, std::size(values) * 2);
+  AppendStoreVgpr(&code, 3, std::size(values) * 2 + 1);
+  test.expected.insert(test.expected.end(), {0xabcdef01u, 0x87654321u});
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
+                 ShaderOpcode::IMAGE_ATOMIC_UMAX, ShaderOpcode::BUFFER_STORE_DWORD,
+                 ShaderOpcode::S_ENDPGM};
+  test.required_spirv = {"OpAtomicUMax", "OpImageTexelPointer",
+                         wide ? "R64ui" : "R32ui"};
+  if constexpr (wide) {
+    test.required_spirv.push_back("Int64ImageEXT");
+    test.required_spirv.push_back("SPV_EXT_shader_image_int64");
+  }
+  return test;
+}
+
 template <bool max_value> TestCase ImageAtomicSignedMinMax() {
   using O = ShaderOpcode;
   // Input, old value, signed minimum, signed maximum.
@@ -33105,6 +33194,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
+  AddCase(ImageAtomicUMaxGlcAndExec<false>);
+  AddCase(ImageAtomicUMaxGlcAndExec<true>);
   AddCase(ImageAtomicFloatGlcAndExec<true>);
   AddCase(ImageAtomicFloatGlcAndExec<false>);
   AddCase(ImageAtomicFloatSpecialValues<true>);
@@ -38394,6 +38485,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageAtomicCompareSwapGlcAndExec());
     RunCase(&vulkan, ImageAtomicSwapReturnsPreviousTexel());
     RunCase(&vulkan, ImageAtomicVariants());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-atomic64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageAtomicUMaxGlcAndExec<false>());
+    RunCase(&vulkan, ImageAtomicUMaxGlcAndExec<true>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

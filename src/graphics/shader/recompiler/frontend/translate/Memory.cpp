@@ -568,7 +568,9 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 		                  ir.GetExec()},
 		                 flags);
 	} else {
-		result = ir.Emit(opcode, {resource, address, ReadU32(data), ir.GetExec()}, flags);
+		const IR::Value value =
+		    memory.data_bits == 64u ? IR::Value(ReadU64(data)) : IR::Value(ReadU32(data));
+		result = ir.Emit(opcode, {resource, address, value, ir.GetExec()}, flags);
 	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
@@ -1052,7 +1054,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_ATOMIC_SMAX:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMax32);
+			return IMAGE_ATOMIC(inst, inst.data_bits == 64u ? IR::ValueOpcode::ImageAtomicUMax64
+			                                                : IR::ValueOpcode::ImageAtomicUMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_AND:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32);
 		case Decoder::Opcode::IMAGE_ATOMIC_OR:

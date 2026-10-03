@@ -1727,6 +1727,8 @@ private:
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
+		const bool atomic64 = ImageOpcodeInfoOf(op).access == ImageAccess::Atomic &&
+		                      memory.data_bits == 64u;
 		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
 		                       ? ImageMipMode::DynamicStorage
 		                       : ImageMipMode::None;
@@ -1735,7 +1737,8 @@ private:
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1751,6 +1754,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.atomic64       = atomic64;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);

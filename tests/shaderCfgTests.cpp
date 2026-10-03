@@ -4273,6 +4273,38 @@ void TestScalarAshrI64Decoder() {
         "S_ASHR_I64 is missing from the decoded dump");
 }
 
+void TestImageAtomicWidthDecoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // Captured PPSA29343 pixel shader: image_atomic_umax v[2:3], v[0:1], s[0:7].
+  const uint32_t captured[] = {0xf05c0308u, 0x00000200u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_ATOMIC_UMAX &&
+            decoded.data_bits == 64u && decoded.data_dwords == 2u &&
+            decoded.dst.reg == 2u && decoded.dmask == 3u && !decoded.glc,
+        "captured image atomic lost its 64-bit data width");
+
+  for (const auto opcode : {0x10u, 0x17u}) {
+    for (uint32_t mask = 0; mask < 16u; ++mask) {
+      const uint32_t words[] = {EncodeMimg0(opcode, mask), captured[1]};
+      DecodeInstruction(words, 0, decoded);
+      const bool compare_swap = opcode == 0x10u;
+      const bool supported = mask == (compare_swap ? 3u : 1u) ||
+                             (!compare_swap && mask == 3u);
+      Check((decoded.opcode != Opcode::UNSUPPORTED) == supported,
+            "image atomic accepted an invalid or unsupported width mask");
+      if (supported) {
+        Check(decoded.data_bits == (!compare_swap && mask == 3u ? 64u : 32u),
+              "image atomic DMASK selected the wrong data width");
+      }
+    }
+  }
+  const uint32_t unsupported[] = {EncodeMimg0(0x11u, 3u), captured[1]};
+  DecodeInstruction(unsupported, 0, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.data_bits == 64u,
+        "unsupported 64-bit image atomic silently decoded as 32-bit");
+}
+
 void TestNewShaderDecoderArchitecture() {
   using namespace ShaderRecompiler::Decoder;
 
@@ -14328,6 +14360,7 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestScalarAshrI64Decoder();
+  TestImageAtomicWidthDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
