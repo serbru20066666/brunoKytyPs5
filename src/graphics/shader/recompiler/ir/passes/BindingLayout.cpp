@@ -15,11 +15,16 @@ namespace {
 	std::abort();
 }
 
-std::vector<uint32_t> CollectUserData(const Program& program) {
+void CollectShaderData(const Program& program, BindingLayout& layout) {
 	std::array<bool, NumScalarRegs> registers {};
+	bool uses_dispatch_threads = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (inst.GetOpcode() != ValueOpcode::GetUserData || !inst.HasUses()) {
+			if (!inst.HasUses()) {
+				continue;
+			}
+			uses_dispatch_threads |= inst.GetOpcode() == ValueOpcode::GetDispatchThreadExtent;
+			if (inst.GetOpcode() != ValueOpcode::GetUserData) {
 				continue;
 			}
 			if (inst.Arg(0).GetType() != Type::ScalarReg) {
@@ -32,13 +37,16 @@ std::vector<uint32_t> CollectUserData(const Program& program) {
 			registers[index] = true;
 		}
 	}
-	std::vector<uint32_t> result;
 	for (uint32_t index = 0; index < registers.size(); index++) {
 		if (registers[index]) {
-			result.push_back(index);
+			layout.user_data_registers.push_back(index);
 		}
 	}
-	return result;
+	layout.memory_offset_dword = static_cast<uint32_t>(layout.user_data_registers.size());
+	if (uses_dispatch_threads) {
+		layout.dispatch_thread_dword = layout.memory_offset_dword;
+		layout.memory_offset_dword += 3u;
+	}
 }
 
 void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
@@ -88,8 +96,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		                                             : "binding layout already allocated");
 	}
 	BindingLayout next;
-	next.user_data_registers = CollectUserData(program);
-	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
+	CollectShaderData(program, next);
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());

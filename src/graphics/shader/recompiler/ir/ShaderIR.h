@@ -436,6 +436,7 @@ struct DescriptorBinding {
 
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
+	uint32_t                       dispatch_thread_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;

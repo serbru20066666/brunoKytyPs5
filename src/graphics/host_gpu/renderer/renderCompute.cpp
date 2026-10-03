@@ -316,6 +316,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}();
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
+		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
+	}
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();

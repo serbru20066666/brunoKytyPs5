@@ -14776,6 +14776,13 @@ public:
                 vk::Sampler sampler = nullptr) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
+    auto shader_data = compiled.packed_user_data;
+    if (layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+      Require(test.name, "dispatch dimensions", test.has_compute_info,
+              "runtime thread extents are required by the compiled shader");
+      std::copy_n(test.compute_info.dispatch_threads_num, 3,
+                  shader_data.begin() + layout.dispatch_thread_dword);
+    }
     auto Binding = [&](Kind kind) {
       return ShaderRecompiler::IR::FindBinding(layout, kind);
     };
@@ -15002,8 +15009,7 @@ public:
     }
     if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
       user_data_buffer =
-          CreateStorageBuffer(test.name, compiled.packed_user_data,
-                              compiled.packed_user_data.size());
+          CreateStorageBuffer(test.name, shader_data, shader_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -15198,8 +15204,7 @@ public:
                            1, &descriptor_set, 0, nullptr);
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(compiled.packed_user_data.begin(),
-                compiled.packed_user_data.end(),
+      std::copy(shader_data.begin(), shader_data.end(),
                 push_data.dwords.begin() + layout.push_data_start_dword);
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
@@ -31771,6 +31776,94 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   return test;
 }
 
+void CheckComputeThreadDimensions(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 grid_size = 16 * 8 * 4;
+  const std::array extents = {std::array{9u, 5u, 3u}, std::array{13u, 7u, 4u},
+                              std::array{3u, 2u, 1u}, std::array{16u, 8u, 4u}};
+  for (const u32 wave_size : {32u, 64u}) {
+    for (const bool thread_dimensions : {false, true}) {
+      TestCase test;
+      test.name = thread_dimensions ? (wave_size == 32 ? "ThreadDimensions32" : "ThreadDimensions64")
+                                    : (wave_size == 32 ? "GroupDimensions32" : "GroupDimensions64");
+      auto &code = test.code;
+      code.push_back(EncodeSop1(0x04, 20, 126)); // Save the SPI-provided initial EXEC.
+      AppendSMovLiteral(&code, 24, grid_size * 4);
+      for (u32 axis = 0; axis < 3; ++axis) {
+        code.push_back(EncodeVop1(0x01, 3 + axis, 4 + axis));
+        code.push_back(EncodeVop2(0x1a, 3 + axis, InlineU32(3 - axis), 3 + axis));
+        code.push_back(EncodeVop2(0x25, 3 + axis, Vgpr(axis), 3 + axis));
+      }
+      code.push_back(EncodeVop2(0x1a, 4, InlineU32(4), 4));
+      code.push_back(EncodeVop2(0x1a, 5, InlineU32(7), 5));
+      code.push_back(EncodeVop2(0x25, 3, Vgpr(4), 3));
+      code.push_back(EncodeVop2(0x25, 3, Vgpr(5), 3));
+      code.push_back(EncodeVop2(0x25, 20, InlineU32(1), 3));
+      code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 20));
+      AppendVMovU32(&code, 6, 1);
+      AppendVMovU32(&code, 7, 0);
+      AppendBufferStoreDword(&code, 6, 20);
+      AppendBufferStoreOpcode(&code, 0x32, 6, 7);
+      code.push_back(EncodeSop2(0x0f, 126, 20, InlineU32(1)));
+      AppendVMovU32(&code, 6, 2); // Divergence changes only lane zero of each wave.
+      code.push_back(EncodeSop1(0x04, 126, 20));
+      code.push_back(EncodeVop2(0x25, 20, 24, 20));
+      AppendBufferStoreDword(&code, 6, 20);
+      AppendVMovU32(&code, 8, 1);
+      AppendBufferStoreOpcode(&code, 0x32, 8, 7);
+      AppendEnd(&code);
+      test.initial.resize(1 + 2 * grid_size);
+      test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_AND_B64, O::V_MOV_B32,
+                      O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                      O::BUFFER_ATOMIC_ADD, O::S_ENDPGM};
+      test.compute_info.wave_size = wave_size;
+      test.compute_info.host_subgroup_size = vulkan.SubgroupSize();
+      test.compute_info.threads_num[0] = 8;
+      test.compute_info.threads_num[1] = 4;
+      test.compute_info.threads_num[2] = 2;
+      std::fill_n(test.compute_info.group_id, 3, true);
+      test.compute_info.thread_ids_num = 3;
+      test.compute_info.workgroup_register = 4;
+      test.compute_info.dispatch_thread_dimensions = thread_dimensions;
+      test.has_compute_info = true;
+      test.expand_shader_data_storage = thread_dimensions && wave_size == 32;
+      const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      std::vector<u32> compiled_key;
+      BuildStageStaticKey(test.compute_info, compiled_key);
+      for (const auto &extent : extents) {
+        std::copy(extent.begin(), extent.end(), test.compute_info.dispatch_threads_num);
+        std::vector<u32> runtime_key;
+        BuildStageStaticKey(test.compute_info, runtime_key);
+        Require(test.name, "runtime shader reuse", compiled_key == runtime_key,
+                "dispatch thread counts changed the compiled shader cache key");
+        test.dispatch_x = thread_dimensions ? (extent[0] + 7) / 8 : 2;
+        test.dispatch_y = thread_dimensions ? (extent[1] + 3) / 4 : 2;
+        test.dispatch_z = thread_dimensions ? (extent[2] + 1) / 2 : 2;
+        test.expected.assign(test.initial.size(), 0);
+        for (u32 z = 0; z < 4; ++z) {
+          for (u32 y = 0; y < 8; ++y) {
+            for (u32 x = 0; x < 16; ++x) {
+              if (thread_dimensions && (x >= extent[0] || y >= extent[1] || z >= extent[2])) continue;
+              const auto index = x + 16 * y + 128 * z;
+              const auto local_index = x % 8 + 8 * (y % 4) + 32 * (z % 2);
+              test.expected[0] += 2;
+              test.expected[1 + index] = 1;
+              test.expected[1 + grid_size + index] = local_index % wave_size == 0 ? 2 : 1;
+            }
+          }
+        }
+        auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+        vulkan.Dispatch(test, compiled, output);
+        const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
+        vulkan.DestroyBuffer(&output);
+        CompareWords(test, "initial EXEC, restored EXEC and padded-lane atomics", test.expected, actual);
+        if (!thread_dimensions) break;
+      }
+      std::printf("[compute] %-32s ok\n", test.name);
+    }
+  }
+}
+
 void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   TestCase test;
@@ -38740,6 +38833,11 @@ int main(int argc, char **argv) {
     RunJournalDisasm(argv[2], std::span(argv + 3, argc - 3));
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
+    VulkanHarness vulkan;
+    CheckComputeThreadDimensions(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -39522,6 +39620,7 @@ int main(int argc, char **argv) {
   CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectBufferStore(vulkan);
+  CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch();
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
