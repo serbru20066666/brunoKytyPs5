@@ -33140,6 +33140,54 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   };
 }
 
+void CheckComputeLdsLimit(VulkanHarness &vulkan) {
+  constexpr const char *name = "ComputeLdsLimit";
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 7);
+  code.push_back(EncodeDs0(0x0d)); // ds_write_b32 v0, v1
+  code.push_back(EncodeDs1(0, 1, 0));
+  AppendEnd(&code);
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+      {.type = Prospero::ShaderBinaryType::kCs,
+       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+
+  GraphicContext graphics;
+  graphics.device = vulkan.Device();
+  graphics.physical_device_properties =
+      vulkan.RuntimeContext().GetPhysicalDeviceProperties();
+  auto &limit = graphics.physical_device_properties.limits.maxComputeSharedMemorySize;
+  // Reproduce a 48-KiB host, or a smaller host limit when the test device requires it.
+  limit = std::min(limit, 48u * 1024u) & ~511u;
+  const auto limit_units = static_cast<uint16_t>(limit / 512u);
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  regs.cs_regs.num_thread_x = 1;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 32;
+  PipelineCache cache(graphics);
+  ShaderProgram at_limit;
+  for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
+                           uint16_t{112}, uint16_t{128}}) {
+    regs.cs_regs.lds_size = units;
+    ShaderComputeInputInfo input{};
+    const auto program = cache.GetComputeProgram(regs, {}, input);
+    const auto expected = units < limit_units ? units * 128u : limit / 4u;
+    Require(name, "device allocation", input.lds_size_dwords == expected,
+            "compute LDS allocation did not respect the device limit");
+    Require(name, "pipeline creation",
+            cache.GetComputePipeline(input, program).pipeline != nullptr,
+            "clamped LDS shader did not create a Vulkan compute pipeline");
+    if (units == limit_units) {
+      at_limit = program;
+    } else if (units > limit_units) {
+      Require(name, "effective-size cache reuse", program.id == at_limit.id,
+              "equivalent clamped LDS allocations compiled separate shaders");
+    }
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -38003,6 +38051,14 @@ int main(int argc, char **argv) {
     RunJournalDisasm(argv[2], std::span(argv + 3, argc - 3));
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
+    VulkanHarness vulkan;
+    CheckComputeLdsLimit(vulkan);
+    RunCase(&vulkan, DsWideLdsPartialBounds());
+    RunCase(&vulkan, DsAtomic64Bounds(false));
+    RunCase(&vulkan, DsAtomic64Bounds(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());
@@ -38761,6 +38817,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
+  CheckComputeLdsLimit(vulkan);
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
