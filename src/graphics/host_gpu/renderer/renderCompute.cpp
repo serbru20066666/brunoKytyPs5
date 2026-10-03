@@ -284,68 +284,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	const bool large_workgroup =
-	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
-	const bool                   has_sampler = !program.info.samplers.empty();
-	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
-		const auto sampled_images = std::count_if(
-		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-		    });
-		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
-		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
-		     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
-		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(),
-		     program.bindings.UsesPushData()
-		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
-		         : 0u);
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& buffer = program.info.buffers[i];
-			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-			LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
-			     " stride=%u records=%u format=%u\n",
-			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
-			     r.Stride(), r.NumRecords(), r.RawFormat());
-		}
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			const auto& image = program.info.images[i];
-			const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
-			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
-			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
-			     i, image.source, image.written ? "read-write" : "read-only",
-			     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
-			         ? "true"
-			         : "false",
-			     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
-			     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
-			     static_cast<uint32_t>(r.Depth()) + 1u,
-			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
-			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
-			         ? 1u
-			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
-			     static_cast<uint32_t>(r.TileMode()));
-		}
-		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(
-			    resources.samplers[program.info.samplers[i].snapshot_index]);
-			LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
-			     "lod=%u-%u bias=%d\n",
-			     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),
-			     static_cast<uint32_t>(r.ClampY()), static_cast<uint32_t>(r.ClampZ()),
-			     static_cast<uint32_t>(r.XyMagFilter()), static_cast<uint32_t>(r.XyMinFilter()),
-			     static_cast<uint32_t>(r.ZFilter()), static_cast<uint32_t>(r.MipFilter()),
-			     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
-			     static_cast<int32_t>(r.LodBias()));
-		}
-	}
-
 	if (use_thread_dimensions) {
 		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
 			return (threads == 0
@@ -408,6 +346,66 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	if (Config::GraphicsDebugDumpEnabled()) {
+		const auto sampled_images = std::count_if(
+		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		    });
+		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
+		     " hash=0x%016" PRIx64 " tick=%" PRIu64
+		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
+		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
+		     m_context.GetCommandScheduler().CurrentTick(),
+		     thread_group_x, thread_group_y, thread_group_z, mode,
+		     input_info.threads_num[0], input_info.threads_num[1],
+		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
+		     sampled_images, program.info.images.size() - sampled_images,
+		     program.info.samplers.size(),
+		     program.bindings.UsesPushData()
+		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
+		         : 0u);
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& buffer = program.info.buffers[i];
+			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
+			     " stride=%u records=%u format=%u\n",
+			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
+			     r.Stride(), r.NumRecords(), r.RawFormat());
+		}
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			const auto& image = program.info.images[i];
+			const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
+			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
+			     i, image.source, image.written ? "read-write" : "read-only",
+			     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
+			         ? "true"
+			         : "false",
+			     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
+			     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+			     static_cast<uint32_t>(r.Depth()) + 1u,
+			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
+			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
+			         ? 1u
+			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
+			     static_cast<uint32_t>(r.TileMode()));
+		}
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(
+			    resources.samplers[program.info.samplers[i].snapshot_index]);
+			LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
+			     "lod=%u-%u bias=%d\n",
+			     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),
+			     static_cast<uint32_t>(r.ClampY()), static_cast<uint32_t>(r.ClampZ()),
+			     static_cast<uint32_t>(r.XyMagFilter()), static_cast<uint32_t>(r.XyMinFilter()),
+			     static_cast<uint32_t>(r.ZFilter()), static_cast<uint32_t>(r.MipFilter()),
+			     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
+			     static_cast<int32_t>(r.LodBias()));
+		}
+	}
+
 	if (DebugFullBarriers()) [[unlikely]] {
 		m_context.GetCommandScheduler().EndRendering();
 		RecordFullBarrier(vk_buffer);
