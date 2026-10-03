@@ -50,6 +50,8 @@ struct ConfigOptions {
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	std::optional<ControllerColor> controller_color;
+	uint32_t               controller_speaker_volume      = 100;
+	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	BdaSyncMode            bda_sync_mode                   = BdaSyncMode::Selective;
 	int32_t                gpu_index                   = -1;
@@ -107,6 +109,8 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 const std::optional<ControllerColor>& GetControllerColor();
+uint32_t GetControllerSpeakerVolume();
+uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
 BdaSyncMode        GetBdaSyncMode();
 int32_t GetGpuIndex();
