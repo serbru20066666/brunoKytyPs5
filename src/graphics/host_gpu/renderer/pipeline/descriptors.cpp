@@ -824,8 +824,7 @@ void RenderExecutor::ResolveTextureInto(const ShaderRecompiler::IR::ImageResourc
                                         TextureBinding&                              out) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled)
 	    [[unlikely]] {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics
-");
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
 	if (source != nullptr) {
 		source->generation = 0;

@@ -1530,10 +1530,12 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 			            image_first + slice, 1}, clear);
 		}
 		cleared_slices++;
-		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
-		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
+		// Publish the conversion's expanded keys without treating them as guest writes
+		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, slice_size);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
 	if (settled && cleared_slices == 0) {

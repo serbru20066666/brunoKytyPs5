@@ -10498,6 +10498,64 @@ public:
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
 
+        // Consuming a clear key updates metadata backing without invalidating
+        // a pooled image whose first texel precedes the metadata range.
+        constexpr uint32_t alias_value = 0x13579bdfu;
+        constexpr uint32_t expanded_words = 0x1000 / sizeof(uint32_t);
+        const auto selected_metadata = dcc_address + metadata_size - 0x1000;
+        ImageDesc metadata_alias{};
+        metadata_alias.info.data = {dcc_address - 0x1000, 0x4000};
+        metadata_alias.info.pixel_format = vk::Format::eR32Uint;
+        metadata_alias.info.guest_format = Prospero::BufferFormat::k32UInt;
+        metadata_alias.info.extent = {4096, 1, 1};
+        metadata_alias.info.pitch = 4096;
+        metadata_alias.info.bytes_per_block = sizeof(uint32_t);
+        metadata_alias.info.mip_layout[0] = {0, 0x4000, 4096, 1};
+        metadata_alias.view_info.format = vk::Format::eR32Uint;
+        const auto metadata_alias_id = texture_cache.FindImage(metadata_alias);
+        vk::ClearValue alias_paint{};
+        alias_paint.color.uint32[0] = alias_value;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), metadata_alias_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, alias_paint);
+        paint();
+        fill_metadata(metadata_words);
+        bind();
+        Require(name, "pooled metadata clear target", read_texel() == expected,
+                "the overlapping native image prevented the metadata clear");
+
+        auto metadata_source = resources.GetBufferCache().ObtainBuffer(
+            selected_metadata, 0x1000, false);
+        Require(name, "expanded metadata buffer source", metadata_source.first != nullptr,
+                "expanded metadata did not produce a GPU-readable buffer");
+        auto metadata_readback = CreateHostBuffer(
+            name, 0x1000, vk::BufferUsageFlagBits::eTransferDst, {});
+        vk::MemoryBarrier metadata_barrier{};
+        metadata_barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        metadata_barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+            {}, 1, &metadata_barrier, 0, nullptr, 0, nullptr);
+        const vk::BufferCopy metadata_copy{metadata_source.second, 0, 0x1000};
+        scheduler.Current().Handle().copyBuffer(metadata_source.first->Handle(),
+                                                metadata_readback.buffer, 1, &metadata_copy);
+        metadata_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        metadata_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 1, &metadata_barrier, 0, nullptr, 0, nullptr);
+        scheduler.Finish();
+        Require(name, "expanded metadata GPU reader",
+                ReadBuffer(name, metadata_readback, expanded_words) ==
+                    std::vector<u32>(expanded_words, UINT32_MAX),
+                "a later GPU buffer read retained the consumed clear key");
+        DestroyBuffer(&metadata_readback);
+        (void)texture_cache.FindTexture(metadata_alias_id, metadata_alias);
+        Require(name, "metadata consumption preserves pooled image",
+                ReadCachedTexel(name, context, metadata_alias_id) ==
+                    std::vector<u32>{alias_value},
+                "internal metadata publication replaced an untouched GPU image texel");
+
         ImageDesc previous_depth{};
         previous_depth.type = BindingType::DepthTarget;
         previous_depth.info.data = {base + 0x180000, 0x10000};
