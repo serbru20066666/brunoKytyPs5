@@ -130,6 +130,58 @@ public:
 		return true;
 	}
 
+	bool SelectsRange(const Inst& selected, Value active, const Inst& candidate,
+	                  const Inst& carried, const Inst& mask,
+	                  std::span<const std::pair<Value, bool>> exit_conditions) {
+		// Inactive lanes retain a previously selected index. Initially every lane is
+		// active; the bounded assignment establishes the invariant on each backedge.
+		m_exclude_bound = false;
+		std::vector<uint32_t> range_values;
+		const auto in_range = [&] {
+			const auto value = Unknown(Type::U32);
+			range_values.push_back(value);
+			return value;
+		};
+		const auto contains = [&](const auto& self, uint32_t node) -> uint32_t {
+			if (std::ranges::find(range_values, node) != range_values.end()) return 1u;
+			const auto entry = m_nodes[node];
+			if (entry.variable == UINT32_MAX) return 0u;
+			return Select(NodeFor(entry.variable, 0u, 1u), self(self, entry.high),
+			              self(self, entry.low));
+		};
+		const auto state = [&](bool in_body) {
+			m_values[1].clear();
+			const auto enabled = Unknown(Type::U1);
+			for (const auto& phi: *m_induction.Parent()) {
+				if (phi.GetOpcode() != ValueOpcode::Phi) continue;
+				m_values[1][&phi] = EquivalentValue(m_program, Value(const_cast<Inst*>(&phi)),
+				                                      Value(const_cast<Inst*>(&mask)))
+				                         ? enabled : Unknown(phi.GetType());
+			}
+			m_values[1][&carried] = Select(enabled, Unknown(Type::U32), in_range());
+			if (in_body) m_values[1][&m_bound] = 1u;
+			m_values[1][&candidate] = Select(Evaluate(Value(const_cast<Inst*>(&m_bound)), true),
+			                                  in_range(), Unknown(Type::U32));
+		};
+		for (uint32_t arm = 0; arm < carried.NumArgs(); ++arm) {
+			const auto initial = mask.Arg(arm).Resolve();
+			if (initial.IsImmediate() && initial.GetType() == Type::U1 && initial.U1()) continue;
+			state(true);
+			const auto retained = contains(contains, Evaluate(carried.Arg(arm), true));
+			if (Select(Evaluate(mask.Arg(arm), true), 1u, retained) != 1u) return false;
+		}
+		for (uint32_t arm = 0; arm < selected.NumArgs(); ++arm) {
+			state(false);
+			const auto value = Evaluate(selected.Arg(arm), true);
+			m_values[1][&selected] = value;
+			auto allowed = Evaluate(exit_conditions[arm].first, true);
+			if (!exit_conditions[arm].second) allowed = Select(allowed, 0u, 1u);
+			allowed = Select(allowed, Evaluate(active, true), 0u);
+			if (Select(allowed, contains(contains, value), 1u) != 1u) return false;
+		}
+		return true;
+	}
+
 private:
 	struct Node {
 		uint32_t variable = UINT32_MAX;
@@ -171,6 +223,10 @@ private:
 	}
 
 	uint32_t Compare(const Inst& inst, uint32_t left, uint32_t right) {
+		if (left == right) {
+			if (inst.GetOpcode() == ValueOpcode::IEqual32) return 1u;
+			if (inst.GetOpcode() == ValueOpcode::INotEqual32) return 0u;
+		}
 		const auto key = std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), left, right};
 		if (const auto found = m_predicates.find(key); found != m_predicates.end()) return found->second;
 		const auto variable = std::min(m_nodes[left].variable, m_nodes[right].variable);
@@ -202,7 +258,7 @@ private:
 			return node;
 		}
 		const auto* inst = value.TryInstruction();
-		if (current && inst == &m_bound) return 0u;
+		if (current && m_exclude_bound && inst == &m_bound) return 0u;
 		auto& values = m_values[current];
 		if (const auto found = values.find(inst); found != values.end()) {
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
@@ -268,6 +324,7 @@ private:
 	const Inst& m_bound;
 	const Block* m_incoming = nullptr;
 	uint32_t m_variables = 0;
+	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
 	std::array<std::map<const Inst*, uint32_t>, 2> m_values;
@@ -296,7 +353,7 @@ public:
 		}
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
-		PlanIndirectImages();
+		PlanIndirectDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -313,17 +370,21 @@ public:
 				memory.sampler = patch.sampler;
 			}
 		}
-		for (const auto& plan: m_indirect_images) {
+		for (const auto& plan: m_indirect_descriptors) {
 			plan.handle->SetArg(0, plan.key);
-			for (uint32_t dword = 0; dword < 4u; dword++) {
-				plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
-			}
-			for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
-				plan.handle->SetArg(dword, plan.key);
+			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
+				for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
+			} else {
+				for (uint32_t dword = 0; dword < 4u; dword++) {
+					plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
+				}
+				for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
+					plan.handle->SetArg(dword, plan.key);
+				}
 			}
 			if (plan.reads[0] != nullptr) {
-				for (const auto index: plan.memory)
-					m_program.memory_info[index].planning_only = true;
+				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word)
+					m_program.memory_info[plan.memory[word]].planning_only = true;
 			}
 		}
 		m_program.descriptor_sources         = std::move(m_sources);
@@ -351,7 +412,7 @@ private:
 		Value planning_handle;
 	};
 
-	struct IndirectImagePlan {
+	struct IndirectDescriptorPlan {
 		Inst*                      handle = nullptr;
 		uint32_t                   source = 0;
 		Value                      key;
@@ -755,16 +816,19 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image.has_value() != descriptor.indirect_image.has_value()) {
+			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value()) {
 				continue;
 			}
-			if (current.indirect_image.has_value()) {
-				const auto& a = *current.indirect_image;
-				const auto& b = *descriptor.indirect_image;
+			if (current.indirect_descriptor.has_value()) {
+				const auto& a = *current.indirect_descriptor;
+				const auto& b = *descriptor.indirect_descriptor;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.table_offset != b.table_offset || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
+				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
+				    (!a.selector_first.IsEmpty() &&
+				     !EquivalentValue(m_program, a.selector_first, b.selector_first)) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask))) continue;
@@ -928,7 +992,7 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset) const {
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t shift = 5u) const {
 		offset = 0;
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
@@ -937,7 +1001,7 @@ private:
 			}
 			uint32_t immediate;
 			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
-			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
+			    ImmediateU32(inst->Arg(1), immediate) && immediate == shift) {
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
 			}
@@ -1241,9 +1305,7 @@ private:
 		return {};
 	}
 
-	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
-	                                DescriptorSource::IndirectImage& indirect,
-	                                DescriptorSource& material_source) {
+	const Inst* UniformizedMaterialValue(Value key, const Inst& use, Value executing = {}) const {
 		Value guard;
 		Value local;
 		const auto* first = key.Resolve().TryInstruction();
@@ -1251,7 +1313,9 @@ private:
 		    first->NumArgs() == 2u) {
 			guard = first->Arg(1).Resolve();
 			// Empty EXEC selects lane zero, which may not have loaded a material key.
-			if (!HasActiveLane(guard, first->Parent())) return false;
+			// An executing store also witnesses nonempty EXEC at the lane read.
+			if (executing.IsEmpty() ? !HasActiveLane(guard, first->Parent())
+			                        : !Implies(executing, guard)) return nullptr;
 			local = first->Arg(0).Resolve();
 			const auto* phi = guard.TryInstruction();
 			if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
@@ -1265,13 +1329,21 @@ private:
 				}
 			}
 		} else {
-			guard = PositiveLaneWitness(image.Parent());
-			if (guard.IsEmpty()) return false;
+			guard = PositiveLaneWitness(use.Parent());
+			if (guard.IsEmpty()) return nullptr;
 			local = EqualLocalKey(guard, key);
 		}
 		const auto* selected = local.Resolve().TryInstruction();
 		if (selected == nullptr || selected->GetOpcode() != ValueOpcode::SelectU32 ||
-		    selected->NumArgs() != 3u || !Implies(guard, selected->Arg(0))) return false;
+		    selected->NumArgs() != 3u || !Implies(guard, selected->Arg(0))) return nullptr;
+		return selected;
+	}
+
+	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
+	                                DescriptorSource::IndirectDescriptor& indirect,
+	                                DescriptorSource& material_source) {
+		const auto* selected = UniformizedMaterialValue(key, image);
+		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
 		const auto* read = selected->Arg(1).Resolve().TryInstruction();
 		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
@@ -1303,9 +1375,9 @@ private:
 		return true;
 	}
 
-	Value BoundedLoopCount(Value key, const Block* use) const {
+	const Inst* BoundedLoop(Value key, const Block* use) const {
 		const auto* phi = key.Resolve().TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->GetType() != Type::U32 || phi->NumArgs() != 2u ||
 		    m_program.blocks.size() != m_program.block_info.size()) return {};
 		const Block* increment_block = nullptr;
@@ -1342,8 +1414,9 @@ private:
 		};
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
-			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
-			    !ValidateRuntimeValue(m_program, compare->Arg(1))) continue;
+			if ((compare->GetOpcode() != ValueOpcode::SLessThan32 &&
+			     compare->GetOpcode() != ValueOpcode::ULessThan32) || use_of_key.operand != 0u ||
+			    !ValidateRuntimeValue(m_program, compare->Arg(1), RuntimeValueType::Integer)) continue;
 			if (!guarded_on_entry(use, [&](const EdgePredicate& edge) {
 				return edge.positive && Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
@@ -1352,19 +1425,75 @@ private:
 			// skipped image alone does not prevent signed induction wraparound.
 			if (guarded_on_entry(increment_block, [&](const EdgePredicate& edge) {
 				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare->Arg(1);
+			})) return compare;
 		}
 		return {};
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan) {
-		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
-			return false;
+	bool BoundedSelectedIndex(Value index, Value active,
+	                          DescriptorSource::IndirectDescriptor& indirect) const {
+		const auto* selected = index.Resolve().TryInstruction();
+		if (selected == nullptr || selected->GetOpcode() != ValueOpcode::Phi ||
+		    selected->NumArgs() == 0u) return false;
+		std::vector<const Inst*> values {selected};
+		for (size_t i = 0; i < values.size(); ++i) {
+			const auto* value = values[i];
+			if (value->GetOpcode() != ValueOpcode::Phi &&
+			    value->GetOpcode() != ValueOpcode::SelectU32) continue;
+			for (size_t arm = value->GetOpcode() == ValueOpcode::SelectU32 ? 1u : 0u;
+			     arm < value->NumArgs(); ++arm) {
+				const auto* next = value->Arg(arm).Resolve().TryInstruction();
+				if (next != nullptr && std::ranges::find(values, next) == values.end())
+					values.push_back(next);
+			}
 		}
+		for (const auto* candidate: values) {
+			if (candidate->GetOpcode() != ValueOpcode::IAdd32) continue;
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				const auto* bound = BoundedLoop(candidate->Arg(arg), candidate->Parent());
+				const auto first = candidate->Arg(arg ^ 1u);
+				if (bound == nullptr || !ValidateRuntimeValue(m_program, first, RuntimeValueType::Integer))
+					continue;
+				const auto* induction = candidate->Arg(arg).ResolveInstruction();
+				const Inst* carried = nullptr;
+				for (const auto* value: values) {
+					if (value->GetOpcode() == ValueOpcode::Phi && value->Parent() == induction->Parent()) {
+						if (carried != nullptr) { carried = nullptr; break; }
+						carried = value;
+					}
+				}
+				if (carried == nullptr || carried->NumArgs() != 2u ||
+				    carried->PhiBlock(0) != induction->PhiBlock(0) ||
+				    carried->PhiBlock(1) != induction->PhiBlock(1)) continue;
+				std::vector<std::pair<Value, bool>> exits;
+				for (size_t arm = 0; arm < selected->NumArgs(); ++arm) {
+					const auto edge = ConditionalEdge(selected->PhiBlock(arm), selected->Parent());
+					if (!edge || edge->lanes != LaneQuantifier::All) break;
+					exits.emplace_back(edge->condition, edge->positive);
+				}
+				if (exits.size() != selected->NumArgs()) continue;
+				for (const auto& mask: *induction->Parent()) {
+					if (mask.GetOpcode() != ValueOpcode::Phi || mask.GetType() != Type::U1 ||
+					    mask.NumArgs() != 2u || mask.PhiBlock(0) != carried->PhiBlock(0) ||
+					    mask.PhiBlock(1) != carried->PhiBlock(1)) continue;
+					const auto initial = induction->Arg(0).Resolve().IsImmediate() ? 0u : 1u;
+					const auto enabled = mask.Arg(initial).Resolve();
+					if (!enabled.IsImmediate() || enabled.GetType() != Type::U1 || !enabled.U1()) continue;
+					LoopBoundProof proof(m_program, *induction, *bound);
+					if (!proof.SelectsRange(*selected, active, *candidate, *carried, mask, exits)) continue;
+					indirect.selector_first = first;
+					indirect.key_count = bound->Arg(1);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	bool MatchDescriptorTable(Inst& handle, IndirectDescriptorPlan& plan,
+	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset) {
 		Inst* table_handle = nullptr;
-		Value key;
-		uint32_t table_offset = 0;
-		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
 				return false;
@@ -1385,7 +1514,7 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, handle.NumArgs() == 4u ? 4u : 5u) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
@@ -1399,19 +1528,33 @@ private:
 			}
 			table_handle = current_handle;
 			const std::array<const Inst*, 1> image_users {&handle};
-			if (!UsesOnly(*read, image_users)) {
+			if (handle.NumArgs() == 8u ? !UsesOnly(*read, image_users) :
+			    std::ranges::any_of(read->Uses(), [](const Use& use) {
+				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
+				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
+					       return consumer.user->GetOpcode() != ValueOpcode::StoreBufferU32;
+				       });
+			    })) {
 				return false;
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
 		}
 
-		DescriptorSource table_source;
 		if (!MakeRuntimeTableSource(*plan.reads[0], table_source)) {
 			return false;
 		}
+		return true;
+	}
+
+	bool TryMakeIndirectImage(Inst& handle, IndirectDescriptorPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
+		DescriptorSource table_source;
+		Value key;
+		uint32_t table_offset = 0;
+		if (!MatchDescriptorTable(handle, plan, table_source, key, table_offset)) return false;
 		DescriptorSource material_source;
-		DescriptorSource::IndirectImage indirect;
+		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
 		if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
@@ -1420,8 +1563,9 @@ private:
 			    NonzeroOnEntry(selector->Arg(0), handle.Parent());
 			if (bitscan) {
 				indirect.key_count = Value(32u);
-			} else {
-				indirect.key_count = BoundedLoopCount(key, handle.Parent());
+			} else if (!m_shader_writes) {
+				if (const auto* bound = BoundedLoop(key, handle.Parent()))
+					indirect.key_count = bound->Arg(1);
 			}
 			if (indirect.key_count.IsEmpty() &&
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
@@ -1467,11 +1611,71 @@ private:
 		            image_source.dwords.begin());
 		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
 		            image_source.dwords.begin() + 4u);
-		image_source.indirect_image = indirect;
+		image_source.indirect_descriptor = indirect;
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
 		plan.key = key;
 		plan.roots = image_source.dwords;
+		return true;
+	}
+
+	bool TryMakeIndirectBuffer(Inst& handle, IndirectDescriptorPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
+		    handle.Uses().empty()) return false;
+		for (const auto& use: handle.Uses()) {
+			const auto& inst = *use.user;
+			if (inst.GetOpcode() != ValueOpcode::StoreBufferU32) return false;
+			const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
+			uint32_t scalar = 1u;
+			if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+			    memory.idxen || !memory.offen || !ImmediateU32(inst.Arg(3), scalar) || scalar != 0u)
+				return false;
+		}
+		DescriptorSource table_source;
+		Value key;
+		uint32_t table_offset = 0;
+		if (!MatchDescriptorTable(handle, plan, table_source, key, table_offset) ||
+		    table_source.dword_count != 4u || table_offset != 0u) return false;
+		const auto* lane_read = key.Resolve().TryInstruction();
+		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
+			return false;
+		const Inst* selected = nullptr;
+		for (const auto& use: handle.Uses()) {
+			const auto* value = UniformizedMaterialValue(
+			    key, *use.user, use.user->Arg(use.user->NumArgs() - 1u));
+			if (value == nullptr || (selected != nullptr && selected != value)) return false;
+			selected = value;
+		}
+		const auto* read = selected->Arg(1).Resolve().TryInstruction();
+		uint32_t lane = 0;
+		if (read != nullptr && read->GetOpcode() == ValueOpcode::CompositeExtractU32x2) {
+			if (!ImmediateU32(read->Arg(1), lane) || lane >= 2u) return false;
+			read = read->Arg(0).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x2) return false;
+		} else if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) {
+			return false;
+		}
+		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+		uint32_t offset = 1u, scalar = 1u;
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
+		    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
+		    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
+		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4))) return false;
+		DescriptorSource material_source;
+		DescriptorSource::IndirectDescriptor indirect;
+		if (!MakeRuntimeTableSource(*read, material_source) ||
+		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
+		indirect.material_source = InternSource(material_source);
+		indirect.table_source = InternSource(table_source);
+		indirect.selector_offset = memory.offset + lane * 4u;
+		DescriptorSource source;
+		source.dword_count = 4u;
+		source.dwords.fill(Value(0u));
+		source.indirect_descriptor = indirect;
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		plan.key = key;
 		return true;
 	}
 
@@ -1515,7 +1719,7 @@ private:
 		return found;
 	}
 
-	bool TryMakeFiniteImage(Inst& handle, IndirectImagePlan& plan) {
+	bool TryMakeFiniteImage(Inst& handle, IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u)
 			return false;
 		if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
@@ -1584,8 +1788,8 @@ private:
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
 		image_source.dwords.fill(Value(0u));
-		image_source.indirect_image.emplace(DescriptorSource::IndirectImage{});
-		auto& sources = image_source.indirect_image->sources;
+		image_source.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
+		auto& sources = image_source.indirect_descriptor->sources;
 		for (auto& choice: choices) {
 			if (choice.branch != nullptr) continue;
 			const auto source = InternSource(choice.descriptor);
@@ -1621,37 +1825,40 @@ private:
 		return true;
 	}
 
-	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
+	const IndirectDescriptorPlan* FindIndirectDescriptor(const Inst& handle) const {
 		const auto found =
-		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
-		                 [&](const IndirectImagePlan& plan) {
+		    std::find_if(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
+		                 [&](const IndirectDescriptorPlan& plan) {
 			    return plan.handle == &handle;
 		    });
-		return found == m_indirect_images.end() ? nullptr : &*found;
+		return found == m_indirect_descriptors.end() ? nullptr : &*found;
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-		                   [&](const IndirectImagePlan& plan) {
+		return std::any_of(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
+		                   [&](const IndirectDescriptorPlan& plan) {
 			return plan.reads[0] != nullptr &&
-			       std::ranges::find(plan.memory, index) != plan.memory.end();
+			       std::find(plan.memory.begin(), plan.memory.begin() + plan.handle->NumArgs(), index) !=
+			           plan.memory.begin() + plan.handle->NumArgs();
 		});
 	}
 
-	void PlanIndirectImages() {
+	void PlanIndirectDescriptors() {
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
-				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
+				     inst.GetOpcode() != ValueOpcode::StoreBufferU32) ||
 				    inst.NumArgs() == 0u) {
 					continue;
 				}
 				auto* handle = inst.Arg(0).Resolve().TryInstruction();
-				if (handle == nullptr || FindIndirectImage(*handle) != nullptr) {
+				if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) {
 					continue;
 				}
-				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan)) {
-					m_indirect_images.push_back(std::move(plan));
+				IndirectDescriptorPlan plan;
+				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan) ||
+				    TryMakeIndirectBuffer(*handle, plan)) {
+					m_indirect_descriptors.push_back(std::move(plan));
 				}
 			}
 		}
@@ -1860,7 +2067,11 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
+			handle = inst.Arg(0).Resolve().TryInstruction();
+			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
+			if (indirect != nullptr) {
+				source = indirect->source;
+			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
@@ -1916,7 +2127,7 @@ private:
 			Fail(flags.pc, "image operation has invalid resource kind");
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
-		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
+		const auto* indirect = handle != nullptr ? FindIndirectDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
 		} else {
@@ -1965,7 +2176,7 @@ private:
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
 				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_image.has_value()) {
+				    image_source->indirect_descriptor.has_value()) {
 					continue;
 				}
 				bool alias = true;
@@ -1993,7 +2204,7 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
-	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 };

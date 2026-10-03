@@ -306,7 +306,7 @@ void TestInvariantIndirectImageMaterialization() {
   const auto source = fixture->program.info.images[0].source;
   Check(source < fixture->program.descriptor_sources.size() &&
             fixture->program.descriptor_sources[source]
-                .indirect_image.has_value(),
+                .indirect_descriptor.has_value(),
         "indirect image source was not retained for runtime proof");
   const auto image_handle =
       std::ranges::find_if(*fixture->block, [](const Inst &inst) {
@@ -668,7 +668,7 @@ void TestGuardedDirectImageTable() {
                  fixture.AddMemory(memory, 0x128));
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->material_source == UINT32_MAX &&
               indirect->selector_stride == 0u && indirect->table_offset == 344u &&
               indirect->key_count.Resolve().IsImmediate() &&
@@ -966,7 +966,7 @@ void TestBoundedComputeImageLoop() {
                  fixture.AddMemory(sample, 0x29c));
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->material_source == UINT32_MAX &&
               indirect->table_offset == 0x6b0u &&
               indirect->key_count.Resolve() == count.Resolve(),
@@ -1321,7 +1321,7 @@ void TestUniformizedMaterialImageKeys() {
                  fixture.AddMemory(output_memory, 0x1b00u), done);
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector_stride == 0x90u &&
               indirect->selector_offset == 0xc00u &&
               indirect->table_offset == 0x20e0u &&
@@ -1340,7 +1340,7 @@ void TestUniformizedMaterialImageKeys() {
   plan = make_plan(Variant::FirstLaneAndNot);
   Check(plan.requires_specialization_memory &&
             plan.descriptor_sources[plan.info.images[0].source]
-                .indirect_image->selector_mask.Resolve().TryInstruction() != nullptr,
+                .indirect_descriptor->selector_mask.Resolve().TryInstruction() != nullptr,
         "uniformized image mask did not survive extraction");
   LinearTestMemory memory;
   memory.words.resize(0x23000u / 4u);
@@ -2577,7 +2577,7 @@ void TestFiniteImagePhiCycle() {
                fixture.AddMemory(memory, 4));
   fixture.PlanAndTrack();
   const auto source = fixture.program.info.images[0].source;
-  const auto &finite = fixture.program.descriptor_sources[source].indirect_image;
+  const auto &finite = fixture.program.descriptor_sources[source].indirect_descriptor;
   Check(finite && finite->sources.size() == 2,
         "cyclic image selection did not retain two complete descriptor candidates");
   const auto *key = image.Instruction()->Arg(0).Instruction();
@@ -2659,7 +2659,7 @@ void TestFiniteImageBitScanSentinel() {
     }
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &finite = fixture.program.descriptor_sources[source].indirect_image;
+    const auto &finite = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(finite && finite->sources.size() == 1 &&
               image.Instruction()->Arg(0).Instruction()->NumPhiBlocks() == 2,
           "nonzero bit scan retained its impossible sentinel or removed a Phi edge");

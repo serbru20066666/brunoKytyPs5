@@ -8789,6 +8789,112 @@ void TestNativeGuardedSamplerSource() {
   }
 }
 
+void TestBoundedMaterialBufferStores(bool scalar_key) {
+  // Captured batch search and descriptor waterfall, with deformation arithmetic removed.
+  const uint32_t shader[] = {
+      0xbfa00003u, 0xd7460002u, 0x04010a04u, 0xf4080101u,
+      0xfa000080u, 0xbe8e0380u, 0xbe8f037eu, 0xbf8cc07fu,
+      0xf4240302u, 0xfa000014u, 0xf4080201u, 0xfa000020u,
+      0xbf880019u, 0x7e3602c1u, 0xbf8cc07fu, 0xbf0a0d0eu,
+      0xbf800000u, 0x8506807eu, 0xbeea0306u, 0xbefe0306u,
+      0xbf860011u, 0x816b0e0cu, 0x810e810eu, 0x936aff6bu,
+      0x00000050u, 0x7e36026bu, 0x816aa46au, 0xf4240104u,
+      0xd4000000u, 0xbf8cc07fu, 0xbeea0404u, 0x816a0405u,
+      0x7d8604f9u, 0x06868405u, 0x7d88046au, 0x876a6a04u,
+      0x8a7e6a06u, 0xbf89ffe6u, 0xbefe030fu, 0x7daa36c1u,
+      0xbf880013u, 0xbf8cc07fu, 0xe0342030u, 0x8002171bu,
+      0xf4080100u, 0xfa000020u, 0x7e020281u, 0x7ed40518u,
+      0xbeeb037eu, 0x7da4306au, 0x8f6a846au, 0x7e020280u,
+      0xf4280002u, 0xd4000000u, 0xbf8cc07fu, 0xe0701000u,
+      0x80003405u, 0xbefe036bu, 0x7daa0280u, 0xbf89fff3u,
+      0xbf810000u,
+  };
+  std::array<uint32_t, 8 * 20> material{};
+  std::array<uint32_t, 16 * 4> table{};
+  std::array<uint32_t, 8> batch{};
+  std::array<uint32_t, 12> table_root{};
+  std::array<uint32_t, 36> batch_root{};
+  const auto buffer = [](uint32_t* words, const void* data, uint32_t stride,
+                         uint32_t count, uint32_t mode = 0u) {
+    const auto address = reinterpret_cast<uint64_t>(data);
+    words[0] = static_cast<uint32_t>(address);
+    words[1] = static_cast<uint32_t>(address >> 32u) | (stride << 16u);
+    words[2] = count;
+    words[3] = 0x5004u | (mode << 28u);
+  };
+  batch[5] = 1u;
+  batch[6] = 2u;
+  material[20 + 9] = 32u;
+  material[20 + 13] = 3u;
+  material[40 + 9] = 32u;
+  material[40 + 10] = 32u;
+  material[40 + 13] = 5u;
+  buffer(table.data() + 12u, reinterpret_cast<void*>(0x100000u), 1u, 128u, 3u);
+  buffer(table.data() + 20u, reinterpret_cast<void*>(0x200000u), 1u, 128u, 3u);
+  buffer(table_root.data() + 8u, table.data(), 16u, 16u);
+  buffer(batch_root.data() + 8u, material.data(), 80u, 8u);
+  buffer(batch_root.data() + 32u, batch.data(), 16u, 2u);
+  const auto table_address = reinterpret_cast<uint64_t>(table_root.data());
+  const auto batch_address = reinterpret_cast<uint64_t>(batch_root.data());
+  const std::array<uint32_t, 4> user_data{
+      static_cast<uint32_t>(table_address), static_cast<uint32_t>(table_address >> 32u),
+      static_cast<uint32_t>(batch_address), static_cast<uint32_t>(batch_address >> 32u)};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 32u;
+  options.user_data = user_data;
+  auto code = std::to_array(shader);
+  if (scalar_key) {
+    code[0xa8u / 4u] = EncodeMubuf0(0x0cu, 52u);
+    code[0xacu / 4u] = EncodeMubuf1(24u, 2u, 27u);
+  }
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot snapshot;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_memory = ReadHostTestMemory,
+      .read_specialization_memory = ReadHostTestMemory};
+  const auto materialize = [&] {
+    return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  Check(materialize(), "bounded material range failed to materialize");
+  const auto& buffers = specialization.buffers;
+  const auto root = std::ranges::find_if(buffers, [](const auto& resource) {
+    return resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;
+  });
+  Check(root != buffers.end() && snapshot.flattened_srt[root->indirect_mapping_offset] == 2u &&
+            buffers.size() == plan.info.buffers.size() + 1u,
+        "bounded material range did not select exactly its two writable buffers");
+  const auto root_index = static_cast<size_t>(root - buffers.begin());
+  const auto first_specialization = specialization;
+  table[12] += 0x1000u;
+  Check(materialize() && specialization == first_specialization,
+        "buffer address changes created a shader permutation");
+  batch[6] = 0u;
+  Check(materialize() && specialization.buffers[root_index].indirect_root ==
+            ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
+            std::ranges::all_of(snapshot.buffers[root_index].dwords,
+                               [](uint32_t word) { return word == 0u; }) &&
+            specialization.buffers.size() == plan.info.buffers.size(),
+        "empty material batch retained writable candidates");
+  batch[6] = 2u;
+  batch[5] = 7u;
+  Check(!materialize(), "material batch exceeded the descriptor record count");
+  batch[5] = 1u;
+  batch_root[11] |= 1u << 30u;
+  Check(!materialize(), "material selection accepted a non-buffer descriptor type");
+  batch_root[11] &= ~(1u << 30u);
+  Check(materialize(), "restored material batch failed to materialize");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
+  CheckSpirvBinaryValidates(result.spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  auto unbounded = code;
+  unbounded[0x3cu / 4u] = EncodeSopc(0x0bu, 14u, 13u); // s_cmp_le_u32 admits wraparound.
+  ExpectFatal([&] { ShaderRecompiler::TranslateProgram(unbounded, options); },
+              "material selection accepted an inclusive induction bound");
+#endif
+}
+
 void TestNativeDescriptorProvenanceRejectsGpuSelection() {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const std::array<uint32_t, 13> selected{
@@ -14410,6 +14516,7 @@ int main() {
   TestNestedSelectionPreservesDescriptorSources();
   TestNativeScalarReadDescriptorPlanning();
   TestNativeGuardedSamplerSource();
+  for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceRejectsGpuSelection();
   TestCfgSiblingSharedExit();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();

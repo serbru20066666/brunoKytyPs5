@@ -435,6 +435,8 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
+uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
+                                   uint32_t search_iterations, uint32_t default_resource);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,

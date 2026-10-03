@@ -97,6 +97,7 @@ struct ExportInfo {
 
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
+	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
@@ -112,6 +113,10 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	uint32_t               indirect_root              = NoIndirectBuffer;
+	uint32_t               indirect_mapping_offset    = 0;
+	uint32_t               indirect_search_iterations = 0;
+	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -482,22 +487,23 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
-	struct IndirectImage {
+	struct IndirectDescriptor {
 		uint32_t material_source = UINT32_MAX;
 		uint32_t table_source    = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
 		Value    key_count;
+		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
 
-		bool operator==(const IndirectImage& other) const = default;
+		bool operator==(const IndirectDescriptor& other) const = default;
 	};
 
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	std::optional<IndirectDescriptor> indirect_descriptor;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };

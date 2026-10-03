@@ -658,6 +658,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				})) {
 					continue;
 				}
+				const auto resource = inst.Flags<uint32_t>();
+				first               = resource < ir.info.buffers.size() &&
+				                              ir.info.buffers[resource].indirect_root == resource
+				                          ? 1u
+				                          : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&

@@ -577,9 +577,51 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		StoreWordPrepared(ctx, inst, mem, resource, ctx.Arg(inst, inst.NumArgs() - 2));
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+		const auto store = [&](uint32_t resource) {
+			if (mem.kind == IR::ResourceKind::Buffer) {
+				const auto& buffer = state.program.info.buffers[resource];
+				if (buffer.packed_stride == 0u &&
+				    buffer.source < state.program.descriptor_sources.size() &&
+				    state.program.descriptor_sources[buffer.source].indirect_descriptor) return;
+			}
+			mem.resource = resource;
+			const auto access = PrepareMemoryResourceAccess(state, mem);
+			StoreWordPrepared(ctx, inst, mem, access, data);
+		};
+		if (mem.kind != IR::ResourceKind::Buffer ||
+		    state.program.info.buffers[mem.resource].indirect_root != mem.resource) {
+			store(mem.resource);
+			return;
+		}
+		const auto& buffer = state.program.info.buffers[mem.resource];
+		const auto* handle = inst.Arg(0).ResolveInstruction();
+		if (handle == nullptr || buffer.indirect_resources.empty() ||
+		    state.flattened_srt_variable == 0 || buffer.indirect_search_iterations == 0u) {
+			ctx.Fail(inst, "has no indirect buffer runtime mapping");
+			return;
+		}
+		const auto selected = EmitIndirectResourceIndex(
+		    state, ctx.Arg(*handle, 0), buffer.indirect_mapping_offset,
+		    buffer.indirect_search_iterations, UINT32_MAX);
+		const auto merge = state.builder.AllocateId();
+		std::vector<uint32_t> labels(buffer.indirect_resources.size());
+		std::vector<uint32_t> branches {spv::OpSwitch, selected, merge};
+		for (uint32_t i = 0; i < labels.size(); ++i) {
+			labels[i] = state.builder.AllocateId();
+			branches.push_back(i);
+			branches.push_back(labels[i]);
+		}
+		state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(branches);
+		for (uint32_t i = 0; i < labels.size(); ++i) {
+			EmitLabel(state, labels[i]);
+			store(buffer.indirect_resources[i]);
+			state.builder.AddFunction(spv::OpBranch, merge);
+		}
+		EmitLabel(state, merge);
 	});
 }
 

@@ -940,7 +940,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "initialize AMPR command buffer");
     }
   };
-  // SDK WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
+  // WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
   struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
   constexpr std::array comparisons {
       Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,

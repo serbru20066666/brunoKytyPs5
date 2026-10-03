@@ -62,6 +62,12 @@ bool UsesGds(const Program& program) {
 				BindingFail("typed shader contains invalid shared-memory metadata");
 			}
 			uses_gds |= kind == ResourceKind::Gds;
+			} else if (kind == ResourceKind::Buffer || kind == ResourceKind::ScalarBuffer) {
+				EXIT_IF(resource >= program.info.buffers.size());
+				live_buffers.at(resource) = true;
+				for (const auto child: program.info.buffers[resource].indirect_resources) {
+					live_buffers.at(child) = true;
+				}
 		}
 	}
 	return uses_gds;
@@ -70,13 +76,15 @@ bool UsesGds(const Program& program) {
 } // namespace
 
 bool UsesFlattenedSrt(const Program& program) {
+	const auto uses_mapping = [](const auto& resource) {
+		return resource.indirect_search_iterations != 0u;
+	};
 	return std::ranges::any_of(program.blocks, [](const Block* block) {
 		return std::ranges::any_of(*block, [](const Inst& inst) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
-	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		return image.indirect_search_iterations != 0u;
-	});
+	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
+	       std::ranges::any_of(program.info.images, uses_mapping);
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
