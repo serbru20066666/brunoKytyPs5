@@ -6504,6 +6504,101 @@ public:
           "sampling");
       DestroyBuffer(&layered_raw_d16_readback);
 
+      auto layered_stencil_desc = MakeLinearDesc(
+          base + 0x27d4000, 6 * 4 * sizeof(float),
+          vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {4, 1, 1}, 6, 4, 1);
+      layered_stencil_desc.type = BindingType::DepthTarget;
+      // Four live stencil bytes per slice, with allocation padding.
+      constexpr uint32_t stencil_slice_size = 16;
+      layered_stencil_desc.info.stencil = {base + 0x27d6000, 6 * stencil_slice_size};
+      layered_stencil_desc.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      layered_stencil_desc.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto layered_stencil_id = texture_cache.FindImage(layered_stencil_desc);
+      auto &layered_stencil_native = texture_cache.GetImage(layered_stencil_id);
+      layered_stencil_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+          vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+      const vk::ClearDepthStencilValue layered_stencil_clear{0.75f, 0x91};
+      const vk::ImageSubresourceRange layered_stencil_range{
+          layered_stencil_desc.view_info.aspect, 0, 1, 0, 6};
+      scheduler.Current().Handle().clearDepthStencilImage(
+          layered_stencil_native.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, &layered_stencil_clear, 1,
+          &layered_stencil_range);
+      texture_cache.MarkGpuWritten(layered_stencil_id);
+      std::array<uint32_t, 6> stencil_expected;
+      stencil_expected.fill(0x91919191u);
+      constexpr std::array<std::array<uint32_t, 3>, 4> stencil_cases{{
+          {0, 1, 0x35353535u}, {0, 3, 0x57575757u},
+          {2, 1, 0x79797979u}, {0, 1, 0xa5a5a5a5u}}};
+      for (uint32_t pass = 0; pass < stencil_cases.size(); pass++) {
+        const auto [first, layers, stencil_word] = stencil_cases[pass];
+        auto partial_stencil_desc = layered_stencil_desc;
+        partial_stencil_desc.info.data.address += first * 4 * sizeof(float);
+        partial_stencil_desc.info.data.size = layers * 4 * sizeof(float);
+        partial_stencil_desc.info.stencil.address += first * stencil_slice_size;
+        partial_stencil_desc.info.stencil.size = layers * stencil_slice_size;
+        partial_stencil_desc.info.resources.layers = layers;
+        partial_stencil_desc.info.mip_layout[0].size =
+            partial_stencil_desc.info.data.size;
+        partial_stencil_desc.view_info.type = layers == 1
+            ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+        partial_stencil_desc.view_info.layer_count = layers;
+        const auto stencil = partial_stencil_desc.info.stencil;
+        if (pass != 3) {
+          (void)resources.GetBufferCache().ObtainBuffer(stencil.address, stencil.size, true);
+          resources.GetBufferCache().FillBuffer(
+              stencil.address, stencil.size, stencil_word, false);
+          const auto partial_stencil_id = texture_cache.FindImage(partial_stencil_desc);
+          Require(name, "partial stencil retains depth owner",
+                  partial_stencil_id == layered_stencil_id &&
+                      texture_cache.GetImage(partial_stencil_id).info.resources.layers == 6 &&
+                      partial_stencil_desc.view_info.base_layer == first &&
+                      texture_cache.FindDepthTarget(partial_stencil_id,
+                                                     partial_stencil_desc) != nullptr,
+                  "a partial stencil view replaced its six-layer depth owner");
+        } else {
+          // The old prefix association must survive the owner's shifted binding.
+          Require(name, "partial stencil buffer clear",
+                  texture_cache.ClearImageFromBuffer(scheduler.Current(),
+                      stencil.address, stencil.size, stencil_word),
+                  "the existing partial stencil association could not be cleared");
+          const auto rebound = texture_cache.FindImage(partial_stencil_desc);
+          Require(name, "rebind cleared stencil association",
+                  rebound == layered_stencil_id &&
+                      texture_cache.FindDepthTarget(rebound, partial_stencil_desc) != nullptr,
+                  "the cleared stencil association lost its depth owner");
+        }
+        std::fill_n(stencil_expected.begin() + first, layers, stencil_word);
+        auto readback = CreateHostBuffer(name, 30 * sizeof(uint32_t),
+            vk::BufferUsageFlagBits::eTransferDst, {});
+        std::vector<vk::BufferImageCopy> copies(2);
+        copies[0].imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 6};
+        copies[1].bufferOffset = 24 * sizeof(float);
+        copies[1].imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 6};
+        for (auto &copy : copies) copy.imageExtent = {4, 1, 1};
+        texture_cache.GetImage(layered_stencil_id).Download(
+            copies, readback.buffer, 0, readback.size);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, 30);
+        for (uint32_t layer = 0; layer < 6; layer++) {
+          for (uint32_t pixel = 0; pixel < 4; pixel++) {
+            Require(name, "partial stencil preserves depth",
+                    words[layer * 4 + pixel] == std::bit_cast<uint32_t>(0.75f),
+                    "stencil upload changed the retained depth plane");
+          }
+          Require(name, "partial stencil preserves other layers",
+                  words[24 + layer] == stencil_expected[layer],
+                  "stencil upload used the retained depth allocation's layer count");
+        }
+        DestroyBuffer(&readback);
+      }
+
       auto native_array_info = array_desc.info;
       native_array_info.data = {};
       auto native_volume_info = volume_desc.info;

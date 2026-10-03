@@ -697,7 +697,9 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
-    : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
+    : info(image_info),
+      stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
+      m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	g_allocation_counters.images_created.fetch_add(1, std::memory_order_relaxed);
 	ImageOps::Validate(info);
