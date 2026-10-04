@@ -24771,8 +24771,7 @@ TestCase VectorF64CapturedScreenSpaceShadows() {
                          "OpTypeFloat 64",
                          "OpFDiv",
                          "Fma",
-                         "SignedZeroInfNanPreserve 64",
-                         "RoundingModeRTE 32"};
+                         "SignedZeroInfNanPreserve 64"};
   test.ir_counts = {{"ConvertF64S32", 9},
                     {"FPRecip64", 3},
                     {"FPMul64", 3},
@@ -24848,6 +24847,73 @@ TestCase VectorFractF64CapturedAndEdges() {
                   O::V_AND_B32, O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F64 v4, v4", cases.size() + 1}};
   test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Fract"};
+  return test;
+}
+
+TestCase VectorFractF64CapturedChainRuntimeExec() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorFractF64CapturedChainRuntimeExec";
+  auto& code = test.code;
+  AppendSMovLiteral(&code, 60, 3);
+  AppendSMovLiteral(&code, 61, 3);
+  code.push_back(EncodeSop1(0x04, 126, 60)); // Lanes 0,1 and 32,33.
+  code.push_back(EncodeVop1(0x01, 20, Vgpr(0)));
+  code.push_back(EncodeVop2(0x1b, 30, InlineU32(1), 0));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(4), 30));
+  AppendVMovU32(&code, 7, 192 * 4);
+  code.push_back(EncodeVop2(0x25, 30, Vgpr(7), 30));
+  constexpr u32 input_regs[] = {6, 4, 10, 11};
+  for (u32 word = 0; word < 4; ++word) {
+    code.push_back(EncodeMubuf0(0x0c, word * 4));
+    code.push_back(EncodeMubuf1(input_regs[word], 0, 30));
+  }
+  code.push_back(EncodeSmem0(0x08, 16, 0));
+  code.push_back(EncodeSmem1(200 * 4, 125));
+  constexpr u32 output_regs[] = {12, 22, 24};
+  for (const auto reg : output_regs) AppendVMovLiteral(&code, reg, 0xdeadbeefu);
+  code.push_back(EncodeVopc(0xc2, InlineU32(1), 6));
+  code.push_back(EncodeSop1(0x24, 8, 106));
+  code.push_back(EncodeSMovB32(106, 16));
+  AppendSMovLiteral(&code, 107, 0x3fea36a9u);
+  code.push_back(EncodeVop1(0x2a, 4, Vgpr(4))); // Runtime FP32 reciprocal with FP64 narrowing.
+  // Captured 4ee720fc4678fa19 PCs 0x1e8..0x20c, 0x23c..0x258, 0x260..0x270.
+  code.insert(code.end(), {0x7e04086au, 0xbeea03f4u, 0x7e082104u, 0xd54c0004u,
+                           0x0410d502u, 0xbeea0b86u, 0xbeeb03ffu, 0x3fe3f9e1u,
+                           0x7e087d04u, 0x7e181f04u});
+  code.push_back(EncodeVop1(0x01, 4, Vgpr(10))); // Second runtime image value.
+  code.insert(code.end(), {0x7e082104u, 0xd54c0004u, 0x0410d502u, 0xbeea0b87u,
+                           0xbeeb03ffu, 0x3fc46bacu, 0x7e087d04u, 0x7e2c1f04u,
+                           0x7e08210bu, 0xd54c0002u, 0x0410d502u, 0x7e047d02u,
+                           0x7e301f02u});
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  for (u32 component = 0; component < 3; ++component)
+    AppendStoreVgprAtLaneDwordOffset(&code, output_regs[component], 20, component * 64);
+  AppendEnd(&code);
+
+  test.initial.resize(192);
+  test.initial.insert(test.initial.end(), {1, 0x3e800000u, 0xbfa00000u, 0x40600000u,
+                                          0, 0x3f800000u, 0x40000000u, 0x40400000u, 3});
+  test.expected = test.initial;
+  constexpr u32 results[] = {0x3eea3fbcu, 0x3f1f6d21u, 0x3f7a860du};
+  for (u32 component = 0; component < 3; ++component) {
+    for (const u32 lane : {0u, 32u}) test.expected[component * 64 + lane] = results[component];
+    for (const u32 lane : {1u, 33u}) test.expected[component * 64 + lane] = 0xdeadbeefu;
+  }
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpCapability Float64", "OpFDiv", "Fma", "Fract"};
+  test.forbidden_spirv = {"RoundingModeRTE"};
+  test.ir_counts = {{"FPRecip32", 1}, {"ConvertF64S32", 1}, {"ConvertF64F32", 3},
+                    {"FPFma64", 3}, {"FPFract64", 3}, {"ConvertF32F64", 3}};
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::V_MOV_B32, O::V_AND_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
+                  O::S_BUFFER_LOAD_DWORD, O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64,
+                  O::S_BREV_B32, O::V_CVT_F64_I32, O::V_CVT_F64_F32, O::V_FMA_F64,
+                  O::V_FRACT_F64, O::V_RCP_F32, O::V_CVT_F32_F64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -24943,6 +25009,16 @@ TestCase VectorF64ModesModifiersAndExec() {
   for (const auto& pair : add_pairs)
     for (const auto bits : pair)
       test.initial.insert(test.initial.end(), {u32(bits), u32(bits >> 32)});
+  // Runtime F64 values immediately around even/odd F32 halfway points, both signs.
+  constexpr std::array<std::pair<uint64_t, u32>, 12> narrowing{{
+      {0x3ff000000fffffffull, 0x3f800000u}, {0x3ff0000010000000ull, 0x3f800000u},
+      {0x3ff0000010000001ull, 0x3f800001u}, {0x3ff000002fffffffull, 0x3f800001u},
+      {0x3ff0000030000000ull, 0x3f800002u}, {0x3ff0000030000001ull, 0x3f800002u},
+      {0xbff000000fffffffull, 0xbf800000u}, {0xbff0000010000000ull, 0xbf800000u},
+      {0xbff0000010000001ull, 0xbf800001u}, {0xbff000002fffffffull, 0xbf800001u},
+      {0xbff0000030000000ull, 0xbf800002u}, {0xbff0000030000001ull, 0xbf800002u}}};
+  for (const auto& item : narrowing)
+    test.initial.insert(test.initial.end(), {u32(item.first), u32(item.first >> 32)});
   test.expected = test.initial;
   const auto load_pair = [&](u32 reg, uint64_t bits) {
     AppendVMovLiteral(&test.code, reg, static_cast<u32>(bits));
@@ -25043,6 +25119,14 @@ TestCase VectorF64ModesModifiersAndExec() {
     load_pair(1, source);
     AppendVop3(&test.code, 0x18f, 1, Vgpr(1), 0);
     store_word(1, expected);
+  }
+  for (u32 i = 0; i < narrowing.size(); ++i) {
+    for (u32 word = 0; word < 2; ++word) {
+      AppendVMovU32(&test.code, 31, (add_pairs.size() * 4 + i * 2 + word) * 4);
+      AppendBufferLoadDword(&test.code, 1 + word, 31);
+    }
+    AppendVop3(&test.code, 0x18f, 1, Vgpr(1), 0);
+    store_word(1, narrowing[i].second);
   }
   load_pair(1, 0x7ff8123456789abcull);
   test.code.push_back(EncodeVop1(0x2f, 1, Vgpr(1)));
@@ -33889,6 +33973,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorCompareF64WaveMasks(64));
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorFractF64CapturedAndEdges);
+  AddCase(VectorFractF64CapturedChainRuntimeExec);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorF64WideningConversions);
   AddCase(VectorSinCosMaxFiniteSpecialCases);
@@ -39235,6 +39320,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF64WaveMasks(64));
     RunCase(&vulkan, VectorF64CapturedScreenSpaceShadows());
     RunCase(&vulkan, VectorFractF64CapturedAndEdges());
+    RunCase(&vulkan, VectorFractF64CapturedChainRuntimeExec());
     RunCase(&vulkan, VectorF64ModesModifiersAndExec());
     return 0;
   }

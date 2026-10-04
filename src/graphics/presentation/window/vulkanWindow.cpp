@@ -618,8 +618,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
-	    float_controls.shaderSignedZeroInfNanPreserveFloat64 &&
-	    float_controls.shaderRoundingModeRTEFloat32;
+	    float_controls.shaderSignedZeroInfNanPreserveFloat64;
 	// if (device_features.shaderFloat64 && !float_controls.shaderDenormPreserveFloat64) {
 	// 	Log::WriteToConsoleAndLog(
 	// 	    "WARNING: Vulkan device does not guarantee FP64 denormal preservation; "
