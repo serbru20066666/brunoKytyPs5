@@ -738,24 +738,37 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
                                        const Format::BufferFormatInfo& info,
                                        uint32_t component, uint32_t data) {
+	auto& state = ctx.state;
 	const auto bits = info.component_bits[component];
-	if (info.type == Format::ComponentType::Unorm) {
-		const auto value = EmitBitCastF32U32(ctx.state, data);
-		const auto clamped = EmitFPMin32(
-		    ctx.state, EmitFPMax32(ctx.state, value, ConstantF32Value(ctx.state, 0.0f)),
-		    ConstantF32Value(ctx.state, 1.0f));
-		const auto scaled = EmitFPMul32(
-		    ctx.state, clamped, ConstantF32Value(ctx.state, float((1u << bits) - 1u)));
-		return Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state),
-		             EmitFPRoundEven32(ctx.state, scaled));
+	const bool normalized = info.type == Format::ComponentType::Unorm ||
+	                        info.type == Format::ComponentType::Snorm;
+	const bool scaled = info.type == Format::ComponentType::Uscaled ||
+	                    info.type == Format::ComponentType::Sscaled;
+	if (normalized || scaled) {
+		// Two-bit packed channels are unsigned even in signed formats.
+		const bool is_signed = bits != 2u && (info.type == Format::ComponentType::Snorm ||
+		                                      info.type == Format::ComponentType::Sscaled);
+		const auto max_value = static_cast<float>((1u << (bits - (is_signed ? 1u : 0u))) - 1u);
+		const auto lower = normalized ? (is_signed ? -1.0f : 0.0f)
+		                              : (is_signed ? -max_value - 1.0f : 0.0f);
+		const auto upper = normalized ? 1.0f : max_value;
+		auto value = Select(state, TypeF32(state), EmitClassifyF32Bits(state, data).nan,
+		                    ConstantF32Value(state, 0.0f), EmitBitCastF32U32(state, data));
+		value = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
+		    state, value, ConstantF32Value(state, lower), ConstantF32Value(state, upper));
+		if (normalized) {
+			value = EmitFPRoundEven32(
+			    state, EmitFPMul32(state, value, ConstantF32Value(state, max_value)));
+		}
+		// Float-to-integer conversion truncates scaled values toward zero.
+		value = Unary(state, is_signed ? spv::OpConvertFToS : spv::OpConvertFToU,
+		              is_signed ? TypeI32(state) : TypeU32(state), value);
+		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
-	if (bits == 16u && (info.type == Format::ComponentType::Snorm ||
-	                    info.type == Format::ComponentType::Float)) {
-		const auto value = EmitBitCastF32U32(ctx.state, data);
-		const auto pair = EmitCompositeConstructF32x2(ctx.state, value,
-		                                               ConstantF32Value(ctx.state, 0.0f));
-		return info.type == Format::ComponentType::Float ? EmitPackHalf2x16(ctx.state, pair)
-		                                               : EmitPackSnorm2x16(ctx.state, pair);
+	if (bits == 16u && info.type == Format::ComponentType::Float) {
+		const auto pair = EmitCompositeConstructF32x2(
+		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
+		return EmitPackHalf2x16(state, pair);
 	}
 	return data;
 }

@@ -29231,6 +29231,105 @@ TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
   return test;
 }
 
+std::vector<TestCase> FormattedStoreConversionCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct ConversionCase {
+    const char *name[2];
+    F format;
+    u32 components;
+    std::array<float, 4> values;
+    u32 expected;
+  };
+  constexpr float nan = std::bit_cast<float>(0x7fc12345u);
+  constexpr float inf = std::bit_cast<float>(0x7f800000u);
+  constexpr ConversionCase inputs[] = {
+      {{"BufferStoreSnorm8Range", "TBufferStoreSnorm8Range"},
+       F::k8_8_8_8SNorm, 4, {-2.0f, 0.25f, 0.75f, 2.0f}, 0x7f5f2081u},
+      {{"BufferStoreSnorm8Ties", "TBufferStoreSnorm8Ties"},
+       F::k8_8SNorm, 2, {0.5f, -0.5f}, 0xffffc040u},
+      {{"BufferStoreSnormPackedAlpha", "TBufferStoreSnormPackedAlpha"},
+       F::k10_10_10_2SNorm, 4, {-1.0f, -0.5f, 0.5f, 1.0f}, 0xd00c0201u},
+      {{"BufferStoreSnormPackedFirstChannel", "TBufferStoreSnormPackedFirstChannel"},
+       F::k2_10_10_10SNorm, 4, {1.0f, -1.0f, 0.5f, -0.5f}, 0xc0100807u},
+      {{"BufferStoreSnormPackedZeroFillX", "TBufferStoreSnormPackedZeroFillX"},
+       F::k10_10_10_2SNorm, 1, {-1.0f}, 0x00000201u},
+      {{"BufferStoreSnormPackedZeroFillXy", "TBufferStoreSnormPackedZeroFillXy"},
+       F::k10_10_10_2SNorm, 2, {-1.0f, 1.0f}, 0x0007fe01u},
+      {{"BufferStoreSnormPackedZeroFillXyz", "TBufferStoreSnormPackedZeroFillXyz"},
+       F::k10_10_10_2SNorm, 3, {-1.0f, 1.0f, -1.0f}, 0x2017fe01u},
+      {{"BufferStoreSnorm8ZeroFillX", "TBufferStoreSnorm8ZeroFillX"},
+       F::k8_8_8_8SNorm, 1, {-1.0f}, 0x00000081u},
+      {{"BufferStoreSnorm16ZeroFillX", "TBufferStoreSnorm16ZeroFillX"},
+       F::k16_16SNorm, 1, {-1.0f}, 0x00008001u},
+      {{"BufferStoreUscaledZeroFillXy", "TBufferStoreUscaledZeroFillXy"},
+       F::k8_8_8_8UScaled, 2, {42.0f, 99.0f}, 0x0000632au},
+      {{"BufferStoreSscaledZeroFillXyz", "TBufferStoreSscaledZeroFillXyz"},
+       F::k8_8_8_8SScaled, 3, {-42.0f, 127.0f, -128.0f}, 0x00807fd6u},
+      {{"BufferStoreUscaled8Fraction", "TBufferStoreUscaled8Fraction"},
+       F::k8UScaled, 1, {42.875f}, 0xffffff2au},
+      {{"BufferStoreSscaled8Fraction", "TBufferStoreSscaled8Fraction"},
+       F::k8SScaled, 1, {-42.875f}, 0xffffffd6u},
+      {{"BufferStoreUscaled8Range", "TBufferStoreUscaled8Range"},
+       F::k8_8_8_8UScaled, 4, {-1.0f, 255.875f, 256.0f, 0.0f}, 0x00ffff00u},
+      {{"BufferStoreSscaled8Range", "TBufferStoreSscaled8Range"},
+       F::k8_8_8_8SScaled, 4, {-129.0f, -128.75f, 127.875f, 128.0f}, 0x7f7f8080u},
+      {{"BufferStoreUscaled16Range", "TBufferStoreUscaled16Range"},
+       F::k16_16UScaled, 2, {65536.0f, 42.875f}, 0x002affffu},
+      {{"BufferStoreSscaled16Range", "TBufferStoreSscaled16Range"},
+       F::k16_16SScaled, 2, {-32769.0f, 32768.0f}, 0x7fff8000u},
+      {{"BufferStoreUscaledPacked", "TBufferStoreUscaledPacked"},
+       F::k10_10_10_2UScaled, 4, {1024.0f, 3.875f, -1.0f, 4.0f}, 0xc0000fffu},
+      {{"BufferStoreSscaledPackedAlpha", "TBufferStoreSscaledPackedAlpha"},
+       F::k10_10_10_2SScaled, 4, {-512.75f, 511.875f, -3.875f, 3.875f}, 0xffd7fe00u},
+      {{"BufferStoreSscaledPackedFirstChannel", "TBufferStoreSscaledPackedFirstChannel"},
+       F::k2_10_10_10SScaled, 4, {3.0f, -512.0f, 511.0f, -1.0f}, 0xffdff803u},
+      {{"BufferStoreSnorm8SpecialValues", "TBufferStoreSnorm8SpecialValues"},
+       F::k8_8_8_8SNorm, 4, {nan, inf, -inf, -0.0f}, 0x00817f00u},
+      {{"BufferStoreUscaled8SpecialValues", "TBufferStoreUscaled8SpecialValues"},
+       F::k8_8_8_8UScaled, 4, {nan, inf, -inf, -0.0f}, 0x0000ff00u},
+      {{"BufferStoreSscaled8SpecialValues", "TBufferStoreSscaled8SpecialValues"},
+       F::k8_8_8_8SScaled, 4, {nan, inf, -inf, -0.0f}, 0x00807f00u},
+  };
+  constexpr O store_opcodes[2][4] = {
+      {O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
+       O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW},
+      {O::TBUFFER_STORE_FORMAT_X, O::TBUFFER_STORE_FORMAT_XY,
+       O::TBUFFER_STORE_FORMAT_XYZ, O::TBUFFER_STORE_FORMAT_XYZW},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    for (const bool typed : {false, true}) {
+      TestCase test;
+      test.name = input.name[typed];
+      for (u32 component = 0; component < input.components; ++component) {
+        AppendVMovLiteral(&test.code, component,
+                          std::bit_cast<u32>(input.values[component]));
+      }
+      AppendVMovU32(&test.code, 20, 4);
+      const u32 opcode = 3 + input.components;
+      if (typed) {
+        const u32 format = BufferFormat(input.format);
+        test.code.push_back(EncodeMtbuf0(opcode, format & 0xfu, format >> 4u));
+        test.code.push_back(EncodeMtbuf1(opcode, 0, 0, 20));
+      } else {
+        test.code.push_back(EncodeMubuf0(opcode));
+        test.code.push_back(EncodeMubuf1(0, 0, 20));
+      }
+      AppendEnd(&test.code);
+      test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+      test.expected = {0xdeadbeefu, input.expected, 0xcafef00du};
+      test.user_data = MakeStructuredStorageBufferData(
+          0, 12, false, BufferFormat(input.format));
+      test.has_user_data = true;
+      test.opcodes = {O::V_MOV_B32, store_opcodes[typed][input.components - 1],
+                      O::S_ENDPGM};
+      cases.push_back(std::move(test));
+    }
+  }
+  return cases;
+}
+
 TestCase BufferLoadFormatXyResource88UintExtractsBytes() {
   using O = ShaderOpcode;
 
@@ -35760,6 +35859,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
+  for (auto &test : FormattedStoreConversionCases()) {
+    cases.push_back(std::move(test));
+  }
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);
@@ -41185,6 +41287,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
+    for (const auto &test : FormattedStoreConversionCases()) {
+      RunCase(&vulkan, test);
+    }
     RunCase(&vulkan, BufferStoreFormatXResource16UintWritesHalfword());
     RunCase(&vulkan, BufferStoreFormatXResource16UintPreservesAdjacentLanes());
     RunCase(&vulkan, BufferStoreFormatXyResource88UintWritesBytes());
