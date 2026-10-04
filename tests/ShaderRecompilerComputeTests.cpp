@@ -12110,7 +12110,7 @@ public:
       }
 
       {
-        const auto buffer_program = make_buffer_program(ShaderType::Compute, {.read = true});
+        const auto buffer_program = make_buffer_program(ShaderType::Compute, {.read = true, .written = true});
         constexpr uint64_t buffer_address = base + 0xe0002;
         ShaderBufferResource descriptor{};
         descriptor.UpdateAddress48(buffer_address);
@@ -12133,6 +12133,90 @@ public:
                     bindings.buffers[0].range == 14 &&
                     bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2,
                 "native binding lost the byte adjustment or rounded the final halfword range");
+      }
+
+      for (const auto format : {Prospero::BufferFormat::k8UNorm,
+                                 Prospero::BufferFormat::k16UNorm}) {
+        const uint64_t alias_address = base + 0xe00000 +
+            Prospero::NumBytesPerElement(format) * 0x10000;
+        constexpr uint8_t texel = 0x7f;
+        Libs::LibKernel::Memory::WriteBacking(alias_address, &texel, sizeof(texel));
+        u32 expected = texel;
+        if (format == Prospero::BufferFormat::k16UNorm) {
+          auto depth_desc = MakeLinearDesc(alias_address, 256, vk::Format::eD16Unorm,
+              format, Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 2, 1);
+          depth_desc.info.pitch = 128;
+          depth_desc.info.mip_layout[0] = {0, 256, 128, 1};
+          depth_desc.type = BindingType::DepthTarget;
+          depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+          depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+          const auto depth_id = texture_cache.FindImage(depth_desc);
+          auto &depth = texture_cache.GetImage(depth_id);
+          depth.Transit(vk::ImageLayout::eTransferDstOptimal,
+                        vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+          const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+          scheduler.Current().Handle().clearDepthStencilImage(depth.backing.image,
+              vk::ImageLayout::eTransferDstOptimal, vk::ClearDepthStencilValue{1.f, 0}, range);
+          texture_cache.MarkGpuWritten(depth_id);
+          expected = 0xffff;
+        }
+        ShaderRecompiler::IR::CompiledShaderInfo program{};
+        program.stage = ShaderType::Compute;
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        // PPSA24156 binds one-texel R8/R16 allocations as 3D, then 2D.
+        for (const auto type : {Prospero::ImageType::kColor3D,
+                                Prospero::ImageType::kColor2D}) {
+          ShaderRecompiler::IR::ImageResource resource{};
+          resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+          resource.read = true;
+          resource.numeric_class = Prospero::TextureNumericClass::Float;
+          resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          if (type == Prospero::ImageType::kColor3D) {
+            resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+          }
+          program.info.images.push_back(resource);
+          auto &value = snapshot.images.emplace_back();
+          value.dword_count = 8;
+          value.dwords = {static_cast<u32>(alias_address >> 8u),
+              static_cast<u32>(format) << 20u, 0,
+              DstSel(4, 4, 4, 1) | (static_cast<u32>(type) << 28u),
+              0, 0x00700000u, 0, 0};
+        }
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        Require(name, "overlapping dimension discovery",
+                !texture_cache.GetImage(bindings.images[0].image_id).registered,
+                "the 2D descriptor did not replace its earlier 3D alias");
+        executor.RebindImages(bindings);
+        auto output = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        constexpr std::array image_types{vk::ImageType::e3D, vk::ImageType::e2D};
+        for (u32 i = 0; i < bindings.images.size(); ++i) {
+          const auto &binding = bindings.images[i];
+          auto &image = texture_cache.GetImage(binding.image_id);
+          Require(name, "overlapping dimension views", binding.image_view != nullptr &&
+                      image.backing.image_type == image_types[i],
+                  "rediscovery lost a live view or the descriptor's image dimension");
+          image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                        vk::AccessFlagBits2::eTransferRead, {}, scheduler.Current().Handle());
+          vk::BufferImageCopy copy{};
+          copy.bufferOffset = i * sizeof(u32);
+          copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+          copy.imageExtent = {1, 1, 1};
+          scheduler.Current().Handle().copyImageToBuffer(image.backing.image,
+              vk::ImageLayout::eTransferSrcOptimal, output.buffer, 1, &copy);
+        }
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        scheduler.Finish();
+        Require(name, "overlapping dimension GPU contents",
+                ReadBuffer(name, output, 2) == std::vector<u32>{expected, expected},
+                "an alias replacement retired image contents before queued GPU reads");
+        DestroyBuffer(&output);
       }
 
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
@@ -41016,6 +41100,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
     VulkanHarness vulkan;
     CheckImageTransitionState(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-rebind-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

@@ -917,7 +917,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	        cached.info.data.size / cached.info.resources.layers &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
-	bool recreate = cached.info.resources < requested.resources;
+	bool recreate = cached.info.resources < requested.resources ||
+	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
