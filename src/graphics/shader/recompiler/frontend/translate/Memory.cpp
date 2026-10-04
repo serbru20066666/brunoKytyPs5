@@ -239,9 +239,6 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_READ_ADDTID_B32: return MakeM0Operand();
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
-			case Decoder::Opcode::DS_MIN_F32:
-			case Decoder::Opcode::DS_MAX_F32:
-				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
 			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
@@ -255,12 +252,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
-			default:
-				if (decoded.opcode >= Decoder::Opcode::DS_ADD_U32 &&
-				    decoded.opcode <= Decoder::Opcode::DS_WRXCHG_RTN_B32) {
-					return index == 0u ? decoded.src1 : decoded.src0;
-				}
-				return decoded.src0;
+			default: return decoded.src0;
 		}
 	}
 	return DecodedSourceAt(decoded, index);
@@ -580,12 +572,13 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
-	const auto data_src = MemorySourceAt(inst, 0);
+	const auto address = ReadU32(inst.src0);
 	const IR::Value value =
-	    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
-	const auto result  = ir.Emit(opcode, {address, value, ir.GetExec()},
-	                             AddMemoryInfo(memory, inst.pc));
+	    memory.data_dwords == 2u ? IR::Value(ReadU64(inst.src1)) : IR::Value(ReadU32(inst.src1));
+	const auto flags = AddMemoryInfo(memory, inst.pc);
+	const auto result = inst.src_count == 3u
+	                        ? ir.Emit(opcode, {address, value, ReadU32(inst.src2), ir.GetExec()}, flags)
+	                        : ir.Emit(opcode, {address, value, ir.GetExec()}, flags);
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
 	}
@@ -857,14 +850,6 @@ void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 	}
 }
 
-void Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
-	const auto memory = MemoryInfoFromDecoded(inst);
-	ir.Emit(opcode,
-	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
-	         ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
-	        AddMemoryInfo(memory, inst.pc));
-}
-
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	WriteOperand(inst.dst, ir.Emit(opcode,
@@ -1048,6 +1033,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, false);
 		case Decoder::Opcode::DS_XOR_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
+		case Decoder::Opcode::DS_MSKOR_B32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicMaskedOr32, false);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
 
@@ -1110,9 +1097,9 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
-			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicFMin32, false);
 		case Decoder::Opcode::DS_MAX_F32:
-			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMax32);
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicFMax32, false);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
 		case Decoder::Opcode::DS_PERMUTE_B32: return DS_PERMUTE(inst, false);
 		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_PERMUTE(inst, true);

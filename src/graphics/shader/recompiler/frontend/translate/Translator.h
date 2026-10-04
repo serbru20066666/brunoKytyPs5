@@ -146,7 +146,6 @@ private:
 	void DS_READ2(const Decoder::Instruction& inst);
 	void DS_WRITE(const Decoder::Instruction& inst);
 	void DS_WRITE2(const Decoder::Instruction& inst);
-	void DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_ADDTID(const Decoder::Instruction& inst, bool write);
 	void DS_SWIZZLE_B32(const Decoder::Instruction& inst);

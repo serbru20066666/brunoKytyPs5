@@ -285,8 +285,14 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 }
 
 uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto address = ByteAddress(ctx, inst, mem);
+	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
+		// RDNA2 DS region addresses retain bits [15:2] after adding the byte offset.
+		address = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
+		                 ConstantU32(ctx.state, 0xffffu));
+	}
 	return Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
-	              ByteAddress(ctx, inst, mem), ConstantU32(ctx.state, 2));
+	              address, ConstantU32(ctx.state, 2));
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -1466,6 +1472,15 @@ uint32_t EmitSharedIncDec(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto replacement =
 	    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicInc32 ? AtomicIncrement : AtomicDecrement;
 	return EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement);
+}
+
+void EmitSharedAtomicMaskedOr32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto keep = Unary(ctx.state, spv::OpNot, TypeU32(ctx.state), ctx.Arg(inst, 1));
+	EmitAtomicUpdate(ctx, inst, ctx.Memory(inst),
+	                 [keep](EmitterState& state, uint32_t old, uint32_t value) {
+		                 return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+		                               Binary(state, spv::OpBitwiseAnd, TypeU32(state), old, keep), value);
+	                 });
 }
 
 uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {

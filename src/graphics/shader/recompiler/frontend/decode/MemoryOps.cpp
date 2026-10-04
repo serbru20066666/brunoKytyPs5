@@ -92,7 +92,8 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x05u, Opcode::DS_MIN_I32, 1, 32},          {0x06u, Opcode::DS_MAX_I32, 1, 32},
     {0x07u, Opcode::DS_MIN_U32, 1, 32},          {0x08u, Opcode::DS_MAX_U32, 1, 32},
     {0x09u, Opcode::DS_AND_B32, 1, 32},          {0x0au, Opcode::DS_OR_B32, 1, 32},
-    {0x0bu, Opcode::DS_XOR_B32, 1, 32},          {0x0du, Opcode::DS_WRITE_B32, 1, 32},
+    {0x0bu, Opcode::DS_XOR_B32, 1, 32},          {0x0cu, Opcode::DS_MSKOR_B32, 1, 32},
+    {0x0du, Opcode::DS_WRITE_B32, 1, 32},
     {0x0eu, Opcode::DS_WRITE2_B32, 2, 32},       {0x0fu, Opcode::DS_WRITE2ST64_B32, 2, 32},
     {0x12u, Opcode::DS_MIN_F32, 1, 32},          {0x13u, Opcode::DS_MAX_F32, 1, 32},
     {0x1eu, Opcode::DS_WRITE_B8, 1, 8},          {0x1fu, Opcode::DS_WRITE_B16, 1, 16},
@@ -192,6 +193,7 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_WRXCHG_RTN_B32: return true;
 		default: return false;
 	}
@@ -203,6 +205,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32: return 3u;
 		case Opcode::DS_PERMUTE_B32:

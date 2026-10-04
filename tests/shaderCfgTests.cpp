@@ -4618,6 +4618,16 @@ void TestNewShaderDecoderArchitecture() {
   Check(ds.opcode == Opcode::DS_READ_B32 && ds.gds,
         "DS decoder lost the GFX10 opcode or GDS fields");
 
+  const uint32_t masked_or_code[] = {0xd8300144u, 0x000a0802u};
+  Instruction masked_or;
+  ShaderRecompiler::Decoder::DecodeInstruction(masked_or_code, 0u, masked_or);
+  Check(masked_or.opcode == Opcode::DS_MSKOR_B32 && !masked_or.gds &&
+            masked_or.word_count == 2u && masked_or.src_count == 3u &&
+            masked_or.offset == 0x144u && masked_or.src0.reg == 2u &&
+            masked_or.src1.reg == 8u && masked_or.src2.reg == 10u &&
+            masked_or.data_dwords == 1u && masked_or.data_bits == 32u,
+        "DS decoder misdecoded captured masked OR operands");
+
   for (bool decrement : {false, true}) {
     const uint32_t words[] = {decrement ? 0xd8920004u : 0xd88e0004u, 0x03000302u};
     Instruction atomic;
