@@ -54,28 +54,37 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 	layout.descriptors.push_back({kind, std::move(resources)});
 }
 
-bool UsesGds(const Program& program) {
-	bool uses_gds = false;
+} // namespace
+
+SharedMemoryResources CollectSharedMemory(const Program& program) {
+	SharedMemoryResources shared;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (SharedAccessOf(inst.GetOpcode()) == SharedAccess::None) {
+			const auto op = inst.GetOpcode();
+			if (SharedAccessOf(op) == SharedAccess::None &&
+			    AddressOpcodeInfoOf(op).access == AddressAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
 			if (index >= program.memory_info.size()) {
-				BindingFail("typed shader contains invalid shared-memory metadata");
+				BindingFail("typed shader contains invalid memory metadata");
 			}
-			const auto kind = program.memory_info[index].kind;
-			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
-				BindingFail("typed shader contains invalid shared-memory metadata");
+			const auto& memory = program.memory_info[index];
+			if (memory.planning_only) {
+				continue;
 			}
-			uses_gds |= kind == ResourceKind::Gds;
+			shared.lds |= memory.kind == ResourceKind::FlatLocal;
+			if (SharedAccessOf(op) != SharedAccess::None) {
+				if (memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) {
+					BindingFail("typed shader contains invalid shared-memory metadata");
+				}
+				shared.gds |= memory.kind == ResourceKind::Gds;
+				shared.lds |= memory.kind == ResourceKind::Lds;
+			}
 		}
 	}
-	return uses_gds;
+	return shared;
 }
-
-} // namespace
 
 bool UsesFlattenedSrt(const Program& program) {
 	const auto uses_mapping = [](const auto& resource) {
@@ -89,13 +98,14 @@ bool UsesFlattenedSrt(const Program& program) {
 	       std::ranges::any_of(program.info.images, uses_mapping);
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
 		                                             : "binding layout already allocated");
 	}
 	BindingLayout next;
+	const auto shared = CollectSharedMemory(program);
 	CollectShaderData(program, next);
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
 	next.push_data_start_dword =
@@ -142,8 +152,11 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	if (shared.gds) {
 		AddBinding(next, DescriptorBindingKind::Gds);
+	}
+	if (shared.lds && lds_storage) {
+		AddBinding(next, DescriptorBindingKind::SharedMemory);
 	}
 	if (program.info.uses_dma) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);

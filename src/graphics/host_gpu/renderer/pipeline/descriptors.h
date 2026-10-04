@@ -76,6 +76,7 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
+	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
 	// KYTY_DEBUG_DRAW_PHASES: the previous draw's program and descriptor hashes (see
 	// NoteBindingRepeat).

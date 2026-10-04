@@ -89,7 +89,14 @@ struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {}
+	      requirements(AnalyzeProgramRequirements(program_)) {
+		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
+			lds_storage_class = spv::StorageClassWorkgroup;
+		}
+		if (IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+			lds_storage_class = spv::StorageClassStorageBuffer;
+		}
+	}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
@@ -129,6 +136,8 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable       = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable       = 0;
+	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable                 = 0;
 	uint32_t                                         lds_u64_variable             = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};

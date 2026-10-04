@@ -1236,16 +1236,22 @@ void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index,
 		                              ConstantU32(state, LdsDwordCount(state) / 2u));
 		EmitIfCondition(state, in_bounds, [&]() {
+			auto native_index = index;
+			auto semantics = spv::MemorySemanticsWorkgroupMemoryMask;
+			if (state.lds_storage_class == spv::StorageClassStorageBuffer) {
+				native_index = EmitAddU32(state, index, EmitBinaryU32(
+				    state, spv::OpShiftRightLogical, state.lds_base_dwords, ConstantU32(state, 1)));
+				semantics = spv::MemorySemanticsUniformMemoryMask;
+			}
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpAccessChain,
-			                          TypePointer(state, spv::StorageClassWorkgroup, TypeScalarU64(state)),
-			                          pointer, state.lds_u64_variable, ConstantU32(state, 0), index);
+			                          TypePointer(state, state.lds_storage_class, TypeScalarU64(state)),
+			                          pointer, state.lds_u64_variable, ConstantU32(state, 0), native_index);
 			const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, 1));
 			state.builder.AddFunction(
 			    SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), state.builder.AllocateId(),
 			    pointer, ConstantU32(state, spv::ScopeWorkgroup),
-			    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
-			                           spv::MemorySemanticsWorkgroupMemoryMask), value);
+			    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | semantics), value);
 		});
 	});
 }

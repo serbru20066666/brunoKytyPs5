@@ -1847,19 +1847,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	WaitForPrecompile();
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
-	// Use one effective size for the cache key, LDS declaration, and access bounds.
-	const auto max_lds_dwords =
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
-	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
-			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
-		}
-	}
-	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor, wait, pending);

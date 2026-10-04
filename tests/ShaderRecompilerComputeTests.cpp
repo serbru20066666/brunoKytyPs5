@@ -10503,6 +10503,79 @@ public:
                   "a retained descriptor load used stale dimensions or the wrong record stride");
         }
       }
+
+      // Exchange values across two waves in the last 512 bytes of each
+      // workgroup's 64-KiB LDS, on a host restricted to 48-KiB native shared memory.
+      constexpr auto lds_output = base + 0xb0000;
+      constexpr auto lds_args = base + 0xc0000;
+      constexpr u32 lds_words = 8 * 128;
+      std::vector<u32> lds_shader{
+          EncodeSop2(0x1e, 8, 5, InlineU32(1)),
+          EncodeSop2(0x1e, 9, 6, InlineU32(2)),
+          EncodeSop2(0x02, 8, 8, 9), EncodeSop2(0x02, 8, 8, 4)};
+      AppendVop3(&lds_shader, 0x346, 2, 8, InlineU32(7), Vgpr(0));
+      lds_shader.push_back(EncodeVop2(0x1a, 5, InlineU32(2), 2));
+      lds_shader.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
+      lds_shader.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));
+      AppendVMovLiteral(&lds_shader, 7, 64 * 1024 - 128 * 4);
+      lds_shader.insert(lds_shader.end(), {
+          EncodeVop2(0x25, 1, Vgpr(7), 1),
+          EncodeDs0(0x0d), EncodeDs1(0, 2, 1), EncodeSopp(0x0a, 0),
+          EncodeVop2(0x1d, 3, InlineU32(64), 0),
+          EncodeVop2(0x1a, 3, InlineU32(2), 3), EncodeVop2(0x25, 3, Vgpr(7), 3),
+          EncodeDs0(0x36), EncodeDs1(4, 0, 3),
+          EncodeMubuf0(0x1c), EncodeMubuf1(4, 0, 5)});
+      AppendEnd(&lds_shader);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(lds_shader.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(lds_shader.size() * sizeof(u32))});
+      auto &host_lds_limit = context.GetGraphics().physical_device_properties.limits.maxComputeSharedMemorySize;
+      const auto saved_lds_limit = host_lds_limit;
+      host_lds_limit = std::min(host_lds_limit, 48u * 1024u);
+      for (u32 dispatch = 0; dispatch < 4; dispatch++) {
+        cache.FillBuffer(lds_output, lds_words * sizeof(u32), sentinel, false);
+        const bool indirect = dispatch == 1 || dispatch == 2;
+        const bool empty = dispatch == 2;
+        if (indirect) {
+          const auto groups = empty ? std::array{4096u, 0u, 1u} : std::array{2u, 2u, 2u};
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          for (u32 axis = 0; axis < 3; axis++) {
+            set_buffer(axis * 4, lds_args + axis * sizeof(u32), sizeof(u32));
+            shaders.SetCsUserSgpr(12 + axis, groups[axis], HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+          Require(name, "GPU-authored LDS dispatch arguments",
+                  cache.HasGpuDirtyBytes(lds_args, 3 * sizeof(u32)),
+                  "indirect LDS dimensions were already visible on the CPU");
+        }
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(lds_shader.data()),
+                             .num_thread_x = 128, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true,
+                             .tgid_y_en = true, .tgid_z_en = true, .lds_size = 128});
+        set_buffer(0, lds_output, lds_words * sizeof(u32));
+        if (indirect) {
+          const std::array<u32, 3> packet{static_cast<u32>(lds_args),
+                                         static_cast<u32>(lds_args >> 32u), 0x41u};
+          Require(name, "indirect storage LDS dispatch",
+                  CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
+                  "the GPU-authored LDS dispatch was not consumed");
+        } else {
+          processor.DispatchDirect(2, 2, 2, 0x41u);
+        }
+        cache.ReadMemory(lds_output, lds_words * sizeof(u32));
+        std::array<u32, lds_words> actual{};
+        Require(name, "storage LDS readback",
+                LibKernel::Memory::TryReadBacking(lds_output, actual.data(), sizeof(actual)),
+                "LDS result buffer could not be read back");
+        for (u32 word = 0; word < actual.size(); word++) {
+          const auto expected = empty ? sentinel : (word ^ 64u) + 1u;
+          Require(name, "storage LDS upper range, isolation and barrier", actual[word] == expected,
+                  "64-KiB LDS lost upper bytes, workgroup isolation, or cross-wave writes");
+        }
+      }
+      host_lds_limit = saved_lds_limit;
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });
@@ -15461,11 +15534,27 @@ public:
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
+    Buffer shared_buffer;
     vk::DescriptorBufferInfo flattened_info{};
     vk::DescriptorBufferInfo user_data_info{};
+    vk::DescriptorBufferInfo shared_info{};
     vk::DescriptorBufferInfo gds_info{};
     vk::DescriptorBufferInfo bda_pagetable_info{};
     vk::DescriptorBufferInfo fault_buffer_info{};
+
+    if (Binding(Kind::SharedMemory) != nullptr) {
+      const auto bytes = uint64_t{test.compute_info.lds_size_dwords} * sizeof(u32) *
+          test.dispatch_x * test.dispatch_y * test.dispatch_z;
+      shared_buffer = CreateHostBuffer(test.name, bytes, vk::BufferUsageFlagBits::eStorageBuffer, {});
+      shared_info = {shared_buffer.buffer, 0, shared_buffer.size};
+      vk::WriteDescriptorSet write{};
+      write.dstSet = descriptor_set;
+      write.dstBinding = Native(Kind::SharedMemory);
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &shared_info;
+      writes.push_back(write);
+    }
 
     const bool uses_bda = Binding(Kind::BdaPagetable) != nullptr;
     Require(test.name, "dispatch",
@@ -15779,6 +15868,7 @@ public:
     if (user_data_buffer.buffer != nullptr) {
       DestroyBuffer(&user_data_buffer);
     }
+    DestroyBuffer(&shared_buffer);
     m_device.destroyDescriptorPool(descriptor_pool, nullptr);
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
@@ -35490,24 +35580,27 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   regs.cs_regs.num_thread_z = 1;
   regs.cs_regs.wave_size = 32;
   PipelineCache cache(graphics);
-  ShaderProgram at_limit;
+  ShaderProgram previous;
+  uint16_t previous_units = 0;
   for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
-                           uint16_t{112}, uint16_t{128}}) {
+                           uint16_t{112}, uint16_t{128}, uint16_t{128}}) {
     regs.cs_regs.lds_size = units;
     ShaderComputeInputInfo input{};
     const auto program = cache.GetComputeProgram(regs, {}, input);
-    const auto expected = units < limit_units ? units * 128u : limit / 4u;
-    Require(name, "device allocation", input.lds_size_dwords == expected,
-            "compute LDS allocation did not respect the device limit");
+    Require(name, "guest allocation and device backing",
+            input.lds_size_dwords == units * 128u &&
+                input.lds_storage == (units > limit_units),
+            "compute LDS was truncated or chose backing that exceeds the device limit");
     Require(name, "pipeline creation",
             cache.GetComputePipeline(input, program).pipeline != nullptr,
-            "clamped LDS shader did not create a Vulkan compute pipeline");
-    if (units == limit_units) {
-      at_limit = program;
-    } else if (units > limit_units) {
-      Require(name, "effective-size cache reuse", program.id == at_limit.id,
-              "equivalent clamped LDS allocations compiled separate shaders");
+            "full-size LDS shader did not create a Vulkan compute pipeline");
+    if (previous.id != 0) {
+      Require(name, "guest-size cache identity",
+              (program.id == previous.id) == (units == previous_units),
+              "different LDS sizes shared a shader, or repeating a size recompiled it");
     }
+    previous = program;
+    previous_units = units;
   }
   std::printf("[gpu]     %-32s ok\n", name);
 }
@@ -40597,6 +40690,13 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsWideLdsPartialBounds());
     RunCase(&vulkan, DsAtomic64Bounds(false));
     RunCase(&vulkan, DsAtomic64Bounds(true));
+    for (auto test : {DsWideLdsPartialBounds(), DsAtomic64Bounds(false), DsAtomic64Bounds(true)}) {
+      test.compute_info.lds_storage = true;
+      std::erase(test.required_spirv, "WorkgroupMemoryExplicitLayoutKHR");
+      test.required_spirv.push_back("StorageBuffer");
+      RunCase(&vulkan, test);
+    }
+    vulkan.CheckNativeIndirectDispatch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {

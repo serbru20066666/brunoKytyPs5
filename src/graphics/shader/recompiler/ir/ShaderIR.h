@@ -201,6 +201,7 @@ enum class StageInputKind {
 	BaryCoordSmoothCentroid,
 	BaryCoordNoPerspective,
 	WorkgroupId,
+	NumWorkgroups,
 	LocalInvocationId,
 	LocalInvocationIndex,
 	GlobalInvocationId,
@@ -303,11 +304,12 @@ enum class DescriptorBindingKind : uint32_t {
 	FaultBuffer,
 	FlattenedSrt,
 	ShaderData,
+	SharedMemory,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

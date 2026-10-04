@@ -17,7 +17,7 @@ namespace {
 	std::abort();
 }
 
-void ValidateNativeProgram(const IR::Program& program) {
+void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	using Kind                                             = IR::DescriptorBindingKind;
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
 	std::array<std::vector<uint32_t>, KindCount> expected;
@@ -54,25 +54,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
-	bool uses_gds = false;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) {
-				continue;
-			}
-			const auto index = inst.Flags<IR::MemoryFlags>().index;
-			if (index >= program.memory_info.size()) {
-				Fail(program, "shared operation has invalid memory metadata");
-			}
-			const auto kind = program.memory_info[index].kind;
-			if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
-				Fail(program, "shared operation has invalid resource kind");
-			}
-			uses_gds |= kind == IR::ResourceKind::Gds;
-		}
-	}
-	if (uses_gds) {
+	const auto shared = IR::CollectSharedMemory(program);
+	if (shared.gds) {
 		Expect(Kind::Gds);
+	}
+	if (shared.lds && lds_storage) {
+		Expect(Kind::SharedMemory);
 	}
 	if (program.info.uses_dma) {
 		Expect(Kind::BdaPagetable);
@@ -362,7 +349,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    !program.shader_info_complete || !program.binding_layout_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	ValidateNativeProgram(program);
+	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
+	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
