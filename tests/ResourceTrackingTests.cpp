@@ -3398,7 +3398,8 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 52u &&
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u,
+            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 55u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
