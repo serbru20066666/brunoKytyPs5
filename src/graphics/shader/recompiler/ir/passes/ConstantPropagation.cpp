@@ -473,6 +473,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
                       std::unordered_set<Inst*>& lowered_ancillary, PossibleValues& possible) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::StoreBufferU32: {
+			const auto data = ResolveActiveU32(Arg(inst, 4), Arg(inst, 5));
+			if (!data.IsEmpty() && data != inst.Arg(4)) inst.SetArg(4, data);
+			return;
+		}
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
 			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) &&

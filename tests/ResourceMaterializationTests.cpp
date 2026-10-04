@@ -2,8 +2,10 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 
 namespace {
@@ -197,45 +199,6 @@ void TestRawScalarAddressPreservesHighBits() {
   }
 }
 
-void TestDispatchBufferKeepsOnlyBindingLayoutOnHost() {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto plan = UserDataBufferPlan();
-  plan.info.buffers[0].dispatch_stride = 64;
-  plan.info.buffers[0].max_byte_extent = 20;
-  auto &source = plan.descriptor_sources[0];
-  source.dwords[1] = Value(20u << 16u);
-  source.dwords[3] = Value(0x16204u);
-  std::array<uint32_t, 1> user_data{0x1000u};
-  uint32_t reads = 0;
-  const SrtRuntime runtime{.user_data = user_data,
-                           .read_memory = RejectSpecializationRead,
-                           .userdata = &reads,
-                           .read_specialization_memory = RejectSpecializationRead};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.buffers[0].dwords[2] == 0 &&
-            specialization.buffers[0].packed_stride == 20 && reads == 0,
-        "native record count was required to materialize its stable binding layout");
-  for (const auto words : {std::array<uint32_t, 2>{0u, 0x16204u},
-                           {16u << 16u, 0x16204u},
-                           {(20u << 16u) | (1u << 31u), 0x16204u},
-                           {20u << 16u, 0x16204u | (1u << 23u)},
-                           {20u << 16u, 0x16204u | (1u << 28u)}}) {
-    source.dwords[1] = Value(words[0]);
-    source.dwords[3] = Value(words[1]);
-    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-          "dispatch buffer accepted a layout outside its native bounds proof");
-  }
-  user_data[0] = 0;
-  source.dwords[1] = Value(0u);
-  source.dwords[3] = Value(0u);
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            specialization.buffers[0].packed_stride == 0,
-        "inactive dispatch buffer did not preserve null binding semantics");
-  Check(reads == 0, "dispatch buffer layout validation read GPU data on the host");
-}
-
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtPlan(0x10000);
@@ -283,6 +246,113 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
   plan.srt_reads[0].value = Value(&first);
   Check(!ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
         "cyclic SRT read-first-lane dependency was accepted");
+}
+
+void TestUniformVectorDescriptorRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {Value(0x1000u), Value(4u << 16u), Value(1u), Value(0x16204u)});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer});
+  auto &count = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)});
+  count.SetFlags(MemoryFlags{.index = 0});
+  // The captured indirect kernel shares one read across sibling scalar lane reads,
+  // enclosed by a different EXEC mask. Its resource plan must share that read too.
+  auto &lane = block.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  auto &active = block.AppendNewInst(ValueOpcode::ULessThan32, {Value(&lane), Value(32u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(true)});
+  auto &next = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&count), Value(1u)});
+  auto &second = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&next), Value(true)});
+  auto &sum = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&first), Value(&second)});
+  auto &small = block.AppendNewInst(ValueOpcode::ULessThanEqual32, {Value(&count), Value(72u)});
+  auto &selected = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&small), Value(&sum), Value(&count)});
+  auto &masked = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&active), Value(&selected), Value(0u)});
+  auto &records = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&masked), Value(&active)});
+  DescriptorSource source;
+  source.dword_count = 4;
+  source.dwords = {Value(0x2000u), Value(4u << 16u), Value(&records), Value(0x16204u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  Check(ValidateRuntimeValue(program, Value(&count)), "uniform DWORD count was rejected");
+  struct Reads { uint32_t value = 72; uint32_t strict = 0; uint32_t ordinary = 0; bool clean = true; } reads;
+  const SrtRuntime runtime{
+      .read_memory = [](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        words[0] = 999;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = [](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (!reads.clean || address != 0x1000u || words.size() != 1) return false;
+        words[0] = reads.value;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const bool written : {false, true}) {
+    program.info.buffers[0].written = written;
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.control_flow.empty() && plan.requires_specialization_memory &&
+              plan.capture_specialization_reads,
+          "vector descriptor read depended on incidental control-flow capture");
+    reads = {};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == 145 && reads.strict == 1 && reads.ordinary == 0 &&
+              snapshot.specialization_reads ==
+                  std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}},
+          "vector descriptor input was not read and captured exactly once");
+    reads.clean = false;
+    reads.strict = 0;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.strict == 1 && reads.ordinary == 0,
+          "dirty vector descriptor input fell back to an ordinary memory read");
+  }
+  count.SetArg(4, Value(false));
+  auto &inactive = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(false)});
+  reads.strict = 0;
+  uint32_t result = 99;
+  Check(SrtWalker(program, runtime).Evaluate(Value(&inactive), result) &&
+            result == 0 && reads.strict == 0 && reads.ordinary == 0,
+        "literal false EXEC read vector memory");
+  count.SetArg(4, Value(true));
+  handle.SetArg(3, Value(0x204u));
+  Check(SrtWalker(program, runtime).Evaluate(Value(&count), result) &&
+            result == 0 && reads.strict == 0 && reads.ordinary == 0,
+        "invalid vector buffer format read memory");
+  handle.SetArg(3, Value(0x16204u));
+  count.SetArg(1, Value(&lane));
+  Check(!ValidateRuntimeValue(program, Value(&count)),
+        "varying vector address was treated as a uniform descriptor read");
+}
+
+void TestExactReciprocalDescriptorArithmetic() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  auto &block = AddValueBlock(program);
+  for (const float divisor : {64.f, 128.f, 256.f, 512.f,
+                              std::numeric_limits<float>::min(),
+                              std::bit_cast<float>(253u << 23u)}) {
+    auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
+    uint32_t result = 0;
+    Check(SrtWalker(program, {}).Evaluate(Value(&reciprocal), result) &&
+              result == std::bit_cast<uint32_t>(1.f / divisor),
+          "power-of-two reciprocal was not exact");
+  }
+  for (const float divisor : {0.f, 3.f, -64.f, std::numeric_limits<float>::infinity(),
+                              std::numeric_limits<float>::denorm_min(),
+                              std::bit_cast<float>(254u << 23u)}) {
+    auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
+    uint32_t result = 0;
+    Check(!SrtWalker(program, {}).Evaluate(Value(&reciprocal), result),
+          "unsupported reciprocal rounding or exceptional input was accepted");
+  }
 }
 
 void TestUnbasedFlatCacheHitMaterializes() {
@@ -871,8 +941,9 @@ int main() {
       true);
   TestMappedSrtUsesDirectReaderByDefault();
   TestRawScalarAddressPreservesHighBits();
-  TestDispatchBufferKeepsOnlyBindingLayoutOnHost();
   TestIntegerRuntimeValueFollowsSrtReads();
+  TestUniformVectorDescriptorRead();
+  TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();

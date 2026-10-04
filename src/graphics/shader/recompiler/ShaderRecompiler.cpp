@@ -651,7 +651,6 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		for (auto& inst: *block) {
 			const auto op = inst.GetOpcode();
 			uint32_t first = 0;
-			bool native_buffer_count = false;
 			if (op == IR::ValueOpcode::GetBufferResource) {
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
 					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
@@ -660,8 +659,6 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 					continue;
 				}
 				const auto resource = inst.Flags<uint32_t>();
-				native_buffer_count = resource < ir.info.buffers.size() &&
-				                      ir.info.buffers[resource].dispatch_stride != 0u;
 				first               = resource < ir.info.buffers.size() &&
 				                              ir.info.buffers[resource].indirect_root == resource
 				                          ? 1u
@@ -674,7 +671,6 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				continue;
 			}
 			for (size_t index = first; index < inst.NumArgs(); index++) {
-				if (native_buffer_count && index == 2u) continue;
 				inst.SetArg(index, IR::Value(0u));
 			}
 		}

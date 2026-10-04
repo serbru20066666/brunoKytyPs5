@@ -2728,6 +2728,33 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+void TestBufferStoreUsesItsOwnActiveValue() {
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto guard = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+  const auto other_guard = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+  const auto inner = fixture.Emit(ValueOpcode::SelectU32, {guard, Value(9u), lane});
+  const auto data = fixture.Emit(ValueOpcode::SelectU32, {guard, inner, lane});
+  const auto handle = fixture.Buffer({Value(0x1000u), Value(4u << 16u),
+                                       Value(64u), Value(0x16204u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  const auto store = [&](Value active) {
+    return fixture.Emit(ValueOpcode::StoreBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), data, active},
+        fixture.AddMemory(memory, 0));
+  };
+  const auto matching = store(guard);
+  const auto different = store(other_guard);
+  ConstantPropagationPass(fixture.program.blocks);
+  Check(matching.Instruction()->Arg(4).Resolve() == Value(9u),
+        "buffer store retained data from its inactive lanes");
+  Check(different.Instruction()->Arg(4).Resolve() == data.Resolve() &&
+            data.Resolve().Instruction()->GetOpcode() == ValueOpcode::SelectU32,
+        "buffer store changed a shared value outside its own EXEC mask");
+}
+
 void TestBoundedRelativeRegisterWrites() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant { Bounded, BoundClobber, DescriptorClobber, EntryBypass };
@@ -3639,6 +3666,7 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);

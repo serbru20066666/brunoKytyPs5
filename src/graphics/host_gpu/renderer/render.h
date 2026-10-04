@@ -234,9 +234,7 @@ public:
 	                      uint32_t mode);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void                           FindBuffers(PreparedBindings& bindings,
-	                                           uint64_t dispatch_threads_x = 0,
-	                                           uint32_t group_size_x = 0);
+	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,

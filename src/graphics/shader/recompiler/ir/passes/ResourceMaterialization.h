@@ -53,10 +53,6 @@ struct MaterializationMemo {
 	bool                  reused = false;
 };
 
-// Nonnegative constant/local/workgroup coefficients under the instruction's active guard.
-std::optional<std::array<uint64_t, 3>> AffineIndex(Value value, uint32_t axis, Value guard,
-                                                 uint32_t depth = 0);
-
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 // With a memo, a memoizable plan whose descriptor inputs (active sources, user data, shader base
 // and flat SRT slots) are unchanged skips descriptor evaluation and specialization.
