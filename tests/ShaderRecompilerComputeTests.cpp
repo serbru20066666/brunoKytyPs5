@@ -18898,6 +18898,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_XOR_RTN_B32:
   case Opcode::DS_WRXCHG_RTN_B32:
   case Opcode::DS_SWIZZLE_B32:
+  case Opcode::DS_PERMUTE_B32:
   case Opcode::DS_BPERMUTE_B32:
   case Opcode::DS_READ_I8:
   case Opcode::DS_READ_U8:
@@ -30339,6 +30340,88 @@ TestCase DsSwizzleInvalidSourceLaneZero() {
   return test;
 }
 
+TestCase DsPermuteCapturedExecOffsetAndWrap() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 10, 30);
+  AppendVMovLiteral(&code, 1, 0xdeadbeefu);
+  AppendVMovU32(&code, 9, 100);
+  code.push_back(EncodeVop2(0x25, 9, Vgpr(0), 9));
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeVop2(0x1b, 18, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(1), 18));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(0xdac80000u);
+  code.push_back(0x0100090au); // Captured SH2 instruction: ds_permute_b32 v1, v10, v9
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 4);
+
+  code.push_back(0xdac80000u);
+  code.push_back(0x0100090au);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 8);
+  AppendVMovU32(&code, 10, 127);
+  code.push_back(EncodeDs0(0xb2, 1));
+  code.push_back(EncodeDs1(1, 9, 10));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 12);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsPermuteCapturedExecOffsetAndWrap";
+  test.code = code;
+  test.initial = {0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  test.expected = {0, 0, 12, 4, 0xdeadbeefu, 103, 0xdeadbeefu, 0,
+                   101, 103, 0, 102, 103, 0, 0, 0};
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::V_MOV_B32,
+                  O::V_ADD_NC_U32, O::V_AND_B32, O::V_CMP_EQ_U32, O::S_MOV_B64,
+                  O::DS_PERMUTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle", "OpGroupNonUniformBallot"};
+  test.forbidden_spirv = {" Workgroup", "OpControlBarrier", "OpMemoryBarrier"};
+  test.decoded_counts = {{"DS_PERMUTE_B32", 3}};
+  test.ir_counts = {{"PermuteU32", 3}};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsPermuteWave64UsesIndependentHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 9, 100);
+  code.push_back(EncodeVop2(0x25, 9, Vgpr(0), 9));
+  code.push_back(EncodeVop2(0x1d, 10, InlineU32(31), 0));
+  code.push_back(EncodeVop2(0x1a, 10, InlineU32(2), 10));
+  code.push_back(0xdac80000u);
+  code.push_back(0x0100090au);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsPermuteWave64UsesIndependentHalves";
+  test.code = code;
+  test.initial = std::vector<u32>(64, 0);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    test.expected.push_back(100 + (lane ^ 31));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_XOR_B32, O::V_LSHLREV_B32,
+                  O::DS_PERMUTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle", "OpGroupNonUniformBallot"};
+  test.forbidden_spirv = {" Workgroup", "OpControlBarrier", "OpMemoryBarrier"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase DsBpermuteCapturedExecOffsetAndWrap() {
   using O = ShaderOpcode;
 
@@ -34338,6 +34421,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
+  AddCase(DsPermuteCapturedExecOffsetAndWrap);
+  AddCase(DsPermuteWave64UsesIndependentHalves);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(Wave64CrossHalfLaneAndLds);
@@ -39801,6 +39886,7 @@ int main(int argc, char **argv) {
     CheckWave64WholeWaveResults();
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
+    RunCase(&vulkan, DsPermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, Wave64CrossHalfLaneAndLds());
     RunCase(&vulkan, Wave64RawMasksAndScalarBranch());

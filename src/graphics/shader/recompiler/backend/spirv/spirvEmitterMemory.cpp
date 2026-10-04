@@ -1474,6 +1474,52 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
 }
 
+uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state   = ctx.state;
+	auto       lane    = EmitSubgroupLocalInvocationId(state);
+	if (state.lane_count == 2) {
+		lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31));
+	}
+	const auto address = ctx.Arg(inst, 1);
+	const auto word    = Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane,
+	                            ConstantU32(state, 5));
+	const auto ballot_word = [&](uint32_t predicate) {
+		const auto ballot = state.builder.AllocateId();
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result, ballot, word);
+		return result;
+	};
+	// RDNA2 permutes independently within each 32-lane half. Intersect the source
+	// address bit ballots to find this destination's enabled writers without LDS.
+	auto writers = ballot_word(ctx.Arg(inst, 2));
+	for (uint32_t bit = 0; bit < 5; ++bit) {
+		const auto address_bit = Binary(state, spv::OpBitwiseAnd, TypeU32(state), address,
+		                                ConstantU32(state, 1u << (bit + 2)));
+		const auto mask = ballot_word(Binary(state, spv::OpINotEqual, TypeBool(state),
+		                                      address_bit, ConstantU32(state, 0)));
+		const auto lane_bit = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane,
+		                             ConstantU32(state, 1u << bit));
+		const auto selected = Select(
+		    state, TypeU32(state),
+		    Binary(state, spv::OpINotEqual, TypeBool(state), lane_bit, ConstantU32(state, 0)),
+		    mask, Unary(state, spv::OpNot, TypeU32(state), mask));
+		writers = Binary(state, spv::OpBitwiseAnd, TypeU32(state), writers, selected);
+	}
+	const auto active = Binary(state, spv::OpINotEqual, TypeBool(state), writers,
+	                           ConstantU32(state, 0));
+	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane,
+	                         ConstantU32(state, ~31u));
+	const auto source = Select(state, TypeU32(state), active,
+	                           Binary(state, spv::OpBitwiseOr, TypeU32(state), base,
+	                                  EmitFindUMsb32(state, writers)), lane);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
+}
+
 uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto source = ctx.Arg(inst, 0);

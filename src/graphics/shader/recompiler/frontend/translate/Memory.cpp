@@ -894,9 +894,10 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 	                                ReadU32(MemorySourceAt(inst, 1)), ir.GetExec()}));
 }
 
-void Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
+void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
-	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::BpermuteU32,
+	WriteOperand(inst.dst, ir.Emit(backward ? IR::ValueOpcode::BpermuteU32
+	                                       : IR::ValueOpcode::PermuteU32,
 	                               {ReadU32(inst.src1), address, ir.GetExec()}));
 }
 
@@ -1112,7 +1113,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_MAX_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMax32);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
-		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_BPERMUTE_B32(inst);
+		case Decoder::Opcode::DS_PERMUTE_B32: return DS_PERMUTE(inst, false);
+		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_PERMUTE(inst, true);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:

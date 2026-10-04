@@ -236,6 +236,7 @@ uint32_t              EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Ins
 void                  EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSharedIncDec(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst);
