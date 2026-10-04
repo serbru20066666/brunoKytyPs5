@@ -13416,6 +13416,18 @@ public:
       RenderDepthInfo phased_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), phased_depth);
+      // PRT permits missing backing; a fully resident target keeps the same layout and image.
+      phased_depth_target.z_info.partially_resident = true;
+      phased_depth_target.stencil_info.partially_resident = true;
+      registers.SetDepthRenderTarget(phased_depth_target);
+      RenderDepthInfo resident_prt_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), resident_prt_depth);
+      Require(name, "fully resident PRT depth identity",
+              resident_prt_depth.image_id == phased_depth.image_id &&
+                  resident_prt_depth.desc.info.data == phased_depth.desc.info.data &&
+                  resident_prt_depth.desc.info.stencil == phased_depth.desc.info.stencil,
+              "PRT permission changed a fully backed depth/stencil attachment");
       auto non_texture_compatible_target = phased_depth_target;
       non_texture_compatible_target.z_info.texture_compatibility =
           Prospero::TextureCompatiblePlaneCompression::kDisable;
