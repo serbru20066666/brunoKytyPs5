@@ -31439,7 +31439,7 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
+TestCase DsFloatMinMaxIgnoresData1() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -31467,10 +31467,10 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxUsesSeparateCompareOperand";
+  test.name = "DsFloatMinMaxIgnoresData1";
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x41100000u, 0x3f800000u};
+  test.expected = {0x40800000u, 0x40800000u};
   test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -31478,6 +31478,100 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsFloatMinMaxClasses(bool gds) {
+  using O = ShaderOpcode;
+  // Rows are memory, columns source: -inf, -normal, -denorm, -0, +0,
+  // +denorm, +normal, +inf, qNaN, sNaN. O/N select old/new; Q/R quiet them.
+  constexpr std::string_view minimum[] = {
+      "OOOOOOOOOR", "NNOOOOOOOR", "NNNNOOOOOR", "NNNOOOOOOR", "NNNNOOOOOR",
+      "NNNNNNOOOR", "NNNNNNOOOR", "NNNNNNNOOR", "NNNNNNNNOR", "QQQQQQQQQQ"};
+  constexpr std::string_view maximum[] = {
+      "ONNNNNNNOR", "OONNNNNNOR", "OOOONNNNOR", "OOOONNNNOR", "OOOOONNNOR",
+      "OOOOOONNOR", "OOOOOONNOR", "OOOOOOOOOR", "NNNNNNNNOR", "QQQQQQQQQQ"};
+  constexpr u32 old_values[] = {
+      0xff800000u, 0xc0000000u, 0x80000100u, 0x80000000u, 0u,
+      0x00000100u, 0x40000000u, 0x7f800000u, 0x7fc12345u, 0x7f812345u};
+  constexpr u32 sources[] = {
+      0xff800000u, 0xc0400000u, 0x80000001u, 0x80000000u, 0u,
+      0x00000001u, 0x40400000u, 0x7f800000u, 0xffc54321u, 0xff854321u};
+  const auto select = [](char choice, u32 old, u32 source) {
+    const u32 bits = choice == 'O' || choice == 'Q' ? old : source;
+    return choice == 'Q' || choice == 'R' ? bits | 0x00400000u : bits;
+  };
+  TestCase test;
+  test.name = gds ? "DsFloatMinMaxGdsClasses" : "DsFloatMinMaxLdsClasses";
+  for (u32 row = 0; row < std::size(old_values); ++row) {
+    for (u32 column = 0; column < std::size(sources); ++column) {
+      const auto old = old_values[row];
+      const auto source = sources[column];
+      test.initial.insert(test.initial.end(), {old, source, 0u, 0u});
+      test.expected.insert(test.expected.end(),
+                           {old, source, select(minimum[row][column], old, source),
+                            select(maximum[row][column], old, source)});
+    }
+  }
+  // Reversing positive denorm magnitudes still selects source for min and old for max.
+  test.initial.insert(test.initial.end(), {1u, 0x100u, 0u, 0u});
+  test.expected.insert(test.expected.end(), {1u, 0x100u, 0x100u, 1u});
+  const auto count = static_cast<u32>(test.initial.size() / 4u);
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(3), 0));
+  code.push_back(EncodeVop2(0x1a, 8, InlineU32(4), 0));
+  code.push_back(EncodeMubuf0(0x0d));
+  code.push_back(EncodeMubuf1(2, 0, 8));
+  for (u32 offset : {0u, 4u}) {
+    code.push_back(EncodeDs0(0x0d, offset, gds));
+    code.push_back(EncodeDs1(0, 2, 1));
+  }
+  code.push_back(EncodeDs0(0x12, 0, gds));
+  code.push_back(EncodeDs1Ex(0, 250, 3, 1)); // DATA1 is unused and uninitialized.
+  code.push_back(EncodeDs0(0x13, 4, gds));
+  code.push_back(EncodeDs1Ex(0, 251, 3, 1));
+  AppendVMovLiteral(&code, 6, 0xff800000u);
+  AppendVMovLiteral(&code, 7, 0x7f800000u);
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  // Inactive updates must leave the table results untouched.
+  code.push_back(EncodeDs0(0x12, 0, gds));
+  code.push_back(EncodeDs1(0, 6, 1));
+  code.push_back(EncodeDs0(0x13, 4, gds));
+  code.push_back(EncodeDs1(0, 7, 1));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  // Active accesses immediately beyond the allocation must also be discarded.
+  AppendVMovU32(&code, 9, count * 8u);
+  code.push_back(EncodeDs0(0x12, 0, gds));
+  code.push_back(EncodeDs1(0, 6, 9));
+  code.push_back(EncodeDs0(0x13, 0, gds));
+  code.push_back(EncodeDs1(0, 7, 9));
+  for (u32 component = 0; component < 2u; ++component) {
+    code.push_back(EncodeDs0(0x36, component * 4u, gds));
+    code.push_back(EncodeDs1(4u + component, 0, 1));
+  }
+  code.push_back(EncodeMubuf0(0x1d, 8));
+  code.push_back(EncodeMubuf1(4, 12, 8));
+  AppendEnd(&code);
+  test.compute_info.threads_num[0] = count;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.lds_size_dwords = count * 2u;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::S_MOV_B64,
+                  O::BUFFER_LOAD_DWORDX2, O::DS_WRITE_B32, O::DS_MIN_F32,
+                  O::DS_MAX_F32, O::DS_READ_B32, O::BUFFER_STORE_DWORDX2,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange", "OpLoopMerge"};
+  test.forbidden_spirv = {"OpFOrdLessThan", "OpFOrdGreaterThan"};
+  if (gds) {
+    test.gds_initial.resize(count * 2u);
+    for (u32 i = 0; i < count; ++i) {
+      test.expected_gds.push_back(test.expected[i * 4u + 2u]);
+      test.expected_gds.push_back(test.expected[i * 4u + 3u]);
+    }
+  }
   return test;
 }
 
@@ -35765,7 +35859,9 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
+  AddCase(DsFloatMinMaxIgnoresData1);
+  AddCase([] { return DsFloatMinMaxClasses(false); });
+  AddCase([] { return DsFloatMinMaxClasses(true); });
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsPermuteCapturedExecOffsetAndWrap);
   AddCase(DsPermuteWave64UsesIndependentHalves);

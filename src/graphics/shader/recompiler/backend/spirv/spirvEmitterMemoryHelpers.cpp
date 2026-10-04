@@ -449,6 +449,20 @@ void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
 	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
 }
 
+namespace {
+
+uint32_t FloatOrderKey(EmitterState& state, uint32_t bits) {
+	const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
+	                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
+	const auto negative_key = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpNot, TypeU32(state), negative_key, bits);
+	const auto positive_key =
+	    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
+	return EmitSelectValueU32(state, negative, negative_key, positive_key);
+}
+
+} // namespace
+
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value) {
 	struct OrderedBits {
@@ -458,15 +472,7 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 	};
 	const auto classify = [&](uint32_t bits) {
 		const auto cls = EmitClassifyF32Bits(state, bits);
-		const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
-		                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
-		const auto negative_key = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpNot, TypeU32(state), negative_key, bits);
-		const auto positive_key =
-		    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
-		return OrderedBits {
-		    cls.nan, cls.zero,
-		    EmitSelectValueU32(state, negative, negative_key, positive_key)};
+		return OrderedBits {cls.nan, cls.zero, FloatOrderKey(state, bits)};
 	};
 	const auto source_class = classify(source);
 	const auto old_class    = classify(old);
@@ -479,6 +485,45 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 	return EmitSelectValueU32(
 	    state, EmitLogicalAndBool(state, EmitLogicalNotBool(state, unordered), compare), source,
 	    old);
+}
+
+uint32_t EmitDsFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                      bool max_value) {
+	struct OrderedBits {
+		uint32_t nan;
+		uint32_t signaling_nan;
+		uint32_t key;
+	};
+	const auto classify = [&](uint32_t bits) {
+		const auto abs = EmitAndConstant(state, bits, 0x7fffffffu);
+		const auto nan = EmitCompareU32Constant(state, spv::OpUGreaterThan, abs, 0x7f800000u);
+		const auto signaling_nan = EmitLogicalAndBool(
+		    state, nan, EmitCompareU32Constant(state, spv::OpIEqual,
+		                                      EmitAndConstant(state, bits, 0x00400000u), 0u));
+		const auto small = EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x00800000u);
+		const auto sign = EmitAndConstant(state, bits, 0x80000000u);
+		const auto positive_denorm = EmitLogicalAndBool(
+		    state, EmitCompareU32Constant(state, spv::OpIEqual, sign, 0u),
+		    EmitCompareU32Constant(state, spv::OpINotEqual, abs, 0u));
+		// Negative denorms tie with -0; positive denorms tie only with each other.
+		const auto small_bits = EmitSelectValueU32(
+		    state, positive_denorm, ConstantU32(state, 1u), sign);
+		const auto key_bits = EmitSelectValueU32(state, small, small_bits, bits);
+		return OrderedBits {nan, signaling_nan, FloatOrderKey(state, key_bits)};
+	};
+	const auto lhs = classify(old);
+	const auto rhs = classify(source);
+	const auto choose_source = state.builder.AllocateId();
+	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThanEqual,
+	                          TypeBool(state), choose_source, rhs.key, lhs.key);
+	// Keep original bits: ordering denorms does not flush the selected operand.
+	auto result = EmitSelectValueU32(state, choose_source, source, old);
+	result = EmitSelectValueU32(state, lhs.nan, source, result);
+	result = EmitSelectValueU32(state, rhs.nan, old, result);
+	result = EmitSelectValueU32(state, rhs.signaling_nan,
+	                            EmitOrU32(state, source, ConstantU32(state, 0x00400000u)), result);
+	return EmitSelectValueU32(state, lhs.signaling_nan,
+	                          EmitOrU32(state, old, ConstantU32(state, 0x00400000u)), result);
 }
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {

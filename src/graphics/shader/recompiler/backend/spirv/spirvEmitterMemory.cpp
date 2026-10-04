@@ -1268,34 +1268,10 @@ uint32_t EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem       = ctx.Memory(inst);
 	const bool  max_value = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
-	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto index = DwordIndex(ctx, inst, mem);
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		EmitIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-			    ctx.state.builder.AddFunction(spv::OpStore, ctx.scratch_u32_variable,
-			                                  ctx.Arg(inst, 1));
-			    const auto data = ctx.state.builder.AllocateId();
-			    ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), data,
-			                                  ctx.scratch_u32_variable);
-			    AtomicUpdate(
-			        ctx.state, EmitMemoryElementPointer(ctx.state, resource, index),
-			        mem.kind, [&](uint32_t old) {
-				        const auto old_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-				        const auto compare_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-				        const auto data_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-				        const auto compare = Binary(
-				            ctx.state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-				            TypeBool(ctx.state), max_value ? old_f : compare_f,
-				            max_value ? compare_f : old_f);
-				        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
-			        });
-		    });
-	});
+	EmitAtomicUpdate(ctx, inst, mem,
+	                 [max_value](EmitterState& state, uint32_t old, uint32_t value) {
+		                 return EmitDsFloatAtomicReplacement(state, old, value, max_value);
+	                 });
 }
 
 uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {

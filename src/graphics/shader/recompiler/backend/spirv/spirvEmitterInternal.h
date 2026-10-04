@@ -496,6 +496,9 @@ void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value);
 
+uint32_t EmitDsFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                      bool max_value);
+
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control);
 
 inline constexpr auto EmitSelectValueU32 =
