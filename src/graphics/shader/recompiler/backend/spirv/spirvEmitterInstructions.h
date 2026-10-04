@@ -160,8 +160,8 @@ EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
 inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
-inline constexpr auto EmitFPFma32 =
-    EmitGlsl<GLSLstd450Fma, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
+uint32_t EmitFPFma32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitFPMad32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1);
