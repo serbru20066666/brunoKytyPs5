@@ -78,6 +78,9 @@ constexpr int SCE_FONT_TEXT_PARSER_RESULT_TERMINATE = 0;
 constexpr int SCE_FONT_TEXT_PARSER_RESULT_ERROR     = -1;
 constexpr int SCE_FONT_WRITING_FORM_HORIZONTAL      = 0x10;
 constexpr int FONT_BITMAP_MAX_DIM                   = 128;
+constexpr int FONT_ERROR_INVALID_PARAMETER          = static_cast<int>(0x80460002u);
+constexpr int FONT_ERROR_INVALID_FONT_HANDLE        = static_cast<int>(0x80460005u);
+constexpr int FONT_ERROR_NO_SUPPORT_CODE            = static_cast<int>(0x80460041u);
 
 struct FontMemory {
 	uint16_t                   type;
@@ -117,6 +120,14 @@ struct FontGlyphMetrics {
 		float advance;
 	} vertical;
 };
+
+struct FontKerning {
+	float offset_x;
+	float offset_y;
+	float position_x;
+	float position_y;
+};
+static_assert(sizeof(FontKerning) == 16);
 
 struct FontRenderSurface {
 	void*   buffer;
@@ -2081,6 +2092,40 @@ int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t
 	return OK;
 }
 
+int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint32_t code,
+                                FontKerning* kerning) {
+	PRINT_NAME();
+	if (kerning == nullptr) {
+		return FONT_ERROR_INVALID_PARAMETER;
+	}
+	*kerning = {};
+	auto* font = static_cast<FontState*>(font_handle);
+	if (font == nullptr) {
+		return FONT_ERROR_INVALID_FONT_HANDLE;
+	}
+	if (pre_code == 0 || !ensure_stb_font(font)) {
+		return OK;
+	}
+	const auto glyph_index = [&](uint32_t value) {
+		if ((value & 0x80000000u) != 0) {
+			return static_cast<int>(value & 0xffffu);
+		}
+		return stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(value));
+	};
+	const int left  = glyph_index(pre_code);
+	const int right = glyph_index(code);
+	if (left <= 0 || left >= font->font_info.numGlyphs ||
+	    right <= 0 || right >= font->font_info.numGlyphs) {
+		return FONT_ERROR_NO_SUPPORT_CODE;
+	}
+	kerning->offset_x = static_cast<float>(stbtt_GetGlyphKernAdvance(&font->font_info, left, right)) *
+	                    stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	LOGF("\t handle = 0x%016" PRIx64 ", pre_code = 0x%08" PRIx32 ", code = 0x%08" PRIx32
+	     ", offset_x = %f\n", reinterpret_cast<uint64_t>(font_handle), pre_code, code,
+	     static_cast<double>(kerning->offset_x));
+	return OK;
+}
+
 int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                           FontGlyphMetrics* metrics) {
 	PRINT_NAME();
@@ -2253,6 +2298,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("FXP359ygujs", Font::FontDestroyLibrary);
 	LIB_FUNC("C-4Qw5Srlyw", Font::FontGenerateCharGlyph);
 	LIB_FUNC("L97d+3OgMlE", Font::FontGetCharGlyphMetrics);
+	LIB_FUNC("sDuhHGNhHvE", Font::FontGetKerning);
 	LIB_FUNC("IQtleGLL5pQ", Font::FontGetRenderCharGlyphMetrics);
 	LIB_FUNC("8-zmgsxkBek", Font::FontGlyphDefineAttribute);
 	LIB_FUNC("whrS4oksXc4", Font::FontMemoryInit);
