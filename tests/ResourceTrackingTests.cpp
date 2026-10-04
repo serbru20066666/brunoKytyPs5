@@ -2728,6 +2728,92 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+void TestBoundedRelativeRegisterWrites() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Bounded, BoundClobber, DescriptorClobber, EntryBypass };
+  for (const auto variant : {Variant::Bounded, Variant::BoundClobber,
+                             Variant::DescriptorClobber, Variant::EntryBypass}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    if (variant == Variant::EntryBypass) entry->AddBranch(body);
+    header->AddBranch(body);
+    header->AddBranch(exit);
+    body->AddBranch(header);
+    fixture.program.block_info[0].terminator = {
+        .kind = variant == Variant::EntryBypass ? CFG::TerminatorKind::ConditionalBranch
+                                               : CFG::TerminatorKind::Branch,
+        .true_block = 1u, .false_block = 2u};
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 2u, .false_block = 3u};
+    fixture.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+    fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto enabled = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+    fixture.program.block_info[0].condition = enabled;
+    const auto chunk = fixture.Emit(ValueOpcode::SelectU32,
+                                    {enabled, Value(64u), Value(512u)});
+    const auto initial_bound = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+                                           {chunk, Value(6u)});
+    const auto initial_records = fixture.UserData(2u);
+    const auto base = fixture.UserData(0u);
+    auto &counter = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &bound = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &records = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    const auto in_range = fixture.Emit(ValueOpcode::ULessThan32,
+                                       {Value(&counter), Value(&bound)}, 0, header);
+    fixture.program.block_info[1].condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {in_range}, CFG::BranchCondition::VccNonZero, header);
+    const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                       {Value(&counter), Value(1u)}, 0, body), Value(255u)}, 0, body);
+    const auto relative_write = [&](Value old_value, uint32_t offset) {
+      const auto selected = fixture.Emit(ValueOpcode::IEqual32,
+                                           {m0, Value(offset)}, 0, body);
+      const auto active = fixture.Emit(ValueOpcode::LogicalAnd,
+                                        {enabled, selected}, 0, body);
+      return fixture.Emit(ValueOpcode::SelectU32, {active, lane, old_value}, 0, body);
+    };
+    bound.AddPhiOperand(entry, initial_bound);
+    bound.AddPhiOperand(body, relative_write(Value(&bound),
+        variant == Variant::BoundClobber ? 14u : 22u));
+    records.AddPhiOperand(entry, initial_records);
+    records.AddPhiOperand(body, relative_write(Value(&records),
+        variant == Variant::DescriptorClobber ? 14u : 21u));
+    counter.AddPhiOperand(entry, Value(0u));
+    counter.AddPhiOperand(body, fixture.Emit(ValueOpcode::IAdd32,
+                                             {Value(&counter), Value(1u)}, 0, body));
+    const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+        {base, Value(4u << 16u), Value(&records), Value(0x16204u)},
+        MemoryFlags{0, 0x3e8}, exit);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        fixture.AddMemory(memory, 0x3e8), exit);
+    if (variant != Variant::Bounded) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "relative register proof discarded a possible loop clobber");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    const std::array<uint32_t, 3> user_data{0x1000u, 0u, 72u};
+    SrtRuntime runtime{.user_data = user_data};
+    DescriptorValue descriptor;
+    Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(
+              fixture.program.info.buffers[0].source, descriptor) &&
+              descriptor.dwords[2] == 72u,
+          "impossible relative writes left a false descriptor dependency");
+  }
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -3553,6 +3639,7 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
