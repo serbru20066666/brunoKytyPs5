@@ -1890,6 +1890,13 @@ void TestSampleAdjustSamplerScratch() {
   fixture.Emit(ValueOpcode::ImageSampleRaw,
                {image, sampler, fixture.ImageAddress()},
                fixture.AddMemory(memory, 0x1ec));
+  // PPSA24156's zero border payload leaves the reserved scratch shift as
+  // the entire DWORD after the frontend folds its OR with zero.
+  const auto shift_sampler = fixture.Sampler(
+      {Value(0x36u), Value(0xfff000u), Value(0x02500000u), scratch}, 0x200);
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, shift_sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x200));
   fixture.PlanAndTrack();
 
   const auto source = fixture.program.info.samplers[0].source;
@@ -1905,6 +1912,12 @@ void TestSampleAdjustSamplerScratch() {
   Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, descriptor) &&
             descriptor.dwords[3] == 0x80000abcu,
         "SampleAdjust canonicalization lost sampler border fields");
+  const auto shift_source = fixture.program.info.samplers[
+      shift_sampler.Instruction()->Flags<uint32_t>()].source;
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(shift_source, descriptor) &&
+            std::ranges::equal(std::span(descriptor.dwords).first(4),
+                               std::array{0x36u, 0xfff000u, 0x02500000u, 0u}),
+        "SampleAdjust shift-only scratch was not reduced to its zero border payload");
 
   const auto CheckRejected = [](uint32_t flags, uint32_t shift,
                                 const char *message) {

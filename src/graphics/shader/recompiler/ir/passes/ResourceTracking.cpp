@@ -77,6 +77,8 @@ Value CanonicalizeSampleAdjustDword3(Value value) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32) {
+			if ((PossibleU32Bits(value) & ~SamplerDword3ReservedMask) == 0)
+				return Value(0u);
 			return value;
 		}
 		const auto left           = inst->Arg(0).Resolve();
