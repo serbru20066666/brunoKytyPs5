@@ -24315,8 +24315,10 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   std::vector<u32> code;
   AppendVMovU32(&code, 5, 100);
   code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
+  code.push_back(EncodeVop1(0x01, 7, Vgpr(5)));
   AppendVMovLiteral(&code, 2, sentinel);
   AppendVMovLiteral(&code, 3, sentinel);
+  AppendVMovLiteral(&code, 8, sentinel);
   AppendSMovLiteral(&code, 126, masks[0]);
   AppendSMovLiteral(&code, 127, masks[1]);
   // Captured DPP8 selectors broadcast each group's upper/lower four lanes.
@@ -24324,6 +24326,9 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   code.push_back(0xfacfac05u);
   code.push_back(EncodeVop1(0x01, 3, 233));
   code.push_back(0x68868805u);
+  // CS 6babb2a8915d35c4, pc 0xcc: add lane 3 of each group to its own v7.
+  code.push_back(0x4a100ee9u);
+  code.push_back(0x6db6db07u);
   AppendSMovLiteral(&code, 126, 0xffffffffu);
   AppendSMovLiteral(&code, 127, 0xffffffffu);
   code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
@@ -24331,13 +24336,15 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendVMovU32(&code, 7, 64u * sizeof(u32));
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
   AppendBufferStoreDword(&code, 3, 6);
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
+  AppendBufferStoreDword(&code, 8, 6);
   AppendEnd(&code);
 
   TestCase test;
   test.name = masked_exec ? "VectorDpp8CapturedMaskedExec"
                           : "VectorDpp8Captured";
   test.code = std::move(code);
-  test.expected.resize(128, sentinel);
+  test.expected.resize(192, sentinel);
   for (u32 lane = 0; lane < 64; ++lane) {
     const auto mask = masks[lane / 32u];
     if ((mask & (1u << (lane % 32u))) == 0) {
@@ -24350,10 +24357,15 @@ TestCase VectorDpp8Captured(bool masked_exec) {
       test.expected[permutation * 64u + lane] =
           (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
     }
+    const u32 source = (lane & ~7u) | 3u;
+    test.expected[128u + lane] = 100u + lane;
+    if ((mask & (1u << (source % 32u))) != 0) {
+      test.expected[128u + lane] += 100u + source;
+    }
   }
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
                   O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{".dpp8(", 2}};
+  test.decoded_counts = {{".dpp8(", 3}};
   test.compute_info.wave_size = 64;
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
