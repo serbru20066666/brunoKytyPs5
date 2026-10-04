@@ -34432,6 +34432,15 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
               packed_clear == 0xff000000u,
           "exact Prospero runtime binding did not resolve to a complete clear");
 
+  auto narrow_exec = code;
+  narrow_exec.insert(narrow_exec.end() - 3,
+                     EncodeSop1(0x24u, 10, InlineU32(1))); // S_AND_SAVEEXEC_B64.
+  runtime_resources = Compile(narrow_exec);
+  Require("Ps5GameExampleImageClear", "guest EXEC narrowing",
+          !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
+                                    packed_clear, size),
+          "a guest predicate narrowing the store was accepted as a complete clear");
+
   auto wrong_index = code;
   wrong_index[0] = (wrong_index[0] & ~(0x3ffu << 16u)) | (0x347u << 16u);
   runtime_resources = Compile(wrong_index);
@@ -34446,6 +34455,18 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "non-uniform uint4 data was replaced with a color clear");
+  runtime_resources = positive;
+  compute.dispatch_threads_num[0] = 63;
+  Require("Ps5GameExampleImageClear", "mismatched requested extent",
+          !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
+                                    packed_clear, size),
+          "a dispatch exceeding its requested extent was classified as a complete clear");
+  runtime_resources.buffers[0].dwords[2] = 65;
+  compute.dispatch_threads_num[0] = 65;
+  Require("Ps5GameExampleImageClear", "partial final workgroup",
+          !ResolveComputeBufferFill(compute, 65, 1, 1, 0x61u, descriptor,
+                                    packed_clear, size),
+          "a nondivisible thread dispatch was classified as a complete clear");
   runtime_resources = positive;
   compute.dispatch_threads_num[0] = 32;
   Require("Ps5GameExampleImageClear", "partial dispatch",
