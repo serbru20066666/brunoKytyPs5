@@ -172,7 +172,7 @@ void Fields(Archive& a, ShaderPixelInputInfo& i) {
 	a(i.scratch_size_dwords, i.ps_pos_x, i.ps_pos_y, i.ps_pos_z, i.ps_pos_w, i.ps_front_face,
 	  i.ps_ancillary, i.ps_no_perspective, i.ps_pixel_kill_enable, i.ps_depth_export_enable,
 	  i.ps_sample_mask_export_enable, i.ps_sample_shading, i.dual_source_blending, i.ps_early_z,
-	  i.ps_execute_on_noop, i.alpha_blend_source_remap);
+	  i.ps_execute_on_noop, i.alpha_blend_source);
 }
 
 template <typename Archive>

@@ -290,7 +290,7 @@ private:
 		vk::PrimitiveTopology topology {};
 		bool                  primitive_restart = false;
 		bool                  pixel_active      = false;
-		bool                  alpha_remap       = false;
+		ShaderAlphaBlendSource alpha_source     = ShaderAlphaBlendSource::None;
 		bool                  sample_shading    = false;
 		bool                  valid             = false;
 	};

@@ -696,7 +696,7 @@ struct PipelineCache::ProgramCache {
 		const bool urgent     = wait == ProgramWait::Defer;
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		const ShaderRecompiler::IR::SrtRuntime runtime {
+		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
@@ -705,6 +705,9 @@ struct PipelineCache::ProgramCache {
 		    .specialization_block_reads = true,
 		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
 		// Refreshes a known source and returns its permutation for the refreshed specialization,
 		// if it has one yet.
 		const auto existing = [&](SourceEntry& source) -> std::optional<ShaderProgram> {
@@ -1897,7 +1900,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	    targets_kept && last.valid && m_last_graphics_pipeline != nullptr && !feedback_aspects &&
 	    last.state_serial == g_target_state_serial && last.topology == topology &&
 	    last.primitive_restart == primitive_restart_enable && last.pixel_active == ps_active &&
-	    (!ps_active || (last.alpha_remap == ps_input_info->alpha_blend_source_remap &&
+	    (!ps_active || (last.alpha_source == ps_input_info->alpha_blend_source &&
 	                    last.sample_shading == ps_input_info->ps_sample_shading)) &&
 	    !(keep_ab && AbFeatureOff())) {
 		const auto& key  = m_last_graphics_key;
@@ -2109,7 +2112,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	                          .topology          = topology,
 	                          .primitive_restart = primitive_restart_enable,
 	                          .pixel_active      = ps_active,
-	                          .alpha_remap = ps_active && ps_input_info->alpha_blend_source_remap,
+	                          .alpha_source = ps_active ? ps_input_info->alpha_blend_source
+	                                                    : ShaderAlphaBlendSource::None,
 	                          .sample_shading = ps_active && ps_input_info->ps_sample_shading,
 	                          .valid          = found != nullptr && found == m_last_graphics_pipeline};
 	if (found != nullptr) {

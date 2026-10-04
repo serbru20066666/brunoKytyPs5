@@ -26,6 +26,7 @@ struct SrtRuntime {
 	// Optional: reads an aligned, nonzero 64-byte block for read_memory (with userdata) only when
 	// reading each of its dwords with read_memory would give the same values; false otherwise.
 	SrtMemoryReader           read_memory_block          = nullptr;
+	std::span<const uint32_t> workgroup_counts;
 };
 
 [[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {

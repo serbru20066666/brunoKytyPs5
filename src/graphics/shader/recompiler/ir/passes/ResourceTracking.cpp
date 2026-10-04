@@ -834,7 +834,8 @@ private:
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.selector_shift != b.selector_shift ||
-				    a.table_offset != b.table_offset || a.sources != b.sources ||
+				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
+				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1010,7 +1011,17 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t shift = 5u) const {
+	uint32_t WorkgroupAxis(Value key) const {
+		const auto* builtin = key.Resolve().TryInstruction();
+		uint32_t axis = UINT32_MAX;
+		if (m_program.stage != ShaderType::Compute || builtin == nullptr ||
+		    builtin->GetOpcode() != ValueOpcode::GetBuiltin || builtin->NumArgs() != 2u ||
+		    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
+		    !ImmediateU32(builtin->Arg(1), axis) || axis >= 3u) return UINT32_MAX;
+		return axis;
+	}
+
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
 		offset = 0;
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
@@ -1019,9 +1030,16 @@ private:
 			}
 			uint32_t immediate;
 			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
-			    ImmediateU32(inst->Arg(1), immediate) && immediate == shift) {
+			    ImmediateU32(inst->Arg(1), immediate) && immediate < 32u) {
 				key = inst->Arg(0).Resolve();
+				stride = 1u << immediate;
 				return key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() == ValueOpcode::IMul32) {
+				if (ImmediateU32(inst->Arg(0), stride)) key = inst->Arg(1).Resolve();
+				else if (ImmediateU32(inst->Arg(1), stride)) key = inst->Arg(0).Resolve();
+				else return false;
+				return stride != 0u && key.GetType() == Type::U32;
 			}
 			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
 				return false;
@@ -1563,7 +1581,8 @@ private:
 
 	bool MatchDescriptorTable(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan,
-	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset) {
+	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset,
+	                          uint32_t& table_stride) {
 		Inst* table_handle = nullptr;
 		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
 			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
@@ -1579,6 +1598,7 @@ private:
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
 			uint32_t offset = 0;
+			uint32_t stride = 0;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1586,7 +1606,7 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, handle.NumArgs() == 4u ? 4u : 5u) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
@@ -1594,12 +1614,14 @@ private:
 			if (dword == 0u) {
 				key = current_key;
 				table_offset = offset;
-			} else if (!EquivalentValue(m_program, key, current_key) ||
+				table_stride = stride;
+			} else if (table_stride != stride || !EquivalentValue(m_program, key, current_key) ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
 			table_handle = current_handle;
-			if (handle.NumArgs() == 8u ? !UsesOnlyImageDescriptors(*read) :
+			if (handle.NumArgs() == 8u
+			        ? WorkgroupAxis(key) == UINT32_MAX && !UsesOnlyImageDescriptors(*read) :
 			    std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
@@ -1654,11 +1676,21 @@ private:
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
-		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset)) return false;
+		uint32_t table_stride = 0;
+		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
+		                          table_stride)) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
-		if (table_source.dword_count == 2u) {
+		indirect.table_stride = table_stride;
+		indirect.workgroup_axis = WorkgroupAxis(key);
+		if (indirect.workgroup_axis != UINT32_MAX) {
+			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
+			// only the image handle is projected onto the bounded workgroup key.
+			plan.reads.fill(nullptr);
+		} else if (table_stride != 32u) {
+			return false;
+		} else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -1733,7 +1765,9 @@ private:
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
-		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset) ||
+		uint32_t table_stride = 0;
+		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
+		                          table_stride) || table_stride != 16u ||
 		    table_source.dword_count != 4u || table_offset != 0u) return false;
 		const auto* lane_read = key.Resolve().TryInstruction();
 		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
@@ -1763,6 +1797,7 @@ private:
 		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4))) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
+		indirect.table_stride = table_stride;
 		if (!MakeRuntimeTableSource(*read, material_source) ||
 		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
 		indirect.material_source = InternSource(material_source);

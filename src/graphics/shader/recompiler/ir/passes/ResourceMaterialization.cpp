@@ -317,12 +317,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		if (indirect.material_source == UINT32_MAX) {
 			uint32_t key_count = 0;
-			const bool evaluated = clean.Evaluate(roots.KeyCount(source_index), key_count);
-			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
-			if (table_value.dword_count != 2u || !evaluated ||
-			    key_count > MaxIndirectDescriptorProbes ||
-			    uint64_t {indirect.table_offset} + uint64_t {key_count} * descriptor_bytes >
-			        UINT32_MAX + 1ull) {
+			if (indirect.workgroup_axis != UINT32_MAX) {
+				if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
+				key_count = runtime.workgroup_counts[indirect.workgroup_axis];
+				if (key_count == 0u) return false;
+			} else {
+				if (table_value.dword_count != 2u || !clean.Evaluate(roots.KeyCount(source_index), key_count))
+					return false;
+				if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
+			}
+			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
+			    (key_count != 0u && uint64_t {indirect.table_offset} +
+			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
+			             UINT32_MAX + 1ull)) {
 				return false;
 			}
 			keys.resize(key_count);
@@ -408,7 +415,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		candidate.dword_count = dword_count;
 		if (sources.empty()) {
 			const auto table_offset =
-			    static_cast<uint32_t>(key * descriptor_bytes) + indirect.table_offset;
+			    static_cast<uint32_t>(key * indirect.table_stride) + indirect.table_offset;
 			if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 			                     std::span(candidate.dwords).first(dword_count))) {
 				return false;
