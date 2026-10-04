@@ -127,6 +127,11 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   const auto image1 = AddSource(8);
   const auto sampler0 = AddSource(4);
   const auto sampler1 = AddSource(4);
+  program.descriptor_sources[image1].dwords[0] = Value(1u);
+  program.descriptor_sources[image1].dwords[1] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k11_11_10UInt) << 20u);
+  program.descriptor_sources[image1].dwords[3] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   for (uint32_t index = 0; index < 2; ++index) {
     auto &value = block.AppendNewInst(
         ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
@@ -143,9 +148,7 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
        .resource_class = ImageResourceClass::Sampled,
        .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
        .dimension =
-           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
-       .conversion_format =
-           Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm});
+           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
   program.info.samplers.push_back({.source = sampler0});
   program.info.samplers.push_back({.source = sampler1});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
