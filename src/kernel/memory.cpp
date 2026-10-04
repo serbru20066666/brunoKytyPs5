@@ -931,12 +931,15 @@ bool BackingContains(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingContains(vaddr, size);
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadGpuBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
+		}
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			buffers.ReadMemory(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
@@ -950,7 +953,7 @@ void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 	if (size != 0 && g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread()) {
 		const auto& buffers = GetGpuResources().GetBufferCache();
 		if ((buffers.IsPageGpuDirtyHint(vaddr) || buffers.IsPageGpuDirtyHint(vaddr + size - 1)) &&
-		    IsGpuAddressRange(vaddr, size) && TryReadGpuCleanBacking(vaddr, data, size)) {
+		    IsGpuAddressRange(vaddr, size) && TryReadGpuBacking(vaddr, data, size)) {
 			return;
 		}
 	}

@@ -129,7 +129,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	       Libs::LibKernel::Memory::TryReadGpuBacking(address, values.data(), values.size_bytes());
 }
 
 // Per-draw resource tables can share a tracker page with GPU-written data, which protects the
@@ -690,7 +690,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
 		    .read_specialization_memory = ReadShaderGuestMemory,
-		    // TryReadGpuCleanBacking fails for a range when any byte is GPU-dirty or unbacked.
+		    // TryReadGpuBacking fails for a range when any byte is GPU-dirty or unbacked.
 		    .specialization_block_reads = true,
 		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
 		};

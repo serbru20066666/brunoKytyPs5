@@ -10195,7 +10195,15 @@ public:
     consumer.push_back(EncodeMubuf0(0x1cu));
     consumer.push_back(EncodeMubuf1(2, 0, 1));
     AppendEnd(&consumer);
-    for (const auto *code : {&writer, &consumer}) {
+    std::vector<u32> counted_consumer{
+        EncodeMubuf0(0x0cu, 0, false, false), EncodeMubuf1(3, 1, 0),
+        EncodeSopp(0x0c, 0), EncodeVop1(0x02, 2, Vgpr(3))};
+    AppendVop3(&counted_consumer, 0x346u, 1, 8, InlineU32(2), Vgpr(0));
+    counted_consumer.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    counted_consumer.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+    counted_consumer.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&counted_consumer);
+    for (const auto *code : {&writer, &consumer, &counted_consumer}) {
       ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
           {.type = Prospero::ShaderBinaryType::kCs,
            .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
@@ -10233,10 +10241,11 @@ public:
       auto &cache = context.GetBufferCache();
       auto &shaders = processor.GetShCtx();
       context.MapMemory(base, allocation_size);
-      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 records, u32 stride = 0) {
         ShaderBufferResource descriptor{};
         descriptor.UpdateAddress48(address);
-        descriptor.fields[2] = bytes;
+        descriptor.fields[1] |= stride << 16u;
+        descriptor.fields[2] = records;
         descriptor.fields[3] = DstSel(4, 5, 6, 7) |
             (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
         for (u32 i = 0; i < 4; i++) {
@@ -10316,6 +10325,63 @@ public:
           Require(name, "indirect invocation coverage", actual[i] == expected,
                   "case " + std::to_string(index) + " word " + std::to_string(i) +
                       " expected " + Hex(expected) + ", got " + Hex(actual[i]));
+        }
+      }
+      // The same GPU-written DWORD supplies indirect X and the output descriptor's
+      // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
+      constexpr auto count_args = base + cases.size() * case_size;
+      constexpr auto count_output = count_args + 2u * BufferCache::CACHING_PAGESIZE;
+      ShaderProgram previous_program;
+      for (const auto count : {3u, 7u}) {
+        cache.FillBuffer(count_output, 16u * sizeof(u32), sentinel, false);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 15});
+        for (u32 i = 0; i < 3; i++) {
+          set_buffer(i * 4u, count_args + i * 4u, 4);
+          shaders.SetCsUserSgpr(12u + i, i == 0 ? count : 1u,
+                               HW::UserSgprType::Unknown);
+        }
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        Require(name, "GPU-owned descriptor count", cache.HasGpuDirtyBytes(count_args, 4),
+                "the descriptor count was already visible to the CPU");
+
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(counted_consumer.data()),
+                             .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, count_output, 0, 4);
+        set_buffer(4, count_args, 1, 4);
+        const std::array<u32, 3> packet{static_cast<u32>(count_args),
+                                      static_cast<u32>(count_args >> 32u), 0x41u};
+        const auto dirty_tick = scheduler.CurrentTick();
+        Require(name, "GPU count indirect dispatch",
+                CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
+                    scheduler.CurrentTick() > dirty_tick &&
+                    !cache.HasGpuDirtyBytes(count_args, 4),
+                "the descriptor dependency did not synchronize its preceding GPU writer");
+        const auto clean_tick = scheduler.CurrentTick();
+        ShaderComputeInputInfo input{};
+        const auto program = context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        if (previous_program.id != 0) {
+          Require(name, "count permutation reuse", program.id == previous_program.id,
+                  "a changing GPU count compiled a new shader permutation");
+        }
+        previous_program = program;
+        Require(name, "clean count repeat",
+                CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
+                    scheduler.CurrentTick() == clean_tick,
+                "a clean descriptor dependency caused another GPU drain");
+        cache.ReadMemory(count_output, 16u * sizeof(u32));
+        std::array<u32, 16> actual{};
+        Require(name, "counted output readback",
+                LibKernel::Memory::TryReadBacking(count_output, actual.data(), sizeof(actual)),
+                "the counted consumer output could not be read back");
+        for (u32 i = 0; i < actual.size(); i++) {
+          Require(name, "native descriptor count bound",
+                  actual[i] == (i < count ? i + 1u : sentinel),
+                  "GPU count " + std::to_string(count) + " wrote an incorrect output word " +
+                      std::to_string(i));
         }
       }
       context.UnmapMemory(base, allocation_size);
