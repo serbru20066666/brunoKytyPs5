@@ -12250,7 +12250,7 @@ public:
         constexpr uint64_t buffer_address = base + allocation_size - 0x5000;
         ShaderBufferResource buffer_descriptor{};
         buffer_descriptor.UpdateAddress48(buffer_address);
-        buffer_descriptor.fields[2] = 0x8000;
+        buffer_descriptor.fields[2] = 0x40000000; // Only oversized descriptors are clamped.
         ShaderRecompiler::IR::ResourceSnapshot buffer_snapshot;
         ShaderStageRuntime buffer_runtime{&buffer_program, &buffer_snapshot};
         auto &value = buffer_snapshot.buffers.emplace_back();
@@ -12385,6 +12385,47 @@ public:
                 ReadBuffer(name, output, 2) == std::vector<u32>{expected, expected},
                 "an alias replacement retired image contents before queued GPU reads");
         DestroyBuffer(&output);
+      }
+
+      for (const bool volume_first : {false, true}) {
+        // PPSA24156 shares a six-face R8 allocation with a smaller 3D placeholder.
+        const auto address = base + 0xe30000 + volume_first * 0x10000;
+        auto array_desc = MakeLinearDesc(address, 1536, vk::Format::eR8Unorm,
+            Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
+            {1, 1, 1}, 6, 1, 1);
+        array_desc.info.pitch = 256;
+        array_desc.info.mip_layout[0] = {0, 1536, 256, 1};
+        auto volume_desc = array_desc;
+        volume_desc.info.type = Prospero::ImageType::kColor3D;
+        volume_desc.info.data.size = 256;
+        volume_desc.info.resources.layers = 1;
+        volume_desc.info.mip_layout[0].size = 256;
+        volume_desc.view_info.type = vk::ImageViewType::e3D;
+        volume_desc.view_info.layer_count = 1;
+        const auto first_id = texture_cache.FindImage(volume_first ? volume_desc : array_desc);
+        const auto second_id = texture_cache.FindImage(volume_first ? array_desc : volume_desc);
+        const auto array_id = volume_first ? second_id : first_id;
+        const auto volume_id = volume_first ? first_id : second_id;
+        Require(name, "smaller volume native image", volume_id != array_id &&
+                    texture_cache.GetImage(volume_id).backing.image_type == vk::ImageType::e3D,
+                "a smaller 3D descriptor reused the six-layer 2D owner");
+        (void)texture_cache.FindTexture(array_id, array_desc);
+        (void)texture_cache.FindTexture(volume_id, volume_desc);
+        Require(name, "retained dimensional aliases",
+                texture_cache.FindImage(array_desc) == array_id &&
+                    texture_cache.FindImage(volume_desc) == volume_id &&
+                    texture_cache.GetImage(array_id).info.resources.layers == 6,
+                "dimensional alias lookup discarded the array owner or lost its faces");
+        auto subarray_desc = array_desc;
+        subarray_desc.info.data.size = 1280;
+        subarray_desc.info.resources.layers = 5;
+        subarray_desc.info.mip_layout[0].size = 1280;
+        subarray_desc.view_info.layer_count = 5;
+        const auto subarray_id = texture_cache.FindImage(subarray_desc);
+        Require(name, "preserved dimensional overlap selection", subarray_id == array_id &&
+                    texture_cache.GetImage(array_id).info.resources.layers == 6,
+                "a smaller volume alias displaced the selected array owner");
+        (void)texture_cache.FindTexture(subarray_id, subarray_desc);
       }
 
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
