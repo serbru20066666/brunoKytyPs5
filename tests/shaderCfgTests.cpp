@@ -12933,6 +12933,9 @@ void TestBlendMappingClassification() {
       static_cast<uint8_t>(Factor::kOneMinusSrcAlpha);
   Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlphaOne,
         "separate alpha accumulation did not preserve its unit source factor");
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kZero);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlphaZero,
+        "separate alpha attenuation did not preserve its zero source factor");
   blend.alpha_srcblend = blend.color_srcblend;
   Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlpha,
         "equal separate alpha equations did not reuse the broadcast alpha mode");
@@ -12943,7 +12946,7 @@ void TestBlendMappingClassification() {
     switch (changed) {
       case 0: blend.color_srcblend = static_cast<uint8_t>(Factor::kZero); break;
       case 1: blend.color_destblend = static_cast<uint8_t>(Factor::kOne); break;
-      case 2: blend.alpha_srcblend = static_cast<uint8_t>(Factor::kZero); break;
+      case 2: blend.alpha_srcblend = static_cast<uint8_t>(Factor::kDstAlpha); break;
       case 3: blend.alpha_destblend = static_cast<uint8_t>(Factor::kOne); break;
       case 4: blend.color_comb_fcn = static_cast<uint8_t>(Prospero::BlendOp::kSubtract); break;
       case 5: blend.alpha_comb_fcn = static_cast<uint8_t>(Prospero::BlendOp::kSubtract); break;
@@ -12964,9 +12967,13 @@ void TestLogicalAlphaBlendExport() {
   const auto remapped_key = MakeStageStaticKey(pixel);
   pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
   const auto separate_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
+  const auto zero_key = MakeStageStaticKey(pixel);
   Check(ordinary_key != guest_key && guest_key != remapped_key &&
             ordinary_key != remapped_key && separate_key != ordinary_key &&
-            separate_key != guest_key && separate_key != remapped_key,
+            separate_key != guest_key && separate_key != remapped_key &&
+            zero_key != ordinary_key && zero_key != guest_key &&
+            zero_key != remapped_key && zero_key != separate_key,
         "ordinary, guest dual-source, and logical-alpha modes share a cache key");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);

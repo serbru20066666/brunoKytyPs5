@@ -16446,7 +16446,7 @@ public:
               "wave32 and wave64 pixel programs shared a cache key");
 
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
-      // unit source factor when alpha accumulates as Sa + Da * (1 - Sa).
+      // zero or unit source factor for separate alpha attenuation or accumulation.
       static const auto blend_pixel = [] {
         std::vector<u32> code;
         constexpr std::array<float, 4> source{0.8f, 0.6f, 0.4f, 0.5f};
@@ -16487,7 +16487,8 @@ public:
       for (const auto test : {
           AlphaBlendCase{false, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
           AlphaBlendCase{true, Prospero::BlendFactor::kSrcAlpha, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
-          AlphaBlendCase{true, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlphaOne, 0.65f}}) {
+          AlphaBlendCase{true, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlphaOne, 0.65f},
+          AlphaBlendCase{true, Prospero::BlendFactor::kZero, ShaderAlphaBlendSource::SourceAlphaZero, 0.15f}}) {
         alpha_blend.separate_alpha_blend = test.separate;
         alpha_blend.alpha_srcblend = static_cast<uint8_t>(test.alpha_source);
         registers.SetBlendControl(0, alpha_blend);

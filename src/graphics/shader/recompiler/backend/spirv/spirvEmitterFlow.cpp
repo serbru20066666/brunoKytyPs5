@@ -512,14 +512,23 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				auto alpha = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
 				                          3u, 3u, 3u, 3u);
-				if (state.input_info.pixel->alpha_blend_source ==
-				    ShaderAlphaBlendSource::SourceAlphaOne) {
+				uint32_t alpha_factor = 0;
+				switch (state.input_info.pixel->alpha_blend_source) {
+					case ShaderAlphaBlendSource::SourceAlphaOne:
+						alpha_factor = ConstantF32Value(state, 1.0f);
+						break;
+					case ShaderAlphaBlendSource::SourceAlphaZero:
+						alpha_factor = ConstantF32Value(state, 0.0f);
+						break;
+					default: break;
+				}
+				if (alpha_factor != 0) {
 					const auto mapping = state.input_info.pixel->target_export_mapping[0];
 					for (uint32_t component = 0; component < 4; component++) {
 						if (mapping.Map(component) != 3u) continue;
 						const auto factors = state.builder.AllocateId();
 						state.builder.AddFunction(spv::OpCompositeInsert, vector_type, factors,
-						                          ConstantF32Value(state, 1.0f), alpha, component);
+						                          alpha_factor, alpha, component);
 						alpha = factors;
 						break;
 					}
