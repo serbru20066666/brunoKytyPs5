@@ -9335,6 +9335,8 @@ public:
               total.size >= 8 && total.size <= allocation_size,
               "BGRA16 tiled layout exceeds its guest allocation");
       std::memset(mapped, 0x5a, total.size);
+      constexpr std::array<uint16_t, 4> initial{0x3c00u, 0x4000u, 0x4200u, 0x4400u};
+      std::memcpy(mapped, initial.data(), sizeof(initial));
 
       ImageDesc desc{};
       desc.type = BindingType::RenderTarget;
@@ -9357,6 +9359,11 @@ public:
 
       auto &cache = resources.GetTextureCache();
       const auto id = cache.FindImage(desc);
+      (void)cache.FindRenderTarget(id, desc);
+      Require(name, "tiled BGRA16 upload",
+              ReadCachedTexel(name, context, id) ==
+                  std::vector<u32>{0x40004200u, 0x44003c00u},
+              "fused detiling lost the BGRA16 component transform");
       auto &image = cache.GetImage(id);
       image.Transit(vk::ImageLayout::eTransferDstOptimal,
                     vk::AccessFlagBits2::eTransferWrite, {},
@@ -11083,6 +11090,15 @@ public:
             target.format == vk::Format::eR5G5B5A1UnormPack16 &&
                 target.export_mapping == Prospero::ColorMappingAbgr,
             "shared format resolution changed the existing 1555 render target");
+    for (const auto native : {target, TextureGetRenderTargetFormat(
+             Prospero::ChannelLayout::k8, Prospero::ChannelType::kSNorm,
+             Prospero::ChannelOrder::kStandard)}) {
+      const auto upload = TextureCalcUploadLayout(native.guest_format, 4, 1, 1, 1,
+          Prospero::TileMode::kLinear, 256, false, name);
+      Require(name, "render-target guest upload layout",
+              upload.pitch * native.bytes_per_element == 256 && upload.mips[0].size == 256,
+              "retaining the render-target format lost its physical byte width");
+    }
     EnsureRuntimeContext();
     int64_t direct_offset = -1;
     Require(name, "allocation",
@@ -11169,6 +11185,134 @@ public:
       }
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    for (const auto tile : {Prospero::TileMode::kLinear, Prospero::TileMode::kRenderTarget}) {
+      constexpr std::array<u32, 4> words{0x883005e1u, 0x7c0e81c0u,
+                                         0x800f0000u, 0x98120280u};
+      constexpr std::array<std::array<float, 4>, 4> channels{{
+          {1.03125f, 2.03125f, 4.0625f, 1.f}, {0.5f, 0.75f, 1.5f, 1.f},
+          {0.f, 1.f, 2.f, 1.f}, {32.f, 8.f, 16.f, 1.f}}};
+      const auto target = TextureGetRenderTargetFormat(
+          Prospero::ChannelLayout::k10_11_11, Prospero::ChannelType::kFloat,
+          Prospero::ChannelOrder::kReversed);
+      Require(name, "10_11_11 reversed render target",
+              target.format == vk::Format::eB10G11R11UfloatPack32 &&
+                  target.guest_format == Prospero::BufferFormat::k10_11_11Float &&
+                  target.export_mapping == Prospero::ColorMappingRgba,
+              "PPSA24156 reversed packed-float target lost its physical encoding");
+      std::memset(mapped, 0, allocation_size);
+      std::array<u32, 4> offsets{0, 4, 8, 12};
+      if (tile == Prospero::TileMode::kRenderTarget) {
+        TileBlockLayout block{};
+        u32 block_xor = 0;
+        Require(name, "10_11_11 tile layout",
+                TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, 4, block) &&
+                    TileGetBlockXor(block, 0, 0, 0, block_xor),
+                "packed-float render-target layout is unavailable");
+        for (u32 pixel = 0; pixel < words.size(); ++pixel) {
+          Require(name, "10_11_11 tile offset",
+                  TileGetBlockOffset(block, pixel, 0, 0, offsets[pixel]),
+                  "packed-float texel offset is unavailable");
+          offsets[pixel] ^= block_xor;
+        }
+      }
+      for (u32 pixel = 0; pixel < words.size(); ++pixel) {
+        std::memcpy(static_cast<uint8_t *>(mapped) + offsets[pixel], &words[pixel], sizeof(u32));
+      }
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      constexpr u32 swizzle = DstSel(4, 5, 6, 1);
+      ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k10_11_11Float) << 20u) |
+              (3u << 30u), 0,
+          swizzle | (static_cast<u32>(tile) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      TestCase test;
+      test.name = name;
+      test.has_user_data = true;
+      test.image_descriptor_swizzle = swizzle;
+      std::copy_n(descriptor.fields, 8, test.user_data.begin());
+      test.user_data[50] = 16 * sizeof(u32);
+      for (u32 pixel = 0; pixel < words.size(); ++pixel) {
+        AppendVMovU32(&test.code, 20, pixel);
+        AppendVMovU32(&test.code, 21, 0);
+        test.code.push_back(EncodeMimg0(0x00, 0xf));
+        test.code.push_back(EncodeMimg1(0, 20));
+        for (u32 channel = 0; channel < 4; ++channel) {
+          AppendStoreVgpr(&test.code, channel, pixel * 4 + channel);
+          test.expected.push_back(std::bit_cast<u32>(channels[pixel][channel]));
+        }
+      }
+      AppendEnd(&test.code);
+      const auto compiled = CompileCase(test, SubgroupSize());
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images.at(0), value);
+      Image sampled;
+      sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+      sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
+      scheduler.Finish();
+      auto output = CreateStorageBuffer(name, {}, 16);
+      Dispatch(test, compiled, output, nullptr, &sampled);
+      Require(name, "10_11_11 uploaded components",
+              ReadBuffer(name, output, 16) == test.expected,
+              "packed-float upload or sample changed a component's width or order");
+      DestroyBuffer(&output);
+
+      const auto clear = [&](std::array<float, 4> channels) {
+        auto &native = cache.GetImage(binding.image_id);
+        native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                       vk::AccessFlagBits2::eTransferWrite, {},
+                       scheduler.Current().Handle());
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(native.backing.image,
+            vk::ImageLayout::eTransferDstOptimal, vk::ClearColorValue{channels}, range);
+        cache.MarkGpuWritten(binding.image_id);
+      };
+      clear({8.f, 4.f, 2.f, 1.f});
+      Require(name, "10_11_11 guest download",
+              TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+              "packed-float native contents could not be downloaded");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::array<u32, 4> guest{};
+      for (u32 pixel = 0; pixel < words.size(); ++pixel) {
+        Require(name, "10_11_11 guest texel",
+                Libs::LibKernel::Memory::TryReadBacking(base + offsets[pixel],
+                                                        &guest[pixel], sizeof(u32)),
+                "packed-float guest texel is inaccessible");
+      }
+      Require(name, "10_11_11 exact guest words",
+              guest == std::array<u32, 4>{0x90110200u, 0x90110200u, 0x90110200u, 0x90110200u},
+              "native packed-float write lost the guest 10/11/11 bit layout");
+
+      clear({16.f, 8.f, 4.f, 1.f});
+      auto alias_desc = binding.desc;
+      alias_desc.info.guest_format = Prospero::BufferFormat::k11_11_10Float;
+      alias_desc.view_info.mapping = {};
+      Require(name, "same-format transform compatibility",
+              !alias_desc.info.IsCompatible(binding.desc.info),
+              "equal Vulkan formats hid incompatible guest color transforms");
+      const auto alias = cache.FindImage(alias_desc);
+      (void)cache.FindTexture(alias, alias_desc);
+      Require(name, "same-format transformed alias",
+              alias != binding.image_id &&
+                  ReadCachedTexel(name, context, alias, {}, {4, 1, 1}) ==
+                      std::vector<u32>(4, 0x98120220u),
+              "packed-float alias reused a transformed image or bypassed guest bytes");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
     Require(name, "release",
@@ -16703,13 +16847,16 @@ public:
     };
     // Keep all four conversions in flight to check growth, overwrite ordering,
     // the requested span on reuse, and two simultaneously live workspaces.
-    const auto first = tile_manager.SwapBgra16({scratch_input.buffer, 0, 8});
+    const auto first = tile_manager.TransformColor(
+        {scratch_input.buffer, 0, 8}, ColorTransform::SwapBgra16, true);
     copy_scratch(first, 0);
-    const auto grown = tile_manager.SwapBgra16({scratch_input.buffer, 0, 32});
+    const auto grown = tile_manager.TransformColor(
+        {scratch_input.buffer, 0, 32}, ColorTransform::SwapBgra16, true);
     copy_scratch(grown, 8);
-    const auto reused = tile_manager.SwapBgra16({scratch_input.buffer, 8, 8});
+    const auto reused = tile_manager.TransformColor(
+        {scratch_input.buffer, 8, 8}, ColorTransform::SwapBgra16, true);
     copy_scratch(reused, 40);
-    const auto paired = tile_manager.SwapBgra16(reused);
+    const auto paired = tile_manager.TransformColor(reused, ColorTransform::SwapBgra16, true);
     copy_scratch(paired, 48);
     Require(name, "scratch workspace reuse",
             first.buffer != grown.buffer && grown.buffer == reused.buffer &&
@@ -36461,7 +36608,9 @@ void CheckImageTransitionState(RenderContext &renderer) {
                          buffered_upload_offset, buffered_expected.size());
   Buffer copy_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                       16);
-  buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch);
+  StreamBuffer copy_parameters(context, scheduler, MemoryUsage::Stream, 4096);
+  TileManager copy_tiler(context, scheduler, copy_parameters);
+  buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch, copy_tiler);
   const auto [buffered_download_data, buffered_download_offset] =
       download.Map(buffered_expected.size(), 4);
   Require(name, "buffered-copy download map", buffered_download_data != nullptr,
@@ -40366,6 +40515,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();
+    vulkan.CheckBgra16Readback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
     RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
     return 0;
@@ -40863,6 +41013,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
+    VulkanHarness vulkan;
+    CheckImageTransitionState(vulkan.RuntimeRenderer());
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
@@ -40883,11 +41038,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledColorViews();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
-    VulkanHarness vulkan;
-    CheckImageTransitionState(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
