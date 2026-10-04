@@ -34501,6 +34501,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(FlatStackApertures(32));
   cases.push_back(FlatStackApertures(64));
   cases.push_back(BvhIntersections(true, true, 1));
+  cases.push_back(BvhIntersections(true, true, 0, true));
   for (bool barycentrics : {false, true}) {
     for (bool sorted : {false, true}) {
       cases.push_back(BvhIntersections(barycentrics, sorted));
@@ -39968,6 +39969,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatStackApertures(32));
     RunCase(&vulkan, FlatStackApertures(64));
     RunCase(&vulkan, BvhIntersections(true, true, 1));
+    RunCase(&vulkan, BvhIntersections(true, true, 0, true));
     for (bool barycentrics : {false, true}) {
       for (bool sorted : {false, true}) {
         RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
