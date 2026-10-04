@@ -20938,10 +20938,13 @@ TestCase ScalarMaskHighWriteInvalidatesProvenance() {
            O::S_ENDPGM}};
 }
 
-TestCase ScalarSelectB64PreservesMaskProvenance() {
+TestCase ScalarSelectB64PreservesMaskProvenance(u32 wave_size) {
   using O = ShaderOpcode;
 
-  std::vector<u32> code;
+  TestCase test;
+  test.name = wave_size == 32 ? "ScalarSelectB64PreservesMaskProvenanceWave32"
+                              : "ScalarSelectB64PreservesMaskProvenanceWave64";
+  auto &code = test.code;
   const auto set_scc = [&] {
     code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
   };
@@ -20958,24 +20961,53 @@ TestCase ScalarSelectB64PreservesMaskProvenance() {
   code.push_back(EncodeSop1(0x08, 6, 4));
   capture_scc(8);
 
-  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0)); // Only lane zero is set.
   code.push_back(EncodeSop1(0x04, 10, 106));
   set_scc();
   code.push_back(EncodeSop2(0x0b, 12, 10, 2));
   code.push_back(EncodeSop1(0x08, 14, 12));
   capture_scc(16);
 
-  AppendStoreSgpr(&code, 8, 0);
-  AppendStoreSgpr(&code, 16, 1);
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 16, 0, wave_size);
+  test.expected.assign(2u * wave_size, 1u);
+  code.push_back(EncodeSop1(0x04, 16, 126)); // Save full EXEC.
+  AppendVMovU32(&code, 2, 9);
+  constexpr std::array<uint32_t, 4> words{
+      0x5aa55aa5u, 0xc39ac39au, 0xa55aa55au, 0x3c653c65u};
+  for (u32 i = 0; i < words.size(); ++i) AppendSMovLiteral(&code, i, words[i]);
+  for (const u32 destination : {106u, 126u}) {
+    for (const u32 scc : {0u, 1u}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(scc), InlineU32(1)));
+      code.push_back(EncodeSop2(0x0b, destination, 0, 2));
+      code.push_back(EncodeSop1(0x04, 8, destination)); // Preserve both raw words.
+      code.push_back(EncodeSop1(0x04, 126, destination));
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0,
+                                      static_cast<u32>(test.expected.size()));
+      const u32 selected = scc ? 0u : 2u;
+      for (u32 lane = 0; lane < wave_size; ++lane)
+        test.expected.push_back((words[selected + lane / 32u] >> (lane & 31u)) & 1u
+                                    ? 9u : 0xdeadbeefu);
+      code.push_back(EncodeSop1(0x04, 126, 16));
+      for (u32 component = 0; component < 2; ++component) {
+        AppendStoreSgprAtLaneDwordOffset(&code, 8 + component, 0,
+                                        static_cast<u32>(test.expected.size()));
+        test.expected.insert(test.expected.end(), wave_size, words[selected + component]);
+      }
+    }
+  }
   AppendEnd(&code);
 
-  return {"ScalarSelectB64PreservesMaskProvenance",
-          code,
-          {},
-          {1, 1},
-          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B64, O::S_NOT_B64,
-           O::S_CSELECT_B32, O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.initial.assign(test.expected.size(), 0xdeadbeefu);
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B64, O::S_NOT_B64,
+                  O::S_CSELECT_B32, O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase ScalarWqmB32Masks(u32 wave_size) {
@@ -34320,7 +34352,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
   AddCase(ScalarMaskHighWriteInvalidatesProvenance);
-  AddCase(ScalarSelectB64PreservesMaskProvenance);
+  cases.push_back(ScalarSelectB64PreservesMaskProvenance(32));
+  cases.push_back(ScalarSelectB64PreservesMaskProvenance(64));
   AddCase(ScalarWqmB64SelectsSccDomain);
   AddCase(ScalarWqmB64PreservesPartialMasks);
   cases.push_back(ScalarWqmB32Masks(32));
@@ -40116,7 +40149,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarSubvectorLoops(32));
     RunCase(&vulkan, ScalarSubvectorLoops(64));
     RunCase(&vulkan, ScalarNotB64UpdatesScc());
-    RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance());
+    RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance(32));
+    RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance(64));
     RunCase(&vulkan, ScalarConditionalMoveB64());
     RunCase(&vulkan, ScalarConditionalMoveB64PreservesMasks());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());

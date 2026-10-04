@@ -8853,6 +8853,46 @@ void TestNativeScalarReadDescriptorPlanning() {
   }
 }
 
+void TestScalarSelectedVccBufferAddress() {
+  using namespace ShaderRecompiler::IR;
+  // 68ca7b6fd9c44cfa selects an ordinary 64-bit address through VCC before
+  // copying its words into a writable buffer descriptor.
+  const uint32_t shader[] = {
+      EncodeSopc(0x07, 4, 128), EncodeSop2(0x0b, 106, 0, 2),
+      EncodeVop1(0x01, 1, 106), EncodeVop1(0x02, 8, 257),
+      EncodeSMovB32(9, 107), EncodeSMovB32(10, 132),
+      EncodeSMovB32(11, 255), 3u << 28u,
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 2, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 5> userdata{0x12345670u, 0x12u, 0xb27c0000u, 0x30u, 0u};
+  for (const uint32_t wave_size : {32u, 64u}) {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    auto input = *options.input_info.compute;
+    input.threads_num[0] = input.wave_size = options.wave_size = wave_size;
+    options.input_info.compute = &input;
+    options.user_data = userdata;
+    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+    auto plan = ExtractResourcePlan(translated.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const uint32_t condition : {0u, 1u}) {
+      userdata[4] = condition;
+      Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+            "scalar-selected VCC address did not materialize");
+      const auto offset = condition ? 0u : 2u;
+      Check(snapshot.buffers.size() == 1 && snapshot.flattened_srt.empty() &&
+                snapshot.specialization_reads.empty() &&
+                snapshot.buffers[0].dwords[0] == userdata[offset] &&
+                snapshot.buffers[0].dwords[1] == userdata[offset + 1],
+            "VCC selection replaced raw address words with a lane ballot");
+    }
+    const auto compiled = ShaderRecompiler::CompileProgram(
+        std::move(translated), options, specialization);
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
 void TestNativeGuardedSamplerSource() {
   constexpr uint32_t nested = 12, sample = 18, join = 20, end = 22;
   const uint32_t shader[] = {
@@ -14709,6 +14749,7 @@ int main() {
   TestSharedExitPreservesNativeDescriptorSources();
   TestNestedSelectionPreservesDescriptorSources();
   TestNativeScalarReadDescriptorPlanning();
+  TestScalarSelectedVccBufferAddress();
   TestNativeGuardedSamplerSource();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
