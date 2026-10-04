@@ -91,7 +91,8 @@ uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
 }
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
-	EXIT_IF(components < 2u || components > 4u);
+	EXIT_IF(components < 1u || components > 4u);
+	if (components == 1u) return TypeU32(state);
 	return components == 2u ? TypeU32Pair(state) : TypeU32Vector(state, components);
 }
 
@@ -344,8 +345,9 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value) {
 }
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {
-	EXIT_IF(components < 2u || components > 4u);
+	EXIT_IF(components < 1u || components > 4u);
 	const auto            zero = ConstantU32(state, 0);
+	if (components == 1u) return zero;
 	std::vector<uint32_t> values(components, zero);
 	return state.builder.Constant(spv::OpConstantComposite, TypeU32Composite(state, components),
 	                              values);

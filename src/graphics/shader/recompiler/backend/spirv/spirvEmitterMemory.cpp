@@ -692,6 +692,7 @@ uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 
 uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
                                const std::array<uint32_t, 4>& values) {
+	if (components == 1u) return values[0];
 	const auto            result = state.builder.AllocateId();
 	std::vector<uint32_t> words {spv::OpCompositeConstruct, TypeU32Composite(state, components),
 	                             result};
@@ -707,7 +708,7 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
 		values[component] = FormattedConstant(ctx, plan.info, source.kind);
 	}
-	return components == 1u ? values[0] : ConstructU32Composite(ctx.state, components, values);
+	return ConstructU32Composite(ctx.state, components, values);
 }
 
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -930,15 +931,17 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	const auto buffer = PrepareIndirectBuffer(ctx, inst);
 	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
 	                                  ConstantU32(state, 0));
+	const auto base = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), buffer.address,
+	                         ConstantDeviceAddress(state, ~uint64_t {3}));
 	std::array<uint32_t, 4> values {};
 	for (uint32_t component = 0; component < components; ++component) {
-		const auto address = component == 0u ? buffer.address : Binary(
-		    state, spv::OpIAdd, TypeScalarU64(state), buffer.address,
+		const auto address = component == 0u ? base : Binary(
+		    state, spv::OpIAdd, TypeScalarU64(state), base,
 		    ConstantDeviceAddress(state, component * 4u));
-		values[component] = LoadBda(
-		    ctx, address, AndCondition(state, valid_format,
-		                               IndirectBufferInBounds(state, buffer, component * 4u, 4u, false)),
-		    32u);
+		values[component] = EmitValueOrZeroIfCondition(
+		    state, AndCondition(state, valid_format,
+		                        IndirectBufferInBounds(state, buffer, component * 4u, 4u, false)),
+		    [&]() { return LoadBdaDword(ctx, address); });
 	}
 	return ConstructU32Composite(state, components, values);
 }
@@ -988,7 +991,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
-uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
@@ -1411,8 +1414,9 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	uint32_t   value;
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		value = LoadLocalFlat(ctx, inst);
-	else if (buffer_components > 1u)
-		value = LoadWideBuffer(ctx, inst, buffer_components);
+	else if (buffer_components > 1u ||
+	         (buffer_components == 1u && mem.kind == IR::ResourceKind::IndirectBuffer && !mem.formatted))
+		value = LoadBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
