@@ -30,6 +30,28 @@ uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_va
 	return Unary(state, not_equal ? spv::OpAny : spv::OpAll, TypeBool(state), compare);
 }
 
+uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	const auto bits_type = TypeU64(state);
+	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
+	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
+	const auto ordered = Binary(state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
+	                            TypeBool(state), lhs, rhs);
+	auto result = Select(state, TypeF64(state), ordered, lhs, rhs);
+
+	// Equal values have identical bits except signed zero: min chooses -0, max chooses +0.
+	const auto equal = Binary(state, spv::OpFOrdEqual, TypeBool(state), lhs, rhs);
+	const auto equal_bits = Binary(state, max_value ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
+	                               bits_type, lhs_bits, rhs_bits);
+	result = Select(state, TypeF64(state), equal,
+	                Unary(state, spv::OpBitcast, TypeF64(state), equal_bits), result);
+
+	// Non-IEEE mode selects the other operand for NaN, including rhs when both are NaN.
+	result = Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
+	                lhs, result);
+	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs),
+	              rhs, result);
+}
+
 uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
                           spv::Op high_compare, spv::Op low_compare) {
 	const auto lhs         = ExtractPair(state, lhs_value);
@@ -480,6 +502,14 @@ uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
+}
+
+uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitMinMaxF64(state, arg0, arg1, false);
+}
+
+uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitMinMaxF64(state, arg0, arg1, true);
 }
 
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {

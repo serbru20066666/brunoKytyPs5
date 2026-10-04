@@ -91,6 +91,9 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x0fu, Opcode::V_CVT_F32_F64},
     {0x10u, Opcode::V_CVT_F64_F32},
     {0x16u, Opcode::V_CVT_F64_U32},
+    {0x17u, Opcode::V_TRUNC_F64},
+    {0x18u, Opcode::V_CEIL_F64},
+    {0x1au, Opcode::V_FLOOR_F64},
     {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
@@ -156,6 +159,9 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x0fu, Opcode::V_CVT_F32_F64},
     {0x10u, Opcode::V_CVT_F64_F32},
     {0x16u, Opcode::V_CVT_F64_U32},
+    {0x17u, Opcode::V_TRUNC_F64},
+    {0x18u, Opcode::V_CEIL_F64},
+    {0x1au, Opcode::V_FLOOR_F64},
     {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
@@ -292,6 +298,8 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x14cu, Opcode::V_FMA_F64},
     {0x164u, Opcode::V_ADD_F64},
     {0x165u, Opcode::V_MUL_F64},
+    {0x166u, Opcode::V_MIN_F64},
+    {0x167u, Opcode::V_MAX_F64},
     {0x148u, Opcode::V_BFE_U32},
     {0x149u, Opcode::V_BFE_I32},
     {0x14au, Opcode::V_BFI_B32},
@@ -478,7 +486,9 @@ bool IsVopcCompareExec(Opcode opcode);
 bool IsVop1Float64Opcode(Opcode opcode) {
 	return opcode == Opcode::V_CVT_F64_I32 || opcode == Opcode::V_CVT_F32_F64 ||
 	       opcode == Opcode::V_CVT_F64_F32 || opcode == Opcode::V_CVT_F64_U32 ||
-	       opcode == Opcode::V_RCP_F64 || opcode == Opcode::V_FRACT_F64;
+	       opcode == Opcode::V_RCP_F64 || opcode == Opcode::V_FRACT_F64 ||
+	       opcode == Opcode::V_TRUNC_F64 || opcode == Opcode::V_CEIL_F64 ||
+	       opcode == Opcode::V_FLOOR_F64;
 }
 
 bool IsVop1FloatSourceOpcode(Opcode opcode) {
@@ -487,6 +497,9 @@ bool IsVop1FloatSourceOpcode(Opcode opcode) {
 		case Opcode::V_CVT_F64_F32:
 		case Opcode::V_RCP_F64:
 		case Opcode::V_FRACT_F64:
+		case Opcode::V_TRUNC_F64:
+		case Opcode::V_CEIL_F64:
+		case Opcode::V_FLOOR_F64:
 		case Opcode::V_MOV_B32:
 		case Opcode::V_CVT_F32_F16:
 		case Opcode::V_CVT_U32_F32:
@@ -1235,6 +1248,8 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
+		case Opcode::V_MIN_F64:
+		case Opcode::V_MAX_F64:
 		case Opcode::V_MUL_LO_U32:
 		case Opcode::V_MUL_HI_U32:
 		case Opcode::V_MUL_LO_I32:
@@ -1387,6 +1402,8 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAD_F32:
 		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
+		case Opcode::V_MIN_F64:
+		case Opcode::V_MAX_F64:
 		case Opcode::V_FMA_F64:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_PACK_B32_F16:

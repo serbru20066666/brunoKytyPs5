@@ -25556,6 +25556,147 @@ TestCase VectorFractF64CapturedAndEdges() {
   return test;
 }
 
+TestCase VectorMinMaxF64CapturedAndEdges() {
+  using O = ShaderOpcode;
+  // MODE.IEEE=0: select the numeric operand, or the second NaN unchanged.
+  constexpr uint64_t positive_zero = 0, negative_zero = 0x8000000000000000ull;
+  constexpr uint64_t one = 0x3ff0000000000000ull, minus_two = 0xc000000000000000ull;
+  constexpr uint64_t qnan = 0x7ff8123456789abcull, snan = 0xfff0000000000042ull;
+  constexpr uint64_t infinity = 0x7ff0000000000000ull;
+  constexpr std::array<std::array<uint64_t, 4>, 20> cases{{
+      {one, minus_two, minus_two, one}, {minus_two, one, minus_two, one},
+      {one, one, one, one},
+      {positive_zero, negative_zero, negative_zero, positive_zero},
+      {negative_zero, positive_zero, negative_zero, positive_zero},
+      {negative_zero, negative_zero, negative_zero, negative_zero},
+      {positive_zero, positive_zero, positive_zero, positive_zero},
+      {qnan, one, one, one}, {one, qnan, one, one},
+      {snan, minus_two, minus_two, minus_two}, {minus_two, snan, minus_two, minus_two},
+      {qnan, snan, snan, snan}, {snan, qnan, qnan, qnan},
+      {infinity, one, one, infinity},
+      {infinity | negative_zero, one, infinity | negative_zero, one},
+      {0x3fe0000000000000ull, one, 0x3fe0000000000000ull, one},
+      {1, negative_zero | 1, negative_zero | 1, 1}, {1, 0, 0, 1},
+      {1, 2, 1, 2}, {2, 1, 1, 2}}};
+  TestCase test;
+  test.name = "VectorMinMaxF64CapturedAndEdges";
+  for (const auto &item : cases) {
+    for (u32 source = 0; source < 2; source++) {
+      test.initial.insert(test.initial.end(), {u32(item[source]), u32(item[source] >> 32)});
+    }
+  }
+  test.expected = test.initial;
+  const auto store_pair = [&](u32 reg, uint64_t bits) {
+    AppendStoreVgpr(&test.code, reg, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&test.code, reg + 1, static_cast<u32>(test.expected.size() + 1));
+    test.expected.insert(test.expected.end(), {u32(bits), u32(bits >> 32)});
+  };
+  for (u32 i = 0; i < cases.size(); i++) {
+    for (u32 word = 0; word < 4; word++) {
+      AppendVMovU32(&test.code, 30, (i * 4 + word) * 4);
+      AppendBufferLoadDword(&test.code, 2 + word, 30);
+    }
+    AppendVop3(&test.code, 0x166, 7, Vgpr(2), Vgpr(4));
+    store_pair(7, cases[i][2]);
+    AppendVop3(&test.code, 0x167, 9, Vgpr(2), Vgpr(4));
+    store_pair(9, cases[i][3]);
+    // CS daced64c72398e80 PCs 0x10c/0x11c clamp the pair to [0, 1].
+    test.code.insert(test.code.end(), {0xd5670006u, 0x00020480u,
+                                       0xd5660006u, 0x00020cf2u});
+    const auto source = std::bit_cast<double>(cases[i][0]);
+    uint64_t clamped = 0;
+    if (source > 0) clamped = source < 1 ? cases[i][0] : one;
+    store_pair(6, clamped);
+  }
+  AppendSMovLiteral(&test.code, 8, 0);
+  AppendSMovLiteral(&test.code, 9, u32(minus_two >> 32));
+  // Scalar source and odd destination pairs; ABS must precede NEG.
+  AppendVop3(&test.code, 0x166, 1, 8, 243, 0, 1, 0, false, 0, 1);
+  store_pair(1, minus_two);
+  AppendVop3(&test.code, 0x167, 1, 8, 243, 0, 1, 0, false, 0, 1);
+  store_pair(1, 0xbff0000000000000ull);
+  test.code.push_back(EncodeSop1(0x04, 12, 126));
+  test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  AppendVop3(&test.code, 0x166, 1, 242, 242);
+  AppendVop3(&test.code, 0x167, 1, 242, 242);
+  test.code.push_back(EncodeSop1(0x04, 126, 12));
+  store_pair(1, 0xbff0000000000000ull);
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64, O::BUFFER_LOAD_DWORD,
+                  O::V_MIN_F64, O::V_MAX_F64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64",
+                         "SignedZeroInfNanPreserve 64"};
+  return test;
+}
+
+TestCase VectorRoundF64EdgesAndModifiers() {
+  using O = ShaderOpcode;
+  constexpr std::array<uint64_t, 14> sources{
+      0x400a000000000000ull, 0xbff4000000000000ull,
+      0x3fd0000000000000ull, 0xbfd0000000000000ull,
+      0, 0x8000000000000000ull, 0x4330000000000001ull, 0xc330000000000001ull,
+      0x7ff0000000000000ull, 0xfff0000000000000ull,
+      0xfff8123456789abcull, 0x7ff0000000000001ull, 1, 0x8000000000000001ull};
+  TestCase test;
+  test.name = "VectorRoundF64EdgesAndModifiers";
+  for (const auto bits : sources) {
+    test.initial.insert(test.initial.end(), {u32(bits), u32(bits >> 32)});
+  }
+  test.expected = test.initial;
+  const auto rounded = [](u32 opcode, double value) {
+    switch (opcode) {
+      case 0x17: return std::trunc(value);
+      case 0x18: return std::ceil(value);
+      case 0x1a: return std::floor(value);
+      default: std::abort();
+    }
+  };
+  const auto store_pair = [&](u32 reg, uint64_t bits) {
+    AppendStoreVgpr(&test.code, reg, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&test.code, reg + 1, static_cast<u32>(test.expected.size() + 1));
+    test.expected.insert(test.expected.end(), {u32(bits), u32(bits >> 32)});
+  };
+  for (const u32 opcode : {0x17u, 0x18u, 0x1au}) {
+    for (u32 i = 0; i < sources.size(); i++) {
+      for (u32 word = 0; word < 2; word++) {
+        AppendVMovU32(&test.code, 30, (i * 2 + word) * 4);
+        AppendBufferLoadDword(&test.code, 2 + word, 30);
+      }
+      test.code.push_back(EncodeVop1(opcode, 5, Vgpr(2)));
+      AppendVop3(&test.code, 0x180 + opcode, 7, Vgpr(2), 0);
+      const auto value = std::bit_cast<double>(sources[i]);
+      for (const u32 reg : {5u, 7u}) {
+        if (std::isnan(value)) {
+          // IEEE=false does not promise a particular NaN payload or quiet bit.
+          test.code.push_back(EncodeVopc(0x22, Vgpr(reg), reg));
+          AppendStoreSgprPair(&test.code, 106, static_cast<u32>(test.expected.size()));
+          test.expected.insert(test.expected.end(), {0, 0});
+        } else {
+          store_pair(reg, std::bit_cast<uint64_t>(rounded(opcode, value)));
+        }
+      }
+    }
+    AppendSMovLiteral(&test.code, 8, 0);
+    AppendSMovLiteral(&test.code, 9, 0xbff40000u);
+    AppendVop3(&test.code, 0x180 + opcode, 1, 8, 0, 0, 1, 0, false, 0, 1);
+    const auto expected = std::bit_cast<uint64_t>(rounded(opcode, -1.25));
+    store_pair(1, expected);
+    test.code.push_back(EncodeSop1(0x04, 12, 126));
+    test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    test.code.push_back(EncodeVop1(opcode, 1, 242));
+    test.code.push_back(EncodeSop1(0x04, 126, 12));
+    store_pair(1, expected);
+  }
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64, O::BUFFER_LOAD_DWORD,
+                  O::V_TRUNC_F64, O::V_CEIL_F64, O::V_FLOOR_F64, O::V_CMP_EQ_F64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "Trunc", "Ceil", "Floor"};
+  return test;
+}
+
 TestCase VectorFractF64CapturedChainRuntimeExec() {
   using O = ShaderOpcode;
   TestCase test;
@@ -35256,6 +35397,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorCompare64WaveMasks(64, true));
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorFractF64CapturedAndEdges);
+  AddCase(VectorMinMaxF64CapturedAndEdges);
+  AddCase(VectorRoundF64EdgesAndModifiers);
   AddCase(VectorFractF64CapturedChainRuntimeExec);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorF64WideningConversions);
@@ -40839,6 +40982,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompare64WaveMasks(64));
     RunCase(&vulkan, VectorF64CapturedScreenSpaceShadows());
     RunCase(&vulkan, VectorFractF64CapturedAndEdges());
+    RunCase(&vulkan, VectorMinMaxF64CapturedAndEdges());
+    RunCase(&vulkan, VectorRoundF64EdgesAndModifiers());
     RunCase(&vulkan, VectorFractF64CapturedChainRuntimeExec());
     RunCase(&vulkan, VectorF64ModesModifiersAndExec());
     return 0;

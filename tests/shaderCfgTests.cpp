@@ -3604,6 +3604,53 @@ void TestNewShaderRecompilerCapturedFractF64() {
   }
 }
 
+void TestNewShaderRecompilerF64AluEncodings() {
+  using namespace ShaderRecompiler::Decoder;
+  for (const bool maximum : {false, true}) {
+    const std::array<uint32_t, 2> captured = maximum
+        ? std::array<uint32_t, 2>{0xd5670006u, 0x00020480u}
+        : std::array<uint32_t, 2>{0xd5660006u, 0x00020cf2u};
+    Instruction decoded;
+    DecodeInstruction(captured, 0, decoded);
+    Check(decoded.family == Family::VOP3 &&
+              decoded.opcode == (maximum ? Opcode::V_MAX_F64 : Opcode::V_MIN_F64) &&
+              decoded.opcode_id == (maximum ? 0x167u : 0x166u) && decoded.word_count == 2 &&
+              decoded.dst.kind == OperandKind::Vgpr && decoded.dst.reg == 6 &&
+              decoded.src0.kind == (maximum ? OperandKind::IntegerInlineConstant
+                                            : OperandKind::FloatInlineConstant) &&
+              decoded.src0.value == (maximum ? 0u : 0x3f800000u) &&
+              decoded.src1.kind == OperandKind::Vgpr && decoded.src1.reg == (maximum ? 2u : 6u) &&
+              !decoded.src0.absolute && !decoded.src0.negate &&
+              !decoded.src1.absolute && !decoded.src1.negate &&
+              !decoded.dst.clamp && decoded.dst.omod == 0,
+          "captured V_MIN/MAX_F64 lost its inline source, register pair, or modifiers");
+  }
+  for (const auto [opcode, expected] : {
+      std::pair{0x17u, Opcode::V_TRUNC_F64}, std::pair{0x18u, Opcode::V_CEIL_F64},
+      std::pair{0x1au, Opcode::V_FLOOR_F64}}) {
+    for (const bool vop3 : {false, true}) {
+      const std::array<uint32_t, 2> words = vop3
+          ? std::array<uint32_t, 2>{EncodeVop3Word0(0x180 + opcode, 1, 0, 1),
+                                   EncodeVop3Word1(8, 0, 0) | (1u << 29)}
+          : std::array<uint32_t, 2>{EncodeVop1(opcode, 1, 258), 0};
+      Instruction decoded;
+      DecodeInstruction(words, 0, decoded);
+      Check(decoded.opcode == expected && decoded.word_count == (vop3 ? 2u : 1u) &&
+                decoded.dst.reg == 1 && decoded.src0.reg == (vop3 ? 8u : 2u) &&
+                decoded.src0.absolute == vop3 && decoded.src0.negate == vop3,
+            "FP64 rounding lost its VOP1/VOP3 encoding, odd pair, or source modifiers");
+    }
+    for (const uint32_t source : {249u, 250u}) {
+      const uint32_t invalid[] = {EncodeVop1(opcode, 1, source),
+          source == 249u ? 0x00060604u : EncodeVop1Dpp(4, 0xe4)};
+      Instruction decoded;
+      DecodeInstruction(invalid, 0, decoded);
+      Check(decoded.opcode == Opcode::UNSUPPORTED,
+            "FP64 rounding accepted unsupported SDWA or DPP encoding");
+    }
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaBfrev() {
   using namespace ShaderRecompiler::Decoder;
   const uint32_t captured[] = {0x7e0070f9u, 0x00040600u};
@@ -14769,6 +14816,7 @@ int main() {
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerCapturedFractF64();
+  TestNewShaderRecompilerF64AluEncodings();
   TestNewShaderRecompilerVop1SdwaBfrev();
   TestNewShaderRecompilerVop1SdwaNotDestination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
