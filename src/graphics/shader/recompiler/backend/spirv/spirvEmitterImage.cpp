@@ -391,28 +391,50 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto format = state.program.info.images[mem.resource].conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
 	const auto info = Format::GetFormatInfo(format);
-	EXIT_IF(Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Uint ||
-	        Prospero::RemapTextureFormat(format) == format ||
-	        info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
-	        info.byte_size != sizeof(uint32_t) || info.component_count == 0u ||
+	EXIT_IF(Prospero::RemapTextureFormat(format) == format || info.component_count == 0u ||
 	        info.component_count > 4u);
+	EXIT_IF(info.type != Format::ComponentType::Uscaled &&
+	        (info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
+	         info.byte_size != sizeof(uint32_t)));
 	return info;
+}
+
+uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto component = ImageGatherComponent(mem.dmask);
+	const auto info      = ImageConversionFormat(state, mem);
+	if (info.format == Prospero::BufferFormat::kInvalid) return component;
+	if (info.packed_bitfield) return 0u;
+	const auto selector =
+	    (state.program.info.images[mem.resource].shader_swizzle >> (component * 3u)) & 7u;
+	return selector >= 4u ? (selector - 4u) % info.component_count : 0u;
 }
 
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
 
-	const auto packed = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), packed, texel, 0u);
-	uint32_t components[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
-	                          ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
+	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
+	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
+	uint32_t   packed        = 0;
+	if (info.packed_bitfield) {
+		packed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, packed, texel, 0u);
+	}
+	uint32_t components[4] {};
 	for (uint32_t component = 0; component < info.component_count; component++) {
 		components[component] = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(ctx.state),
-		                              components[component], packed,
-		                              ConstantU32(ctx.state, info.component_bit_offset[component]),
-		                              ConstantU32(ctx.state, info.component_bits[component]));
+		if (info.packed_bitfield) {
+			ctx.state.builder.AddFunction(spv::OpBitFieldUExtract, scalar_type,
+			                              components[component], packed,
+			                              ConstantU32(ctx.state, info.component_bit_offset[component]),
+			                              ConstantU32(ctx.state, info.component_bits[component]));
+		} else {
+			ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type,
+			                              components[component], texel, component);
+			// UNorm backing preserves the guest's filtering; scaling precedes swizzle constants.
+			components[component] = Binary(ctx.state, spv::OpFMul, scalar_type, components[component],
+			                               ConstantF32Value(ctx.state, 255.0f));
+		}
 	}
 	for (uint32_t component = info.component_count; component < 4u; component++) {
 		components[component] = components[component % info.component_count];
@@ -423,16 +445,19 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	for (uint32_t component = 0; component < 4u; component++) {
 		const auto selector = (swizzle >> (component * 3u)) & 7u;
 		if (selector == 1u) {
-			selected[component] = ConstantU32(ctx.state, 1u);
+			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 1u)
+			                                          : ConstantF32Value(ctx.state, 1.0f);
 		} else if (selector >= 4u) {
 			selected[component] = components[selector - 4u];
 		} else {
-			selected[component] = ConstantU32(ctx.state, 0u);
+			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 0u)
+			                                          : ZeroF32(ctx.state);
 		}
 	}
 	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
-	                              selected[0], selected[1], selected[2], selected[3]);
+	ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
+	                              ImageVectorType(ctx.state, numeric_class, 4), result, selected[0],
+	                              selected[1], selected[2], selected[3]);
 	return result;
 }
 
@@ -443,10 +468,20 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto selector =
 	    (ctx.state.program.info.images[mem.resource].shader_swizzle >> (component * 3u)) & 7u;
+	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
+	const auto vector_type   = ImageVectorType(ctx.state, numeric_class, 4);
 	if (selector < 4u) {
-		const auto value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u);
-		return ctx.state.builder.Constant(spv::OpConstantComposite, TypeU32Vector(ctx.state, 4),
-		                                  value, value, value, value);
+		const auto value = info.packed_bitfield
+		                       ? ConstantU32(ctx.state, selector == 1u ? 1u : 0u)
+		                       : ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
+		return ctx.state.builder.Constant(spv::OpConstantComposite, vector_type, value, value,
+		                                  value, value);
+	}
+	if (!info.packed_bitfield) {
+		const auto scale  = ConstantF32Value(ctx.state, 255.0f);
+		const auto scales = ctx.state.builder.Constant(spv::OpConstantComposite, vector_type,
+		                                                scale, scale, scale, scale);
+		return Binary(ctx.state, spv::OpFMul, vector_type, gathered, scales);
 	}
 
 	uint32_t values[4] {};
@@ -488,10 +523,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                     LoadSamplerDescriptor(state, mem.sampler));
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
-	const auto component =
-	    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
-	        ? ImageGatherComponent(mem.dmask)
-	        : 0u;
+	const auto component = ImageGatherSource(state, mem);
 	uint32_t values[2] {};
 	for (uint32_t index = 0; index < 2u; index++) {
 		const auto sample_coord =
@@ -515,6 +547,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+	EXIT_IF(info.type != Format::ComponentType::Uint || !info.packed_bitfield);
 
 	auto packed = ConstantU32(ctx.state, 0u);
 	for (uint32_t component = 0; component < info.component_count; component++) {
@@ -669,7 +702,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
-			ctx.Fail(inst, "uses depth comparison with a packed integer image");
+			ctx.Fail(inst, "uses depth comparison with a converted image");
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
@@ -700,9 +733,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                        ? AddressF32(ctx, mem, *address, layout.dref)
 				                        : ZeroF32(state);
 			} else {
-				component_or_dref = ConstantU32(
-				    state, ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
-				               ? ImageGatherComponent(mem.dmask) : 0u);
+				component_or_dref = ConstantU32(state, ImageGatherSource(state, mem));
 			}
 			uint32_t operand_mask = 0;
 			uint32_t offset = 0;

@@ -1412,6 +1412,7 @@ struct TestCase {
   std::vector<u32> sampled_image_rgba;
   std::vector<std::vector<u32>> sampled_image_rgba_mips;
   vk::Format sampled_image_format = vk::Format::eR32G32B32A32Sfloat;
+  vk::Filter sampler_filter = vk::Filter::eNearest;
   u32 sampled_image_dwords_per_pixel = 4;
   vk::ImageType sampled_image_type = vk::ImageType::e2D;
   vk::ImageViewType sampled_image_view_type = vk::ImageViewType::e2D;
@@ -1445,6 +1446,7 @@ struct TestCase {
   std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
+  float expected_float_tolerance = 0.0f;
   std::vector<u32> gds_initial;
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
@@ -13584,7 +13586,7 @@ public:
       copied_depth_sample.layout = copy_sample_image.backing.state.layout;
       scheduler.Finish();
       auto copy_sample_output = CreateStorageBuffer(name, {}, 2);
-      const auto copy_sampler = CreateNearestSampler(name);
+      const auto copy_sampler = CreateSampler(name);
       Dispatch(copy_sample_test, copy_sample_program, copy_sample_output,
                nullptr, &copied_depth_sample, nullptr, nullptr, copy_sampler);
       Require(
@@ -14929,11 +14931,12 @@ public:
     return ret;
   }
 
-  vk::Sampler CreateNearestSampler(const char *shader_name, u32 mip_levels = 1) {
+  vk::Sampler CreateSampler(const char *shader_name, u32 mip_levels = 1,
+                            vk::Filter filter = vk::Filter::eNearest) {
     vk::SamplerCreateInfo sampler_info{};
     sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
-    sampler_info.magFilter = vk::Filter::eNearest;
-    sampler_info.minFilter = vk::Filter::eNearest;
+    sampler_info.magFilter = filter;
+    sampler_info.minFilter = filter;
     sampler_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
     sampler_info.addressModeU = vk::SamplerAddressMode::eClampToEdge;
     sampler_info.addressModeV = vk::SamplerAddressMode::eClampToEdge;
@@ -18575,6 +18578,15 @@ void CompareWords(const TestCase &test, const char *stage,
   if (actual == expected) {
     return;
   }
+  if (test.expected_float_tolerance > 0.0f &&
+      std::equal(expected.begin(), expected.end(), actual.begin(), actual.end(),
+                 [&](u32 expected_word, u32 actual_word) {
+                   return std::abs(std::bit_cast<float>(expected_word) -
+                                   std::bit_cast<float>(actual_word)) <=
+                          test.expected_float_tolerance;
+                 })) {
+    return;
+  }
   std::ostringstream out;
   out << "expected [";
   for (size_t i = 0; i < expected.size(); i++) {
@@ -18622,6 +18634,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
             compiled.program.info.samplers.size() == 1u &&
                 compiled.program.info.samplers[0].force_point_filtering,
             "bit-packed sampled image did not force point filtering");
+  }
+  if (test.sampler_filter == vk::Filter::eLinear) {
+    Require(test.name, "sampler specialization",
+            std::ranges::none_of(compiled.program.info.samplers,
+                                [](const auto &sampler) { return sampler.force_point_filtering; }),
+            "filterable sampled image incorrectly forced point filtering");
   }
   if (test.compile_only) {
     std::printf("[compute] %-32s ok\n", test.name);
@@ -18697,8 +18715,9 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
   }
   if (needs_sampler) {
-    sampler = vulkan->CreateNearestSampler(
-        test.name, sampled_image.mip_levels - test.sampled_image_view_base_mip);
+    sampler = vulkan->CreateSampler(
+        test.name, sampled_image.mip_levels - test.sampled_image_view_base_mip,
+        test.sampler_filter);
   }
 
   vulkan->Dispatch(test, compiled, buffer, needs_gds ? &gds_buffer : nullptr,
@@ -31912,6 +31931,49 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   return test;
 }
 
+template <bool rg> TestCase ImageSampleUScaled8() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = rg ? "ImageSampleRG8UScaled" : "ImageSampleR8UScaled";
+  AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.375f));
+  AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.375f));
+  test.code.push_back(EncodeMimg0(0x20, 0xf));
+  test.code.push_back(EncodeMimg1(0, 20));
+  test.code.push_back(EncodeMimg0(0x47, 0x1));
+  test.code.push_back(EncodeMimg1(4, 20));
+  test.code.push_back(EncodeMimg0(0x47, 0x8));
+  test.code.push_back(EncodeMimg1(8, 20));
+  for (u32 component = 0; component < 12; ++component) {
+    AppendStoreVgpr(&test.code, component, component);
+  }
+  AppendEnd(&test.code);
+  // R varies horizontally; G varies vertically in the opposite direction.
+  // Bilinear samples must retain fractions despite host UNorm filter precision.
+  test.image_width = test.image_height = 2;
+  test.sampled_image_rgba = rg ? std::vector<u32>{0xffffff00u, 0x00ff0000u}
+                               : std::vector<u32>{0xff00ff00u};
+  test.sampled_image_format = rg ? vk::Format::eR8G8Unorm : vk::Format::eR8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.sampler_filter = vk::Filter::eLinear;
+  test.expected_float_tolerance = 0.01f;
+  test.user_data = MakeSampledTextureData(rg ? Prospero::BufferFormat::k8_8UScaled
+                                            : Prospero::BufferFormat::k8UScaled);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  test.user_data[50] = 12u * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(rg ? 5 : 4, 4, 0, 1);
+  for (float value : {rg ? 191.25f : 63.75f, 63.75f, 0.0f, 1.0f,
+                      0.0f, rg ? 0.0f : 255.0f, 255.0f, rg ? 255.0f : 0.0f,
+                      1.0f, 1.0f, 1.0f, 1.0f}) {
+    test.expected.push_back(std::bit_cast<u32>(value));
+  }
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase ImageLoadR128IgnoresAdjacentMaskSgprs() {
   using O = ShaderOpcode;
 
@@ -34923,6 +34985,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
+  AddCase(ImageSampleUScaled8<false>);
+  AddCase(ImageSampleUScaled8<true>);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
@@ -40293,9 +40357,17 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorFloatConversionOps());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scaled-texture-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleUScaled8<false>());
+    RunCase(&vulkan, ImageSampleUScaled8<true>());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();
+    RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
+    RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--system-dialog-only") == 0) {
