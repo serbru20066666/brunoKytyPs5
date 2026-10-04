@@ -10220,13 +10220,15 @@ void TestMeshExportStorage() {
       EncodeExp0(0x21, 0xf, false), EncodeExp1(0, 0, 0, 0),
       EncodeExp0(0x22, 0xf, false), EncodeExp1(0, 0, 0, 0),
       EncodeExp0(0x0d, 0x4, false), EncodeExp1(0, 0, 0, 0), // Layer
+      EncodeExp0(0x0e, 0x9, false), EncodeExp1(0, 0, 0, 0), // Clip distances 0, 3
+      EncodeExp0(0x0f, 0x6, false), EncodeExp1(0, 0, 0, 0), // Cull distances 1, 2
       EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
       EncodeSopp(0x01),
   };
   std::vector<uint32_t> monolithic(std::begin(front), std::begin(front) + 2);
   monolithic.insert(monolithic.end(), std::begin(back), std::end(back));
   ShaderVertexInputInfo input{};
-  input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 18u);
+  input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 18u) | 0x00c0f00fu;
   auto &mesh = input.mesh;
   mesh.threads_num[0] = 192;
   mesh.threads_num[1] = mesh.threads_num[2] = 1;
@@ -10285,6 +10287,19 @@ void TestMeshExportStorage() {
                                               "vsharp %uint_0 %uint_4294967295"),
           "mesh draw prefix was lost or spilled shader data wrapped into push constants");
     const auto &binary = result.spirv;
+    for (const auto builtin : {3u, 4u}) {
+      auto expected = builtin == 3u ? std::vector<uint32_t>{0, 3}
+                                    : std::vector<uint32_t>{1, 2};
+      if (subgroup_size == 32) {
+        expected.push_back(expected[0]);
+        expected.push_back(expected[1]);
+        std::sort(expected.begin(), expected.end());
+      }
+      Check(SpirvDecorationValueCount(binary, 11u, builtin) == 1 &&
+                SpirvStoredBuiltInElements(binary, builtin) == expected &&
+                SpirvContainsCapability(binary, builtin == 3u ? 32u : 33u),
+            "mesh distances lost their shared BuiltIn array, plane index or logical lane");
+    }
     std::vector<uint32_t> sizes(binary[3]), constants(binary[3]);
     uint32_t shared_bytes = 0, private_bytes = 0;
     for (size_t i = 5; i < binary.size(); i += binary[i] >> 16u) {
@@ -10317,7 +10332,7 @@ void TestMeshExportStorage() {
     // when its four vertex exports and primitive exports are shared arrays.
     Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u && shared_bytes <= 28672u,
           "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
-    Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
+    Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }
 }
