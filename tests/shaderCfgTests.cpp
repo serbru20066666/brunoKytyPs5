@@ -4717,8 +4717,8 @@ void TestNewShaderDecoderArchitecture() {
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   const uint32_t opcodes[] = {
-      0xa2u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
-      0xf5u}; // eq_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
+      0xa2u, 0xa5u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
+      0xf5u}; // eq_i64, ne_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
   for (const auto opcode : opcodes) {
     const uint32_t shader[] = {
         EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
@@ -4736,6 +4736,13 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
     Check((compare.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") != std::string::npos),
           "64-bit VOPC DPP rejection reason was not explicit");
   }
+  const uint32_t sdwa[] = {EncodeVopc(0xa5u, 249u, 0u), 0x06060000u};
+  ShaderRecompiler::Decoder::Instruction compare;
+  ShaderRecompiler::Decoder::DecodeInstruction(sdwa, 0u, compare);
+  Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED &&
+            compare.word_count == 2u &&
+            compare.unsupported_reason.find("VOPC SDWA modifier is not supported") != std::string::npos,
+        "V_CMP_NE_I64 accepted an illegal SDWA encoding");
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {

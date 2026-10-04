@@ -24487,8 +24487,9 @@ TestCase VectorCompareInteger64Edges() {
     const auto lhs = pairs[i][0], rhs = pairs[i][1];
     const auto signed_lhs = std::bit_cast<int64_t>(lhs);
     const auto signed_rhs = std::bit_cast<int64_t>(rhs);
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 4>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 5>{{
              {0xa1, signed_lhs < signed_rhs}, {0xa3, signed_lhs <= signed_rhs},
+             {0xa5, lhs != rhs},
              {0xe3, lhs <= rhs}, {0xe6, lhs >= rhs}}}) {
       test.code.push_back(EncodeVopc(opcode, Vgpr(1), 3));
       store_mask(106, value);
@@ -24496,8 +24497,9 @@ TestCase VectorCompareInteger64Edges() {
       store_mask(20, value);
     }
     // A negative literal expands by signedness, including equality comparisons.
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 4>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 5>{{
              {0xa1, -1 < signed_rhs}, {0xa3, -1 <= signed_rhs},
+             {0xa5, -1 != signed_rhs},
              {0xa2, -1 == signed_rhs}, {0xe3, 0xffffffffull <= rhs}}}) {
       test.code.push_back(EncodeVopc(opcode, 255, 3));
       test.code.push_back(0xffffffffu);
@@ -24506,13 +24508,24 @@ TestCase VectorCompareInteger64Edges() {
     AppendVop3(&test.code, 0xa3, 20, Vgpr(1), 255);
     test.code.push_back(0xffffffffu);
     store_mask(20, signed_lhs <= -1);
+    // Captured 8395e43f382309df PC 0x20cc: s[2:3] = (s[0:1] != 0) & EXEC.
+    // Save the test buffer descriptor while its SGPRs hold the captured operands.
+    test.code.push_back(EncodeSop1(0x04, 32, 0));
+    test.code.push_back(EncodeSop1(0x04, 34, 2));
+    test.code.push_back(EncodeVop1(0x02, 0, Vgpr(1)));
+    test.code.push_back(EncodeVop1(0x02, 1, Vgpr(2)));
+    test.code.insert(test.code.end(), {0xd4a50002u, 0x00010000u});
+    test.code.push_back(EncodeSop1(0x04, 20, 2));
+    test.code.push_back(EncodeSop1(0x04, 0, 32));
+    test.code.push_back(EncodeSop1(0x04, 2, 34));
+    store_mask(20, lhs != 0);
   }
   AppendEnd(&test.code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
-                  O::V_CMP_LT_I64, O::V_CMP_LE_I64, O::V_CMP_EQ_I64,
+                  O::V_CMP_LT_I64, O::V_CMP_LE_I64, O::V_CMP_EQ_I64, O::V_CMP_NE_I64,
                   O::V_CMP_LE_U64, O::V_CMP_GE_U64,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSLessThan", "OpULessThanEqual", "OpUGreaterThanEqual"};
   return test;
 }
@@ -24675,25 +24688,34 @@ TestCase VectorCompareF64Edges() {
   return test;
 }
 
-TestCase VectorCompareF64WaveMasks(u32 wave_size) {
+TestCase VectorCompare64WaveMasks(u32 wave_size, bool integer_ne = false) {
   using O = ShaderOpcode;
   constexpr std::array<uint64_t, 4> values{0, 1, 0x8000000000000000ull,
                                           0x7ff8000000000000ull};
   constexpr u32 low_exec = 0xeeeeeeeeu, high_exec = 0x77777777u;
   constexpr u32 vcc_hi = 0x89abcdefu;
+  constexpr u32 vcc_lo = 0x12345678u;
+  const u32 result_reg = integer_ne ? 20 : 106;
+  const u32 result_bits = integer_ne ? 0xeeeeeeeeu : 0x55555555u;
   TestCase test;
-  test.name = wave_size == 32 ? "VectorCompareF64Wave32Masks" : "VectorCompareF64Wave64Masks";
-  test.initial.assign(6 * wave_size, 0);
+  test.name = integer_ne
+      ? (wave_size == 32 ? "VectorCompareNeI64Wave32Masks" : "VectorCompareNeI64Wave64Masks")
+      : (wave_size == 32 ? "VectorCompareF64Wave32Masks" : "VectorCompareF64Wave64Masks");
+  test.initial.assign((integer_ne ? 8 : 6) * wave_size, 0);
   for (u32 lane = 0; lane < wave_size; ++lane) {
     test.initial[lane] = u32(values[lane % 4]);
     test.initial[wave_size + lane] = u32(values[lane % 4] >> 32);
   }
   test.expected = test.initial;
   for (u32 lane = 0; lane < wave_size; ++lane) {
-    test.expected[2 * wave_size + lane] = low_exec & 0x55555555u;
-    test.expected[3 * wave_size + lane] = wave_size == 64 ? high_exec & 0x55555555u : vcc_hi;
+    test.expected[2 * wave_size + lane] = low_exec & result_bits;
+    test.expected[3 * wave_size + lane] = wave_size == 64 ? high_exec & result_bits : vcc_hi;
     test.expected[4 * wave_size + lane] = low_exec;
     test.expected[5 * wave_size + lane] = wave_size == 64 ? high_exec : 0;
+    if (integer_ne) {
+      test.expected[6 * wave_size + lane] = vcc_lo;
+      test.expected[7 * wave_size + lane] = vcc_hi;
+    }
   }
   auto& code = test.code;
   code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
@@ -24702,16 +24724,24 @@ TestCase VectorCompareF64WaveMasks(u32 wave_size) {
   code.push_back(EncodeVop2(0x25, 31, Vgpr(31), 30));
   AppendBufferLoadDword(&code, 2, 31);
   code.push_back(EncodeSop1(0x04, 10, 126));
-  AppendSMovLiteral(&code, 107, vcc_hi);
+  AppendSMovLiteral(&code, result_reg + 1, vcc_hi);
+  if (integer_ne) {
+    AppendSMovLiteral(&code, 106, vcc_lo);
+    AppendSMovLiteral(&code, 107, vcc_hi);
+  }
   AppendSMovLiteral(&code, 126, low_exec);
   if (wave_size == 64) AppendSMovLiteral(&code, 127, high_exec);
-  AppendVop3(&code, 0x22, 106, InlineU32(0), Vgpr(1));
-  code.push_back(EncodeSMovB32(20, 126));
-  code.push_back(EncodeSMovB32(21, 127));
+  AppendVop3(&code, integer_ne ? 0xa5 : 0x22, result_reg, InlineU32(0), Vgpr(1));
+  code.push_back(EncodeSMovB32(22, 126));
+  code.push_back(EncodeSMovB32(23, 127));
   code.push_back(EncodeSop1(0x04, 126, 10));
   for (const auto [reg, offset] : std::array<std::pair<u32, u32>, 4>{{
-           {106, 2}, {107, 3}, {20, 4}, {21, 5}}})
+           {result_reg, 2}, {result_reg + 1, 3}, {22, 4}, {23, 5}}})
     AppendStoreSgprAtLaneDwordOffset(&code, reg, 0, offset * wave_size);
+  if (integer_ne) {
+    AppendStoreSgprAtLaneDwordOffset(&code, 106, 0, 6 * wave_size);
+    AppendStoreSgprAtLaneDwordOffset(&code, 107, 0, 7 * wave_size);
+  }
   AppendEnd(&code);
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
@@ -24719,9 +24749,10 @@ TestCase VectorCompareF64WaveMasks(u32 wave_size) {
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64, O::V_LSHLREV_B32,
-                  O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD, O::V_CMP_EQ_F64,
+                  O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
+                  integer_ne ? O::V_CMP_NE_I64 : O::V_CMP_EQ_F64,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpFOrdEqual"};
+  test.required_spirv = {integer_ne ? "OpINotEqual" : "OpFOrdEqual"};
   return test;
 }
 
@@ -33969,8 +34000,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareInteger64Edges);
   cases.push_back(VectorCompareExecWaveMasks(32));
   cases.push_back(VectorCompareExecWaveMasks(64));
-  cases.push_back(VectorCompareF64WaveMasks(32));
-  cases.push_back(VectorCompareF64WaveMasks(64));
+  cases.push_back(VectorCompare64WaveMasks(32));
+  cases.push_back(VectorCompare64WaveMasks(64));
+  cases.push_back(VectorCompare64WaveMasks(32, true));
+  cases.push_back(VectorCompare64WaveMasks(64, true));
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorFractF64CapturedAndEdges);
   AddCase(VectorFractF64CapturedChainRuntimeExec);
@@ -39204,6 +39237,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());
+    RunCase(&vulkan, VectorCompare64WaveMasks(32, true));
+    RunCase(&vulkan, VectorCompare64WaveMasks(64, true));
     RunCase(&vulkan, VectorCompareExecWaveMasks(32));
     RunCase(&vulkan, VectorCompareExecWaveMasks(64));
     RunCase(&vulkan, VectorCompareF64Edges());
@@ -39316,8 +39351,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cmp-eq-f64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareF64Edges());
-    RunCase(&vulkan, VectorCompareF64WaveMasks(32));
-    RunCase(&vulkan, VectorCompareF64WaveMasks(64));
+    RunCase(&vulkan, VectorCompare64WaveMasks(32));
+    RunCase(&vulkan, VectorCompare64WaveMasks(64));
     RunCase(&vulkan, VectorF64CapturedScreenSpaceShadows());
     RunCase(&vulkan, VectorFractF64CapturedAndEdges());
     RunCase(&vulkan, VectorFractF64CapturedChainRuntimeExec());
