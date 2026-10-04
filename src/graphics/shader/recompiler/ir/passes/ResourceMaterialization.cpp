@@ -317,6 +317,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
 			if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
+			    (indirect.selector_shift != 0u && (material.Base48() & 3u) != 0u) ||
 			    material.SwizzleEnabled() ||
 			    material.AddTid() || material.OutOfBounds() != 0u ||
 			    uint64_t {indirect.selector_offset} + 4u > material.Stride() ||
@@ -328,17 +329,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			                           indirect.selector_offset + 4u >
 			                       uint64_t {UINT32_MAX} + 1u)
 				return false;
-			keys.reserve(count);
-			for (uint64_t index = first; index < uint64_t {first} + count; ++index) {
-				uint32_t   key    = 0;
-				const auto offset = index * material.Stride() + indirect.selector_offset;
-				if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
-				                     {&key, 1}))
-					return false;
-				keys.push_back(key);
+			if (material.Stride() == 4u && indirect.selector_offset == 0u) {
+				keys.resize(count);
+				if (!ReadScalarTable(material.Base48(), material.GetSize(), uint64_t {first} * 4u,
+				                     runtime, keys)) return false;
+			} else {
+				keys.reserve(count);
+				for (uint64_t index = first; index < uint64_t {first} + count; ++index) {
+					uint32_t   key    = 0;
+					const auto offset = index * material.Stride() + indirect.selector_offset;
+					if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
+					                     {&key, 1})) return false;
+					keys.push_back(key);
+				}
 			}
-			std::ranges::sort(keys);
-			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		} else if (!indirect.selector_mask.IsEmpty()) {
 			uint32_t mask = 0;
 			uint32_t count = 0;
@@ -362,8 +366,6 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				keys.push_back(key);
 				mask &= mask - 1u;
 			}
-			std::ranges::sort(keys);
-			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		} else {
 			ShaderBufferResource material;
 			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
@@ -388,6 +390,12 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return false;
 				}
 				keys.push_back(key);
+			}
+		}
+		if (indirect.material_source != UINT32_MAX) {
+			if (indirect.selector_shift != 0u) {
+				for (auto& key: keys) key >>= indirect.selector_shift;
+				keys.push_back(0u); // An out-of-range material load returns zero.
 			}
 			std::ranges::sort(keys);
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -458,10 +466,21 @@ struct SamplerPlan {
 	uint32_t                                                  sampler_count = 0;
 };
 
+template <typename T, typename Keep>
+void CompactImages(std::vector<T>& images, Keep&& keep) {
+	size_t count = 0;
+	for (size_t index = 0; index < images.size(); ++index) {
+		if (!keep(index)) continue;
+		if (count != index) images[count] = std::move(images[index]);
+		++count;
+	}
+	images.resize(count);
+}
+
 struct ImageRemap {
 	explicit ImageRemap(const ResourceSpecialization& specialization)
-	    : source_count(static_cast<uint32_t>(specialization.images.size())) {
-		EXIT_IF(specialization.images.size() > indices.size());
+	    : indices(specialization.images.size()),
+	      source_count(static_cast<uint32_t>(specialization.images.size())) {
 		for (uint32_t index = 0; index < source_count; index++) {
 			indices[index] = specialization.images[index].fmask ? UINT32_MAX : count++;
 		}
@@ -478,16 +497,11 @@ struct ImageRemap {
 		if (count == source_count) {
 			return;
 		}
-		for (uint32_t index = 0; index < source_count; index++) {
-			if (indices[index] != UINT32_MAX && indices[index] != index) {
-				images[indices[index]] = std::move(images[index]);
-			}
-		}
-		images.resize(count);
+		CompactImages(images, [&](size_t index) { return indices[index] != UINT32_MAX; });
 	}
 
 private:
-	std::array<uint32_t, ShaderInfo::MaxImages> indices;
+	std::vector<uint32_t> indices;
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
 };
@@ -634,7 +648,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
-	ImageRemap(specialization).Apply(snapshot.images);
+	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
 
@@ -1399,7 +1413,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 			const auto& indirect = *source->indirect_descriptor;
 			if (!MaterializeIndirectDescriptor(
 			        program, roots, image.source, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
-			        specialization.images, ShaderInfo::MaxImages, [&](DescriptorValue& value) {
+			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128))
 					        value.dwords.fill(0u);
 				        return true;

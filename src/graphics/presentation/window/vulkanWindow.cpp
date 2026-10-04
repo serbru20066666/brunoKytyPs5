@@ -57,6 +57,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
 
@@ -268,6 +269,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.bufferDeviceAddress);
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
 		              required_features12.shaderBufferInt64Atomics);
+		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
+		              "shaderSampledImageArrayNonUniformIndexing",
+		              required_features12.shaderSampledImageArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);

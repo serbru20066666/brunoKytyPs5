@@ -826,6 +826,7 @@ private:
 				const auto& b = *descriptor.indirect_descriptor;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
+				    a.selector_shift != b.selector_shift ||
 				    a.table_offset != b.table_offset || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
@@ -1549,6 +1550,37 @@ private:
 		return true;
 	}
 
+	bool MatchUniformizedBufferKey(Value key, const Inst& image,
+	                               DescriptorSource::IndirectDescriptor& indirect,
+	                               DescriptorSource& material_source) {
+		const auto* selected = UniformizedMaterialValue(key, image);
+		if (selected == nullptr) return false;
+		const auto* shift = selected->Arg(1).Resolve().TryInstruction();
+		uint32_t amount = 0;
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
+		    !ImmediateU32(shift->Arg(1), amount) || amount == 0u || amount >= 32u) return false;
+		const auto* loaded = shift->Arg(0).Resolve().TryInstruction();
+		if (loaded == nullptr || loaded->GetOpcode() != ValueOpcode::SelectU32 ||
+		    !EquivalentValue(m_program, selected->Arg(0), loaded->Arg(0))) return false;
+		const auto* read = loaded->Arg(1).Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) return false;
+		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+		uint32_t offset = 1u, scalar = 1u;
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen ||
+		    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
+		    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
+		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4)) ||
+		    !MakeRuntimeTableSource(*read, material_source)) return false;
+		// GPU index arithmetic may wrap. Every record in the bounded V# is a candidate.
+		indirect.material_source = InternSource(material_source);
+		indirect.selector_first = Value(0u);
+		indirect.key_count = material_source.dwords[2];
+		indirect.selector_offset = memory.offset;
+		indirect.selector_shift = amount;
+		return true;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
 		DescriptorSource table_source;
@@ -1575,7 +1607,7 @@ private:
 			}
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
-		} else {
+		} else if (!MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
 			auto* material_read = key.Resolve().TryInstruction();
 			uint32_t material_memory_index = 0;
 			const auto* memory = material_read != nullptr

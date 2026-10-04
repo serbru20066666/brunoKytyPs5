@@ -497,6 +497,7 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		uint32_t selector_shift  = 0;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

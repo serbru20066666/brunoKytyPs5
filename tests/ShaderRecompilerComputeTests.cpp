@@ -17796,6 +17796,7 @@ private:
               features12.samplerMirrorClampToEdge != true ||
               features12.shaderOutputViewportIndex != true ||
               features12.shaderBufferInt64Atomics != true ||
+              features12.shaderSampledImageArrayNonUniformIndexing != true ||
               features12.shaderSharedInt64Atomics != true ||
               image_atomic64.shaderImageInt64Atomics != true ||
               workgroup_layout.workgroupMemoryExplicitLayout != true ||
@@ -17885,6 +17886,9 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.shaderSampledImageArrayNonUniformIndexing == true,
+            "nonuniform sampled image indexing is not supported");
     m_min_lod_supported = available_min_lod.minLod == true;
     Require("VulkanHarness", "dispatch", m_min_lod_supported || SoftwareGpuAllowed(),
             "image view minimum LOD is not supported");
@@ -32532,12 +32536,44 @@ void CheckIndirectImageKeySwitch() {
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
           "failed to disassemble indirect image shader");
-  Require(name, "key switch",
-          text.find("OpSwitch") != std::string::npos &&
-              text.find("OpPhi") != std::string::npos &&
-              CountText(text, "OpImageSampleExplicitLod") == 2 &&
-              CountText(text, "OpIEqual") == 1,
-          "dynamic image key did not use a compact two-sample switch");
+  Require(name, "homogeneous image array",
+          text.find("OpSwitch") == std::string::npos &&
+              CountText(text, "OpImageSampleExplicitLod") == 1 &&
+              text.find("SampledImageArrayNonUniformIndexing") != std::string::npos,
+          "homogeneous image keys did not select one descriptor array sample");
+  u32 sampled_image = 0;
+  std::vector<u32> nonuniform;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+    if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+      nonuniform.push_back(words[1]);
+    if (opcode == spv::OpImageSampleExplicitLod) sampled_image = words[3];
+    offset += words.size();
+  }
+  Require(name, "nonuniform sampled image operand",
+          sampled_image != 0u && std::ranges::find(nonuniform, sampled_image) != nonuniform.end(),
+          "the sample operand lacks its nonuniform decoration");
+
+  // Materialized children follow all native roots, including unrelated images.
+  root.indirect_resources = {0u};
+  program.info.images = {root, candidate};
+  program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
+  for (u32 ordinal = 1; ordinal < 189u; ++ordinal) {
+    root.indirect_resources.push_back(static_cast<u32>(program.info.images.size()));
+    program.info.images.push_back(candidate);
+  }
+  program.info.images[0] = root;
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "large image array disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble the materialized image array");
+  Require(name, "large homogeneous image array",
+          text.find("OpSwitch") == std::string::npos &&
+              CountText(text, "OpImageSampleExplicitLod") == 1,
+          "materialized images expanded into per-candidate samples");
 
   program.memory_info[0].image_dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
@@ -36809,6 +36845,94 @@ void CheckImageSamplerSpecialization() {
                   }),
           "a shared float/unsigned/signed sampler lost its border or filtering "
           "class in the compiled bindings, instruction or descriptor snapshot");
+
+  {
+    using namespace ShaderRecompiler::IR;
+    constexpr const char *name = "GpuMaterialImageDomain";
+    constexpr u32 count = 70, table_base = 0x1000, material_base = 0x2000;
+    std::vector<u32> memory(4096);
+    for (u32 i = 0; i < count; ++i) {
+      auto descriptor = native_image_descriptor;
+      descriptor.dwords[0] += i * 0x100u;
+      std::copy(descriptor.dwords.begin(), descriptor.dwords.end(),
+                memory.begin() + table_base / 4u + i * 8u);
+      memory[material_base / 4u + i] = (i << 4u) | 3u;
+    }
+    memory[material_base / 4u + count] = (7u << 4u) | 15u; // Duplicate after shift.
+    memory[material_base / 4u + count + 1u] = 0x80000010u; // key<<5 wraps to entry1.
+    memory[material_base / 4u + count + 2u] = count << 4u; // Scalar table OOB is null.
+    std::array<u32, 64> user_data{};
+    const std::array<u32, 8> buffers{table_base, 32u << 16u, count, 0x5204u,
+                                    material_base, 4u << 16u, count + 3u, 0x5204u};
+    std::copy(buffers.begin(), buffers.end(), user_data.begin());
+    const auto output = MakeStructuredStorageBufferData(
+        0u, 64u, false, static_cast<u32>(Prospero::BufferFormat::k32UInt));
+    std::copy_n(output.begin(), 4, user_data.begin() + 48);
+    user_data[48] = 0x3000u;
+    std::vector<u32> code{EncodeVopc(0xc5, InlineU32(0), 0),
+                          EncodeSop1(0x24, 24, 106), EncodeSopp(0x08, 0),
+                          EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(15, 1, 0),
+                          EncodeVop2(0x16, 15, InlineU32(4), 15),
+                          EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15),
+                          EncodeSop2(0x1e, 20, 20, InlineU32(5)),
+                          EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20),
+                          EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)};
+    AppendBufferStoreDword(&code, 4, 0);
+    code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
+    AppendEnd(&code);
+    ShaderComputeInputInfo compute{};
+    compute.wave_size = 32;
+    compute.threads_num[0] = 32;
+    compute.thread_ids_num = 1;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 32;
+    options.user_data = user_data;
+    options.input_info.compute = &compute;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ExtractResourcePlan(translated.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
+                             .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    Require(name, "bounded native material plan",
+            plan.capture_specialization_reads && !translated.program.has_address_writes &&
+                MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.images.size() == count + 1u,
+            "GPU-selected material descriptors did not expand beyond native root capacity");
+    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto ordinal = [&](u32 key) {
+      for (u32 i = 0; i < snapshot.flattened_srt[offset]; ++i)
+        if (snapshot.flattened_srt[offset + 1u + 2u * i] == key)
+          return snapshot.flattened_srt[offset + 2u + 2u * i];
+      return UINT32_MAX;
+    };
+    Require(name, "shift, wrap and whole-record read",
+            snapshot.flattened_srt[offset] == count + 2u && ordinal(1u) != UINT32_MAX &&
+                ordinal(0x08000001u) == ordinal(1u) && ordinal(count) < snapshot.images.size() &&
+                snapshot.images[ordinal(count)].dwords[0] == 0u &&
+                std::ranges::count(snapshot.specialization_reads,
+                    std::pair<uint64_t, uint64_t>{material_base, (count + 3u) * 4u}) == 1,
+            "material keys lost shift/dedup, scalar wrap/OOB, or bulk strict-read semantics");
+    const auto previous = specialization;
+    memory[table_base / 4u + 8u] += 0x10000u;
+    Require(name, "runtime descriptor refresh",
+            MaterializeResources(plan, runtime, snapshot, specialization) &&
+                specialization == previous && snapshot.images[1].dwords[0] == 0x11100u,
+            "descriptor addresses were frozen or entered the shader specialization");
+    auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    ValidateSpirv(name, compiled.spirv);
+    user_data[4] += 1u;
+    Require(name, "misaligned material rejection",
+            !MaterializeResources(plan, runtime, snapshot, specialization),
+            "unaligned raw buffer base was treated as separately aligned scalar memory");
+    user_data[4] -= 1u;
+    auto dirty = runtime;
+    dirty.read_specialization_memory = +[](void*, uint64_t, std::span<u32>) { return false; };
+    Require(name, "dirty material rejection",
+            !MaterializeResources(plan, dirty, snapshot, specialization),
+            "GPU-selected texture materialization bypassed strict read provenance");
+  }
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }

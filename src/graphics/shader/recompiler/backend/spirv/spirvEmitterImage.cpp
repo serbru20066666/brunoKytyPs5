@@ -776,13 +776,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
-		const auto EmitSample = [&](uint32_t resource) {
+		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto            sampled = MakeSampledImage(state, resource, sampler_id);
+			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
 			if (dref) {
@@ -821,6 +821,41 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		const auto selected = EmitIndirectResourceIndex(
 		    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+		const auto kind = *IR::DescriptorBindingForImage(image);
+		const auto& binding = *IR::FindBinding(state.program.bindings, kind);
+		uint32_t first_child = 0;
+		bool homogeneous = true;
+		for (uint32_t ordinal = 0; ordinal < image.indirect_resources.size(); ++ordinal) {
+			const auto resource = image.indirect_resources[ordinal];
+			const auto& candidate = state.program.info.images[resource];
+			if (candidate.dimension != image.dimension || candidate.cube != image.cube ||
+			    IR::DescriptorBindingForImage(candidate) != kind ||
+			    candidate.mip_count != 1u) {
+				homogeneous = false;
+				break;
+			}
+			if (ordinal == 1u) first_child = ResourceForDescriptor(state, kind, resource);
+			const auto child_slot = first_child + ordinal - 1u;
+			if (ordinal > 1u && (child_slot >= binding.resources.size() ||
+			                     binding.resources[child_slot] != resource)) {
+				homogeneous = false;
+				break;
+			}
+		}
+		if (homogeneous) {
+			const auto child_index = Binary(state, spv::OpIAdd, TypeU32(state), selected,
+			                                ConstantU32(state, first_child - 1u));
+			const auto is_root = Binary(state, spv::OpIEqual, TypeBool(state), selected,
+			                            ConstantU32(state, 0u));
+			const auto array_index = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), array_index, is_root,
+			                          ConstantU32(state, ResourceForDescriptor(state, kind, mem.resource)),
+			                          child_index);
+			const auto sample = EmitSample(mem.resource, array_index);
+			const auto result = dref ? sample : UnpackImageTexel(ctx, mem, sample);
+			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+			return;
+		}
 		const auto            default_label = state.builder.AllocateId();
 		const auto            merge_label   = state.builder.AllocateId();
 		std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
