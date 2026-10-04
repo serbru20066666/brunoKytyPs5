@@ -2297,6 +2297,8 @@ public:
     pixel_snapshot.user_data = {0x77777777u, 0x88888888u};
     executor.PrepareBindings(vertex_runtime, vertex);
     executor.PrepareBindings(pixel_runtime, pixel);
+    std::array<PreparedBindings *, 2> stages{&vertex, &pixel};
+    RenderExecutorTestAccess::PrepareGraphicsBindings(executor, stages, {});
     Require(name, "prepared binding scratch",
             vertex.shader_data.data() == vertex_storage &&
                 pixel.shader_data.data() == pixel_storage &&
