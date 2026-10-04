@@ -36639,8 +36639,8 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 19> legacy_shader_slots{
-      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
+  constexpr std::array<uint32_t, 17> legacy_shader_slots{
+      0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
       0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
       0x219u, 0x21au, 0x27du,
   };
@@ -36669,13 +36669,18 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
       g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr &&
       g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr;
 
+  const bool native_ps_address_slots_are_handled =
+      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
+      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr;
   const bool native_pace_slots_are_handled =
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] != nullptr;
   Require("Pm4NativeTargetGeometry", "legacy register holes",
           legacy_slots_are_unhandled && native_pace_slots_are_handled &&
-              native_index_size_packet_complete,
+              native_ps_address_slots_are_handled && native_index_size_packet_complete,
           "a removed GCN register has a handler or a native packet is not handled");
   std::printf("[host]    %-32s ok\n", "Pm4NativeTargetGeometry");
 }
