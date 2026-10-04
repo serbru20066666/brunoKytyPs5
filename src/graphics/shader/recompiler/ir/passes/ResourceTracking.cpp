@@ -923,38 +923,39 @@ private:
 		return ValidateSource(descriptor, bad_dword);
 	}
 
-	bool MatchMaterialOffset(Value value, Value& selector, uint32_t& stride,
-	                         uint32_t& offset) const {
-		value           = value.Resolve();
-		offset          = 0;
-		auto* candidate = value.TryInstruction();
-		if (candidate != nullptr && candidate->GetOpcode() == ValueOpcode::IAdd32 &&
-		    candidate->NumArgs() == 2u) {
-			uint32_t immediate = 0;
-			if (ImmediateU32(candidate->Arg(0), immediate)) {
-				value = candidate->Arg(1).Resolve();
-			} else if (ImmediateU32(candidate->Arg(1), immediate)) {
-				value = candidate->Arg(0).Resolve();
+	bool MatchMaterialOffset(Value value, uint32_t& stride, uint32_t& offset) const {
+		stride = 1u;
+		offset = 0u;
+		value = value.Resolve();
+		while (const auto* inst = value.TryInstruction()) {
+			if (inst->NumArgs() != 2u) break;
+			uint32_t constant = 0;
+			Value remaining;
+			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), constant) && constant < 32u) {
+				stride *= 1u << constant;
+				remaining = inst->Arg(0);
+			} else if (inst->GetOpcode() == ValueOpcode::IAdd32 ||
+			           inst->GetOpcode() == ValueOpcode::IMul32) {
+				if (ImmediateU32(inst->Arg(0), constant)) remaining = inst->Arg(1);
+				else if (ImmediateU32(inst->Arg(1), constant)) remaining = inst->Arg(0);
+				else break;
+				if (inst->GetOpcode() == ValueOpcode::IAdd32) offset += stride * constant;
+				else stride *= constant;
 			} else {
-				return false;
+				break;
 			}
-			offset = immediate;
+			value = remaining.Resolve();
 		}
-		const auto* multiply = value.TryInstruction();
-		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
-		    multiply->NumArgs() != 2u) {
-			return false;
-		}
-		if (ImmediateU32(multiply->Arg(0), stride)) {
-			selector = multiply->Arg(1).Resolve();
-		} else if (ImmediateU32(multiply->Arg(1), stride)) {
-			selector = multiply->Arg(0).Resolve();
-		} else {
-			return false;
-		}
-		const auto* selector_inst = selector.TryInstruction();
-		return stride != 0u && selector_inst != nullptr &&
-		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+		// Treat the remaining GPU-derived scalar as any U32 value.
+		return stride != 0u && value.GetType() == Type::U32 && !value.IsImmediate();
+	}
+
+	const Inst* MaterialKeyShift(Value key, uint32_t& amount) const {
+		const auto* shift = key.Resolve().TryInstruction();
+		return shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+		               ImmediateU32(shift->Arg(1), amount) && amount != 0u && amount < 32u
+		           ? shift : nullptr;
 	}
 
 	enum class LaneQuantifier { Any, All };
@@ -1558,10 +1559,9 @@ private:
 	                               DescriptorSource& material_source) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
-		const auto* shift = selected->Arg(1).Resolve().TryInstruction();
 		uint32_t amount = 0;
-		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
-		    !ImmediateU32(shift->Arg(1), amount) || amount == 0u || amount >= 32u) return false;
+		const auto* shift = MaterialKeyShift(selected->Arg(1), amount);
+		if (shift == nullptr) return false;
 		const auto* loaded = shift->Arg(0).Resolve().TryInstruction();
 		if (loaded == nullptr || loaded->GetOpcode() != ValueOpcode::SelectU32 ||
 		    !EquivalentValue(m_program, selected->Arg(0), loaded->Arg(0))) return false;
@@ -1611,7 +1611,9 @@ private:
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else if (!MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
-			auto* material_read = key.Resolve().TryInstruction();
+			const auto* key_shift = MaterialKeyShift(key, indirect.selector_shift);
+			auto* material_read =
+			    (key_shift != nullptr ? key_shift->Arg(0) : key).Resolve().TryInstruction();
 			uint32_t material_memory_index = 0;
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
@@ -1619,8 +1621,7 @@ private:
 			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
-			Value selector;
-			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
+			if (!MatchMaterialOffset(material_read->Arg(1), indirect.selector_stride,
 			                         indirect.selector_offset)) {
 				return false;
 			}
@@ -1628,8 +1629,11 @@ private:
 			indirect.selector_offset =
 			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
-			const std::array<const Inst*, 1> material_users {shift};
-			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
+			const std::array<const Inst*, 1> material_users {key_shift != nullptr ? key_shift : shift};
+			const std::array<const Inst*, 1> key_users {shift};
+			if (!UsesOnly(*material_read, material_users) ||
+			    (key_shift != nullptr && !UsesOnly(*key_shift, key_users)) ||
+			    !UsesOnly(*shift, plan.reads)) {
 				return false;
 			}
 			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();

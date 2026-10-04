@@ -281,6 +281,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto  descriptor_bytes = dword_count * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
 	auto& keys = program.ThreadScratch().material_keys;
+	const auto read_keys = [&](const ShaderBufferResource& material, uint64_t first,
+	                           uint64_t step, uint64_t count) {
+		keys.resize(count);
+		if (step == 4u) {
+			return ReadScalarTable(material.Base48(), material.GetSize(), first, runtime, keys);
+		}
+		for (auto& key: keys) {
+			if (!ReadScalarTable(material.Base48(), material.GetSize(), first, runtime, {&key, 1}))
+				return false;
+			first += step;
+		}
+		return true;
+	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	if (sources.empty()) {
@@ -329,20 +342,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			                           indirect.selector_offset + 4u >
 			                       uint64_t {UINT32_MAX} + 1u)
 				return false;
-			if (material.Stride() == 4u && indirect.selector_offset == 0u) {
-				keys.resize(count);
-				if (!ReadScalarTable(material.Base48(), material.GetSize(), uint64_t {first} * 4u,
-				                     runtime, keys)) return false;
-			} else {
-				keys.reserve(count);
-				for (uint64_t index = first; index < uint64_t {first} + count; ++index) {
-					uint32_t   key    = 0;
-					const auto offset = index * material.Stride() + indirect.selector_offset;
-					if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
-					                     {&key, 1})) return false;
-					keys.push_back(key);
-				}
-			}
+			if (!read_keys(material, uint64_t {first} * material.Stride() + indirect.selector_offset,
+			               material.Stride(), count)) return false;
 		} else if (!indirect.selector_mask.IsEmpty()) {
 			uint32_t mask = 0;
 			uint32_t count = 0;
@@ -368,8 +369,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 		} else {
 			ShaderBufferResource material;
-			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-			    material.Stride() != indirect.selector_stride) {
+			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u) {
 				return false;
 			}
 			// The first aligned offset includes the immediate added after shader U32 arithmetic.
@@ -382,15 +382,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (probe_count > MaxIndirectDescriptorProbes) {
 				return false;
 			}
-			keys.reserve(static_cast<size_t>(probe_count) + 1u);
-			keys.push_back(0u);
-			for (uint64_t probe = 0, offset = first; probe < probe_count; ++probe, offset += step) {
-				uint32_t key = 0;
-				if (!ReadScalarTable(material.Base48(), size, offset, runtime, {&key, 1})) {
-					return false;
-				}
-				keys.push_back(key);
-			}
+			if (!read_keys(material, first, step, probe_count)) return false;
+			if (indirect.selector_shift == 0u) keys.push_back(0u);
 		}
 		if (indirect.material_source != UINT32_MAX) {
 			if (indirect.selector_shift != 0u) {
@@ -1043,8 +1036,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (!source.indirect_descriptor.has_value()) continue;
 		const auto& indirect                = *source.indirect_descriptor;
 		plan.requires_specialization_memory = true;
-		capture_indirect_reads |= !indirect.selector_mask.IsEmpty() ||
-		                          !indirect.selector_first.IsEmpty() || !indirect.sources.empty();
+		capture_indirect_reads |= indirect.material_source != UINT32_MAX || !indirect.sources.empty();
 		MarkCleanFlatSlots(plan, Source(plan, indirect.material_source), plan.clean_flat_slots,
 		                   indirect.selector_mask);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_first);
