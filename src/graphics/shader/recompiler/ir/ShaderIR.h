@@ -106,6 +106,9 @@ struct BufferResource {
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
+	// Nonzero proves index = local_x + workgroup_x * dispatch_stride. NUM_RECORDS
+	// stays on the GPU; host binding capacity comes from the known dispatch extent.
+	uint32_t               dispatch_stride    = 0;
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);

@@ -534,7 +534,15 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	EmitIfCondition(ctx.state, EmitWordAccessInBounds(ctx.state, resource, index), [&]() {
+	auto in_bounds = EmitWordAccessInBounds(ctx.state, resource, index);
+	if (mem.kind == IR::ResourceKind::Buffer &&
+	    ctx.state.program.info.buffers[mem.resource].dispatch_stride != 0u) {
+		const auto& handle = *inst.Arg(0).ResolveInstruction();
+		in_bounds = AndCondition(
+		    ctx.state, in_bounds,
+		    Binary(ctx.state, spv::OpULessThan, TypeBool(ctx.state), ctx.Arg(inst, 1), ctx.Arg(handle, 2)));
+	}
+	EmitIfCondition(ctx.state, in_bounds, [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
 }

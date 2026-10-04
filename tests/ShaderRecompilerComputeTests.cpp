@@ -32450,6 +32450,82 @@ void CheckComputeThreadDimensions(VulkanHarness &vulkan) {
   }
 }
 
+void CheckGpuComputedBufferRecords(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  TestCase test;
+  test.name = "GpuComputedBufferRecords";
+  // Captured b71ef7c579835a0d: read a GPU counter, divide it into chunks,
+  // construct a structured descriptor, then clear each live record's last DWORD.
+  test.code = {
+    0xbfa00003u, 0xd7460000u, 0x04010c0eu, 0x8805ff0du, 0x00040000u, 0xbe84030cu,
+    0xbe860381u, 0xbe8703ffu, 0x00016204u, 0xb06a0100u, 0xe0300000u, 0x80010400u,
+    0x92049281u, 0x7e0a026au, 0x996a9480u, 0xb0062000u, 0xb00a0080u, 0x380212f9u,
+    0x8686066au, 0x7e040208u, 0x7e0602ffu, 0x00016204u, 0xbf8c3f70u, 0x7d8808ffu,
+    0x00000200u, 0x7d8808f9u, 0x06868404u, 0x7d8808f9u, 0x06868606u, 0x020d80f9u,
+    0x8686060au, 0xd5010005u, 0x00120affu, 0x00000200u, 0xd5010006u, 0x001a0d05u,
+    0x7e0a0d06u, 0x7e0c0506u, 0xd76d0004u, 0x041a08c1u, 0x7e0a5705u, 0x81ea0680u,
+    0x7e080504u, 0x100a0affu, 0x4f7ffffeu, 0x7e0a0f05u, 0x7ed60505u, 0x936a6b6au,
+    0x9aea6b6au, 0x816a6a6bu, 0x9a87046au, 0x936a0607u, 0x4e08086au, 0x4e0a0806u,
+    0x7d8608f9u, 0x06868406u, 0x7d860a06u, 0x87ea046au, 0x020902f9u, 0x86860680u,
+    0xd5286a04u, 0x00120807u, 0xbeea047eu, 0x7da40080u, 0xbf880003u, 0x7e0a0280u,
+    0xe0700000u, 0x80000500u, 0xbefe046au, 0x7e0a0280u, 0x7e000502u, 0x7e020501u,
+    0x7e040504u, 0x7e060503u, 0xe0702010u, 0x80000500u, 0xbf810000u,
+  };
+  constexpr u32 guest_base = 0x1000;
+  test.user_data[0] = guest_base + 16;
+  test.user_data[1] = 4u << 16;
+  test.user_data[2] = 1;
+  test.user_data[3] = 0x5204;
+  test.user_data[8] = guest_base + 20;
+  test.user_data[12] = guest_base;
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {0, 16, 20};
+  test.initial.assign(5 + 5 * 130, 0xdeadbeefu);
+  test.initial[0] = 72;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 64;
+  test.compute_info.float_mode = 0xc0;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 14;
+  test.compute_info.dispatch_thread_dimensions = true;
+  test.compute_info.dispatch_threads_num[0] = 2;
+  test.compute_info.dispatch_threads_num[1] = test.compute_info.dispatch_threads_num[2] = 1;
+  test.required_spirv = {"OpFDiv", "OpUMulExtended"};
+  test.forbidden_spirv = {"get_bda_pointer", "flattened_srt"};
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  Require(test.name, "native record count",
+          compiled.program.info.buffers.size() == 3 &&
+              compiled.program.info.buffers[2].dispatch_stride == 64 &&
+              compiled.resources.buffers[2].dwords[2] == 0 &&
+              compiled.resources.specialization_reads.empty(),
+          "GPU count entered the host descriptor snapshot or lost its dispatch bound");
+  // Reuse the same compiled shader as both GPU data and dispatch coverage change.
+  for (const u32 count : {0u, 72u, 512u, 8192u, 262144u}) {
+    for (const u32 threads : {2u, 3u, 65u}) {
+      test.initial[0] = count;
+      test.compute_info.dispatch_threads_num[0] = threads;
+      test.dispatch_x = (threads + 63) / 64;
+      const u32 chunk = count < 512 ? 64 : count < 8192 ? 128 : count < 262144 ? 256 : 512;
+      const u32 records = (count + chunk - 1) / chunk;
+      test.expected = test.initial;
+      test.expected[4] = 0;
+      for (u32 index = 0; index < std::min(threads, records); ++index) {
+        test.expected[9 + index * 5] = 0;
+      }
+      auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, output);
+      const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
+      vulkan.DestroyBuffer(&output);
+      CompareWords(test, "GPU records and padded invocation bounds", test.expected, actual);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
 void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   TestCase test;
@@ -39865,6 +39941,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckIndirectBufferStore(vulkan);
+    CheckGpuComputedBufferRecords(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
@@ -40462,6 +40539,7 @@ int main(int argc, char **argv) {
   CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectBufferStore(vulkan);
+  CheckGpuComputedBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch();
   CheckWave64WholeWaveResults();

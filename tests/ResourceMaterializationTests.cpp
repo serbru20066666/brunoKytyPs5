@@ -197,6 +197,45 @@ void TestRawScalarAddressPreservesHighBits() {
   }
 }
 
+void TestDispatchBufferKeepsOnlyBindingLayoutOnHost() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  plan.info.buffers[0].dispatch_stride = 64;
+  plan.info.buffers[0].max_byte_extent = 20;
+  auto &source = plan.descriptor_sources[0];
+  source.dwords[1] = Value(20u << 16u);
+  source.dwords[3] = Value(0x16204u);
+  std::array<uint32_t, 1> user_data{0x1000u};
+  uint32_t reads = 0;
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = RejectSpecializationRead,
+                           .userdata = &reads,
+                           .read_specialization_memory = RejectSpecializationRead};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[2] == 0 &&
+            specialization.buffers[0].packed_stride == 20 && reads == 0,
+        "native record count was required to materialize its stable binding layout");
+  for (const auto words : {std::array<uint32_t, 2>{0u, 0x16204u},
+                           {16u << 16u, 0x16204u},
+                           {(20u << 16u) | (1u << 31u), 0x16204u},
+                           {20u << 16u, 0x16204u | (1u << 23u)},
+                           {20u << 16u, 0x16204u | (1u << 28u)}}) {
+    source.dwords[1] = Value(words[0]);
+    source.dwords[3] = Value(words[1]);
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "dispatch buffer accepted a layout outside its native bounds proof");
+  }
+  user_data[0] = 0;
+  source.dwords[1] = Value(0u);
+  source.dwords[3] = Value(0u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization.buffers[0].packed_stride == 0,
+        "inactive dispatch buffer did not preserve null binding semantics");
+  Check(reads == 0, "dispatch buffer layout validation read GPU data on the host");
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtPlan(0x10000);
@@ -832,6 +871,7 @@ int main() {
       true);
   TestMappedSrtUsesDirectReaderByDefault();
   TestRawScalarAddressPreservesHighBits();
+  TestDispatchBufferKeepsOnlyBindingLayoutOnHost();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();

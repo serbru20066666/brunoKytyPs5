@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
@@ -1955,9 +1956,32 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	bool TryMakeDispatchBuffer(const Inst& inst, const Inst& handle, uint32_t& source,
+	                           uint32_t& dispatch_stride) {
+		const auto flags = inst.Flags<MemoryFlags>();
+		const auto& memory = m_program.memory_info[flags.index];
+		if (m_program.stage != ShaderType::Compute || inst.GetOpcode() != ValueOpcode::StoreBufferU32 ||
+		    memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen || memory.data_bits != 32u || memory.data_dwords != 1u ||
+		    inst.Arg(2).Resolve() != Value(0u) || inst.Arg(3).Resolve() != Value(0u)) return false;
+		const auto index = AffineIndex(inst.Arg(1), 0, inst.Arg(5).Resolve());
+		if (!index || (*index)[0] != 0u || (*index)[1] != 1u || (*index)[2] == 0u) return false;
+		DescriptorSource descriptor;
+		MakeSource(handle, 4u, false, false, memory.resource * 4u, descriptor, flags.pc);
+		// Binding capacity is derived from the dispatch. The native handle keeps its count.
+		descriptor.dwords[2] = Value(0u);
+		uint32_t bad_dword = 0;
+		if (!ValidateSource(descriptor, bad_dword)) return false;
+		source = InternSource(descriptor);
+		dispatch_stride = static_cast<uint32_t>((*index)[2]);
+		return true;
+	}
+
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                   uint32_t dispatch_stride) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
-			if (m_info.buffers[i].source == source) {
+			if (m_info.buffers[i].source == source &&
+			    m_info.buffers[i].dispatch_stride == dispatch_stride) {
 				Merge(m_info.buffers[i], memory, op, pc);
 				return i;
 			}
@@ -1968,6 +1992,7 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
+		resource.dispatch_stride = dispatch_stride;
 		Merge(resource, memory, op, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
@@ -2125,12 +2150,14 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
+			uint32_t dispatch_stride = 0;
 			handle = inst.Arg(0).Resolve().TryInstruction();
 			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
 			if (indirect != nullptr) {
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
-			               memory.resource * 4u, handle, source)) {
+			                      memory.resource * 4u, handle, source) &&
+			           !TryMakeDispatchBuffer(inst, *handle, source, dispatch_stride)) {
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
 				    !memory.SupportsIndirectBufferLoad(op)) {
@@ -2142,7 +2169,7 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
-			resource = AddBuffer(source, memory, op, flags.pc);
+			resource = AddBuffer(source, memory, op, flags.pc, dispatch_stride);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
 			}

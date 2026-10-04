@@ -808,8 +808,8 @@ static Value FillValue(Value value, Value guard) {
 
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
 // arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
-static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis, Value guard,
-                                                      uint32_t depth = 0) {
+std::optional<std::array<uint64_t, 3>> AffineIndex(Value value, uint32_t axis, Value guard,
+                                                 uint32_t depth) {
 	value = FillValue(value, guard);
 	if (depth > 32 || value.GetType() != Type::U32) {
 		return {};
@@ -834,8 +834,8 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	    op != ValueOpcode::ShiftLeftLogical32) {
 		return {};
 	}
-	auto left  = FillIndex(inst->Arg(0), axis, guard, depth + 1);
-	auto right = FillIndex(inst->Arg(1), axis, guard, depth + 1);
+	auto left  = AffineIndex(inst->Arg(0), axis, guard, depth + 1);
+	auto right = AffineIndex(inst->Arg(1), axis, guard, depth + 1);
 	if (!left || !right) {
 		return {};
 	}
@@ -902,7 +902,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		const auto* address = store->Arg(1).ResolveInstruction();
 		if (address == nullptr || address->GetOpcode() != ValueOpcode::MakeImageAddress) return {};
 		for (uint32_t axis = 0; axis < 3; ++axis) {
-			const auto index = FillIndex(address->Arg(axis), axis, guard);
+			const auto index = AffineIndex(address->Arg(axis), axis, guard);
 			if (!index || (*index)[0] != 0) return {};
 			if (axis < 2) {
 				if ((*index)[1] != 1 || (*index)[2] == 0) return {};
@@ -932,7 +932,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		    memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
 			return {};
-		const auto address = FillIndex(store->Arg(1), 0, guard);
+		const auto address = AffineIndex(store->Arg(1), 0, guard);
 		if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
 		result.fill.kind = UniformFillKind::Buffer;
 		result.fill.group_stride[0] = static_cast<uint32_t>((*address)[2]);
@@ -1391,6 +1391,12 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 		auto       packed_stride = descriptor.PackedStride();
 		const auto stride        = packed_stride & 0x3fffu;
 		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+		if (base.dispatch_stride != 0u && descriptor.Base48() != 0u &&
+		    (descriptor.OutOfBounds() != 0u || stride == 0u || swizzle ||
+		     (packed_stride & (1u << 20u)) != 0u || base.max_byte_extent > stride)) {
+			return SpecializationFail(fmt::format(
+			    "dispatch-sized buffer {} requires an unswizzled structured DWORD layout", i));
+		}
 		if (stride == 0u) {
 			packed_stride &= ~((1u << 14u) | (3u << 16u));
 		} else if (!swizzle) {

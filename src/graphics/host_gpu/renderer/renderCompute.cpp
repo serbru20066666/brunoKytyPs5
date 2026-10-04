@@ -320,7 +320,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
-	FindBuffers(bindings);
+	const auto dispatch_threads_x = use_thread_dimensions
+	                                    ? uint64_t{input_info.dispatch_threads_num[0]}
+	                                    : uint64_t{thread_group_x} * input_info.threads_num[0];
+	FindBuffers(bindings, dispatch_threads_x, input_info.threads_num[0]);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

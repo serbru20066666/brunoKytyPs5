@@ -1232,7 +1232,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(PreparedBindings& prepared, uint64_t dispatch_threads_x,
+                                  uint32_t group_size_x) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -1247,8 +1248,23 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
-		if (address == 0 || requested_size == 0) {
+		if (address == 0u) {
+			sources[i] = {};
+			continue;
+		}
+		auto requested_size = descriptor.GetSize();
+		const auto& buffer = program.info.buffers[i];
+		if (buffer.dispatch_stride != 0u) {
+			if (dispatch_threads_x == 0u || dispatch_threads_x > uint64_t{UINT32_MAX} + 1u ||
+			    buffer.dispatch_stride != group_size_x) {
+				EXIT("GPU-sized buffer requires a known matching X dispatch extent\n");
+			}
+			requested_size = (dispatch_threads_x - 1u) * descriptor.Stride() + buffer.max_byte_extent;
+			if (requested_size > uint64_t{UINT32_MAX} + 1u) {
+				EXIT("GPU-sized buffer dispatch wraps its 32-bit byte address\n");
+			}
+		}
+		if (requested_size == 0) {
 			sources[i] = {};
 			continue;
 		}
