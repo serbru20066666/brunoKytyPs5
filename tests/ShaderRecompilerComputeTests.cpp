@@ -5893,37 +5893,6 @@ public:
                       vk::Extent3D{9, 1, 1},
               "a smaller render area replaced its compatible larger backing");
 
-      auto MakeLinearDesc =
-          [&](uint64_t address, uint64_t size, vk::Format format,
-              Prospero::BufferFormat guest_format, Prospero::ImageType type,
-              vk::Extent3D extent, uint32_t layers, uint32_t bytes_per_block,
-              uint32_t samples) {
-            ImageDesc desc{};
-            desc.type = BindingType::Texture;
-            desc.info.data = {address, size};
-            desc.info.pixel_format = format;
-            desc.info.guest_format = guest_format;
-            desc.info.type = type;
-            desc.info.extent = extent;
-            desc.info.resources = {1, layers};
-            desc.info.pitch = extent.width;
-            desc.info.bytes_per_block = bytes_per_block;
-            desc.info.samples = samples;
-            desc.info.tile_mode = Prospero::TileMode::kLinear;
-            desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
-            desc.view_info.format = format;
-            if (type == Prospero::ImageType::kColor3D) {
-              desc.view_info.type = vk::ImageViewType::e3D;
-            } else if (layers > 1) {
-              desc.view_info.type = vk::ImageViewType::e2DArray;
-            } else {
-              desc.view_info.type = vk::ImageViewType::e2D;
-            }
-            desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
-            desc.view_info.layer_count = layers;
-            desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
-            return desc;
-          };
       const auto HostReadBarrier = [&](vk::Buffer buffer, uint64_t size,
                                        vk::PipelineStageFlags source_stage,
                                        vk::AccessFlags source_access) {
@@ -6711,6 +6680,8 @@ public:
       sampled_ms_depth.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto sampled_ms_depth_image =
           texture_cache.FindImage(sampled_ms_depth);
+      const auto ms_stencil_alias = texture_cache.FindImageFromRange(
+          base + ms_stencil_offset, ms_stencil_size, false);
       Require(
           name, "unequal-sample depth overlap",
           ms_depth_image && ms_depth_with_htile == ms_depth_image &&
@@ -6728,8 +6699,9 @@ public:
               !texture_cache.IsMetaCleared(ms_htile_address, 0) &&
               !resources.GetBufferCache().HasGpuDirtyBytes(
                   base + ms_stencil_offset, ms_stencil_size) &&
-              !texture_cache.IsRegionGpuModified(base + ms_stencil_offset,
-                                                 ms_stencil_size),
+              ms_stencil_alias &&
+              texture_cache.GetImage(ms_stencil_alias).depth_id == ms_depth_image &&
+              texture_cache.GetImage(ms_stencil_alias).backing.image == nullptr,
           "unequal-sample overlap did not run the color-to-MS-depth pass "
           "without manufacturing stencil ownership");
       auto &oversized_ms = texture_cache.GetImage(ms_depth_image);
@@ -7287,10 +7259,8 @@ public:
                   !texture_cache.GetImage(fault_b_image).IsTracked() &&
                   texture_cache.GetImage(fault_a_image).IsMaybeCpuDirty() &&
                   texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty() &&
-                  texture_cache.IsRegionGpuModified(base + 0x8000,
-                                                    sizeof(fault_a)) &&
-                  texture_cache.IsRegionGpuModified(base + 0x8010,
-                                                    sizeof(fault_b)),
+                  !texture_cache.GetImage(fault_a_image).IsDefinitelyCpuDirty() &&
+                  !texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty(),
               "a byte-disjoint CPU write discarded authoritative images");
       const auto retracked_a = texture_cache.FindImage(fault_a_desc);
       const auto retracked_b = texture_cache.FindImage(fault_b_desc);
@@ -8464,10 +8434,7 @@ public:
       Require(name, "GPU image range validity",
               texture_cache.FindImageFromRange(
                   gc_image_desc_a.info.data.address,
-                  gc_image_desc_a.info.data.size) == gc_images[0] &&
-                  texture_cache.IsRegionGpuModified(
-                      gc_image_desc_a.info.data.address,
-                      gc_image_desc_a.info.data.size),
+                  gc_image_desc_a.info.data.size) == gc_images[0],
               "FindImageFromRange rejected a clean GPU-current image");
       auto &gc_native = texture_cache.GetImage(gc_images[0]);
       texture_cache.InvalidateMemory(gc_image_desc_a.info.data.address,
@@ -8477,17 +8444,12 @@ public:
           !texture_cache.FindImageFromRange(gc_image_desc_a.info.data.address,
                                             gc_image_desc_a.info.data.size) &&
               !TextureCacheTestAccess::TryDownload(texture_cache, gc_images[0]) &&
-              !texture_cache.IsRegionGpuModified(
-                  gc_image_desc_a.info.data.address,
-                  gc_image_desc_a.info.data.size) &&
               gc_native.IsDefinitelyCpuDirty() && gc_native.IsGpuModified() &&
               !gc_native.IsTracked(),
           "CPU writes did not supersede native contents while retaining GPU history");
       texture_cache.MarkGpuWritten(gc_images[0]);
       Require(name, "GPU image reacquisition",
-              texture_cache.IsRegionGpuModified(
-                  gc_image_desc_a.info.data.address,
-                  gc_image_desc_a.info.data.size),
+              gc_native.SafeToDownload(),
               "a new GPU write did not reclaim image authority");
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::WriteBacking(base + gc_image_offsets[index],
@@ -10119,6 +10081,33 @@ public:
     LibKernel::Memory::WriteBacking(address, words.data(), size);
   }
 
+  static TextureCache::ImageDesc MakeLinearDesc(
+      uint64_t address, uint64_t size, vk::Format format,
+      Prospero::BufferFormat guest_format, Prospero::ImageType type,
+      vk::Extent3D extent, uint32_t layers, uint32_t bytes_per_block,
+      uint32_t samples) {
+    TextureCache::ImageDesc desc{};
+    desc.type = TextureCache::BindingType::Texture;
+    desc.info.data = {address, size};
+    desc.info.pixel_format = format;
+    desc.info.guest_format = guest_format;
+    desc.info.type = type;
+    desc.info.extent = extent;
+    desc.info.resources = {1, layers};
+    desc.info.pitch = extent.width;
+    desc.info.bytes_per_block = bytes_per_block;
+    desc.info.samples = samples;
+    desc.info.tile_mode = Prospero::TileMode::kLinear;
+    desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+    desc.view_info.format = format;
+    desc.view_info.type = type == Prospero::ImageType::kColor3D ? vk::ImageViewType::e3D
+        : layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    desc.view_info.layer_count = layers;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    return desc;
+  }
+
   std::vector<u32> ReadCachedTexel(const char *name, RenderContext &context,
                                  ImageId id, vk::Offset3D offset = {},
                                  vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0,
@@ -10199,7 +10188,7 @@ public:
         EncodeMubuf0(0x0cu, 0, false, false), EncodeMubuf1(3, 1, 0),
         EncodeSopp(0x0c, 0), EncodeVop1(0x02, 2, Vgpr(3))};
     AppendVop3(&counted_consumer, 0x346u, 1, 8, InlineU32(2), Vgpr(0));
-    counted_consumer.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    AppendVop3(&counted_consumer, 0x36du, 2, Vgpr(1), Vgpr(3), InlineU32(1));
     counted_consumer.push_back(EncodeMubuf0(0x1cu, 0, true, false));
     counted_consumer.push_back(EncodeMubuf1(2, 0, 1));
     AppendEnd(&counted_consumer);
@@ -10329,8 +10318,16 @@ public:
       }
       // The same GPU-written DWORD supplies indirect X and the output descriptor's
       // native NUM_RECORDS. Four lanes per group exercise the descriptor's OOB bound.
-      constexpr auto count_args = base + cases.size() * case_size;
-      constexpr auto count_output = count_args + 2u * BufferCache::CACHING_PAGESIZE;
+      constexpr auto image_address = base + cases.size() * case_size;
+      constexpr auto count_args = image_address + 4u * sizeof(u32);
+      constexpr auto count_output = image_address + 2u * BufferCache::CACHING_PAGESIZE;
+      constexpr u32 image_value = 0x13579bdfu;
+      auto &textures = context.GetTextureCache();
+      auto image_desc = MakeLinearDesc(
+          image_address, 8u * sizeof(u32), vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {8, 1, 1}, 1, 4, 1);
+      const auto image = textures.FindImage(image_desc);
       ShaderProgram previous_program;
       for (const auto count : {3u, 7u}) {
         cache.FillBuffer(count_output, 16u * sizeof(u32), sentinel, false);
@@ -10345,6 +10342,20 @@ public:
         processor.DispatchDirect(1, 1, 1, 0x41u);
         Require(name, "GPU-owned descriptor count", cache.HasGpuDirtyBytes(count_args, 4),
                 "the descriptor count was already visible to the CPU");
+        // Raw buffer access keeps its own contents even after a newer overlapping image write.
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{image_value + count, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            textures, scheduler.Current(), image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        u32 stale_count = 0;
+        Require(name, "independent raw buffer and image contents",
+                textures.GetImage(image).SafeToDownload() &&
+                    cache.HasGpuDirtyBytes(count_args, sizeof(u32)) &&
+                    LibKernel::Memory::TryReadBacking(count_args, &stale_count,
+                                                     sizeof(stale_count)) &&
+                    stale_count != count,
+                "the alias fixture did not retain GPU buffer data and a newer independent image");
 
         shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(counted_consumer.data()),
                              .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
@@ -10379,10 +10390,14 @@ public:
                 "the counted consumer output could not be read back");
         for (u32 i = 0; i < actual.size(); i++) {
           Require(name, "native descriptor count bound",
-                  actual[i] == (i < count ? i + 1u : sentinel),
+                  actual[i] == (i < count ? count + i + 1u : sentinel),
                   "GPU count " + std::to_string(count) + " wrote an incorrect output word " +
                       std::to_string(i));
         }
+        Require(name, "raw count preserves independent image contents",
+                ReadCachedTexel(name, context, image, {}, {8, 1, 1}) ==
+                    std::vector<u32>(8, image_value + count),
+                "raw buffer descriptor materialization overwrote the newer native image");
       }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

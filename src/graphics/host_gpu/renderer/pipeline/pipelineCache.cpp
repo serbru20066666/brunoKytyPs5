@@ -128,8 +128,10 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
+	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuBacking(address, values.data(), values.size_bytes());
+	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
 // Per-draw resource tables can share a tracker page with GPU-written data, which protects the
@@ -690,7 +692,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
 		    .read_specialization_memory = ReadShaderGuestMemory,
-		    // TryReadGpuBacking fails for a range when any byte is GPU-dirty or unbacked.
+		    // TryReadBufferBacking fails for a range when any byte is GPU-dirty or unbacked.
 		    .specialization_block_reads = true,
 		    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,
 		};
