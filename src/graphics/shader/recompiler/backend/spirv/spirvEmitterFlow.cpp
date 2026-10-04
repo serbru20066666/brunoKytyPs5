@@ -459,7 +459,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.
 	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-	    exp.index != 0 && state.input_info.pixel->alpha_blend_source_remap) {
+	    exp.index != 0 && state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 		return;
 	}
 	EmitIfCondition(state, exec, [&]() {
@@ -503,14 +503,27 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
+		    exp.index == 0 && !uint_output &&
+		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
 			    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1});
 			if (blend_output != 0) {
-				const auto alpha = state.builder.AllocateId();
+				auto alpha = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
 				                          3u, 3u, 3u, 3u);
+				if (state.input_info.pixel->alpha_blend_source ==
+				    ShaderAlphaBlendSource::SourceAlphaOne) {
+					const auto mapping = state.input_info.pixel->target_export_mapping[0];
+					for (uint32_t component = 0; component < 4; component++) {
+						if (mapping.Map(component) != 3u) continue;
+						const auto factors = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeInsert, vector_type, factors,
+						                          ConstantF32Value(state, 1.0f), alpha, component);
+						alpha = factors;
+						break;
+					}
+				}
 				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
 			}
 		}

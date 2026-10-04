@@ -12878,6 +12878,28 @@ void TestBlendMappingClassification() {
   blend.color_srcblend = static_cast<uint8_t>(Factor::kDstAlpha);
   Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
         "destination alpha incorrectly used the physical alpha channel");
+
+  blend.separate_alpha_blend = true;
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kSrcAlpha);
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kOne);
+  blend.color_destblend = blend.alpha_destblend =
+      static_cast<uint8_t>(Factor::kOneMinusSrcAlpha);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlphaOne,
+        "separate alpha accumulation did not preserve its unit source factor");
+  const auto exact = blend;
+  for (uint32_t changed = 0; changed < 6; changed++) {
+    blend = exact;
+    switch (changed) {
+      case 0: blend.color_srcblend = static_cast<uint8_t>(Factor::kZero); break;
+      case 1: blend.color_destblend = static_cast<uint8_t>(Factor::kOne); break;
+      case 2: blend.alpha_srcblend = static_cast<uint8_t>(Factor::kZero); break;
+      case 3: blend.alpha_destblend = static_cast<uint8_t>(Factor::kOne); break;
+      case 4: blend.color_comb_fcn = static_cast<uint8_t>(Prospero::BlendOp::kSubtract); break;
+      case 5: blend.alpha_comb_fcn = static_cast<uint8_t>(Prospero::BlendOp::kSubtract); break;
+    }
+    Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+          "separate alpha lowering accepted a different blend equation");
+  }
 }
 
 void TestLogicalAlphaBlendExport() {
@@ -12887,58 +12909,81 @@ void TestLogicalAlphaBlendExport() {
   const auto ordinary_key = MakeStageStaticKey(pixel);
   pixel.dual_source_blending = true;
   const auto guest_key = MakeStageStaticKey(pixel);
-  pixel.alpha_blend_source_remap = true;
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
   const auto remapped_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
+  const auto separate_key = MakeStageStaticKey(pixel);
   Check(ordinary_key != guest_key && guest_key != remapped_key &&
-            ordinary_key != remapped_key,
-        "ordinary, guest dual-source, and logical-alpha shaders share a cache key");
+            ordinary_key != remapped_key && separate_key != ordinary_key &&
+            separate_key != guest_key && separate_key != remapped_key,
+        "ordinary, guest dual-source, and logical-alpha modes share a cache key");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.input_info.pixel = &pixel;
-  for (const bool compressed : {false, true}) {
-    const uint32_t shader[] = {
-        // RGBA = (1000, 2, 3, 0.25), packed into two half pairs when compressed.
-        EncodeVop1(0x01, 0, 255), compressed ? 0x400063d0u : 0x447a0000u,
-        EncodeVop1(0x01, 1, 255), compressed ? 0x34004200u : 0x40000000u,
-        EncodeVop1(0x01, 2, 255), 0x40400000u,
-        EncodeVop1(0x01, 3, 255), 0x3e800000u,
-        EncodeExp0(0, 0xf, false, compressed), EncodeExp1(0, 1, 2, 3),
-        EncodeExp0(1, 0xf, false), EncodeExp1(0, 0, 0, 0),
-        EncodeExp0(2, 0xf, true, false, true), EncodeExp1(0, 0, 0, 0),
-        EncodeSopp(0x01),
-    };
-    const auto result = RecompileForTest(shader, options);
-    CheckSpirvBinaryValidates(result.spirv);
-    const auto source = DisassembleSpirvBinary(result.spirv);
-    Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
-              source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
-              CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
-              source.find("out_mrt_2") == std::string::npos,
-          "inactive MRT exports overwrote the logical-alpha output");
-    Check(SpirvInstructionOpcodeCount(result.spirv, 252u) != 0,
-          "ignoring inactive MRT stores discarded their valid-mask export");
-    uint32_t alpha_input = 0;
-    uint32_t color_input = 0;
-    for (size_t i = 5; i < result.spirv.size(); i += result.spirv[i] >> 16u) {
-      if ((result.spirv[i] & 0xffffu) != 79u || (result.spirv[i] >> 16u) != 9u) {
-        continue;
+  for (const auto mode : {ShaderAlphaBlendSource::SourceAlpha,
+                          ShaderAlphaBlendSource::SourceAlphaOne}) {
+    pixel.alpha_blend_source = mode;
+    for (const bool compressed : {false, true}) {
+      const uint32_t shader[] = {
+          // RGBA = (1000, 2, 3, 0.25), packed into two half pairs when compressed.
+          EncodeVop1(0x01, 0, 255), compressed ? 0x400063d0u : 0x447a0000u,
+          EncodeVop1(0x01, 1, 255), compressed ? 0x34004200u : 0x40000000u,
+          EncodeVop1(0x01, 2, 255), 0x40400000u,
+          EncodeVop1(0x01, 3, 255), 0x3e800000u,
+          EncodeExp0(0, 0xf, false, compressed), EncodeExp1(0, 1, 2, 3),
+          EncodeExp0(1, 0xf, false), EncodeExp1(0, 0, 0, 0),
+          EncodeExp0(2, 0xf, true, false, true), EncodeExp1(0, 0, 0, 0),
+          EncodeSopp(0x01),
+      };
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto source = DisassembleSpirvBinary(result.spirv);
+      Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+                source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+                CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+                source.find("out_mrt_2") == std::string::npos,
+            "inactive MRT exports overwrote the logical-alpha output");
+      Check(SpirvInstructionOpcodeCount(result.spirv, 252u) != 0,
+            "ignoring inactive MRT stores discarded their valid-mask export");
+      uint32_t alpha_input = 0;
+      uint32_t alpha_broadcast = 0;
+      uint32_t color_input = 0;
+      uint32_t one = 0;
+      bool unit_alpha_factor = false;
+      for (size_t i = 5; i < result.spirv.size(); i += result.spirv[i] >> 16u) {
+        const auto opcode = result.spirv[i] & 0xffffu;
+        if (opcode == 43u && (result.spirv[i] >> 16u) == 4u &&
+            result.spirv[i + 3] == 0x3f800000u) {
+          one = result.spirv[i + 2];
+        }
+        if (opcode == 82u && (result.spirv[i] >> 16u) == 6u &&
+            result.spirv[i + 3] == one && result.spirv[i + 4] == alpha_broadcast &&
+            result.spirv[i + 5] == 0u) {
+          unit_alpha_factor = true;
+        }
+        if ((result.spirv[i] & 0xffffu) != 79u || (result.spirv[i] >> 16u) != 9u) {
+          continue;
+        }
+        const auto selectors = std::span(result.spirv).subspan(i + 5, 4);
+        if (std::ranges::equal(selectors, std::array{3u, 3u, 3u, 3u})) {
+          alpha_input = result.spirv[i + 3];
+          alpha_broadcast = result.spirv[i + 2];
+        } else if (std::ranges::equal(selectors, std::array{3u, 2u, 1u, 0u})) {
+          color_input = result.spirv[i + 3];
+        }
       }
-      const auto selectors = std::span(result.spirv).subspan(i + 5, 4);
-      if (std::ranges::equal(selectors, std::array{3u, 3u, 3u, 3u})) {
-        alpha_input = result.spirv[i + 3];
-      } else if (std::ranges::equal(selectors, std::array{3u, 2u, 1u, 0u})) {
-        color_input = result.spirv[i + 3];
-      }
+      Check(alpha_input != 0 && alpha_input == color_input,
+            "blend source did not broadcast logical alpha before the physical export swizzle");
+      Check(unit_alpha_factor == (mode == ShaderAlphaBlendSource::SourceAlphaOne),
+            "secondary ABGR output must be (1, Sa, Sa, Sa) only for separate alpha accumulation");
     }
-    Check(alpha_input != 0 && alpha_input == color_input,
-          "blend source did not broadcast logical alpha before the physical export swizzle");
   }
 
   const uint32_t guest_shader[] = {
       EncodeExp0(0, 0xf, false), EncodeExp1(0, 1, 2, 3),
       EncodeExp0(1, 0xf), EncodeExp1(4, 5, 6, 7), EncodeSopp(0x01),
   };
-  pixel.alpha_blend_source_remap = false;
+  pixel.alpha_blend_source = ShaderAlphaBlendSource::None;
   pixel.target_output_mode[1] = pixel.target_output_mode[0];
   pixel.target_export_mapping = {};
   const auto guest = RecompileForTest(guest_shader, options);

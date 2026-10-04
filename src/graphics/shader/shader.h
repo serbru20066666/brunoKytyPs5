@@ -156,6 +156,8 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
+enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne };
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -179,8 +181,8 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha through MRT1 for blending after channel swizzling.
-	bool                                           alpha_blend_source_remap     = false;
+	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
+	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;

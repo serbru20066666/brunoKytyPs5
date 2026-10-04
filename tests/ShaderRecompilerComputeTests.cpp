@@ -15878,7 +15878,8 @@ public:
               : vk::ImageAspectFlags{});
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3) {
+    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
+                          std::array<u32, 4> clear_value = {}) {
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
         RenderExecutorTestAccess::BindRenderTarget(executor, depth.image_id);
@@ -15905,6 +15906,7 @@ public:
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], *bindings.pixel);
       rendering.color_attachments[0].is_clear = true;
+      rendering.color_attachments[0].clear_value = clear_value;
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
@@ -16257,6 +16259,68 @@ public:
       Require(name, "pixel wave cache distinction",
               wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
               "wave32 and wave64 pixel programs shared a cache key");
+
+      // Reversed RGBA targets must use logical Sa for RGB, with a separate
+      // unit source factor when alpha accumulates as Sa + Da * (1 - Sa).
+      static const auto blend_pixel = [] {
+        std::vector<u32> code;
+        constexpr std::array<float, 4> source{0.8f, 0.6f, 0.4f, 0.5f};
+        for (u32 component = 0; component < source.size(); component++) {
+          AppendVMovLiteral(&code, component, std::bit_cast<u32>(source[component]));
+        }
+        code.push_back(EncodeExp0(0, 0xf));
+        code.push_back(EncodeExp1(0, 1, 2, 3));
+        AppendEnd(&code);
+        return code;
+      }();
+      native_pixel_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(blend_pixel.data());
+      ShaderMapUserData(native_pixel_regs.ps_regs.data_addr,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(blend_pixel.size() * sizeof(u32))});
+      const auto saved_blend = registers.GetBlendControl(0);
+      const auto saved_target_info = registers.GetRenderTarget(0).info;
+      const auto saved_output_mode = registers.GetShaderRegisters().target_output_mode[0];
+      registers.SetTargetOutputMode(0, 4);
+      auto blend_target_info = saved_target_info;
+      blend_target_info.blend_bypass = false;
+      registers.SetColorInfo(0, blend_target_info);
+      export_mapping[0] = color.export_mapping = Prospero::ColorMappingAbgr;
+      HW::BlendControl alpha_blend{};
+      alpha_blend.enable = true;
+      alpha_blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha);
+      alpha_blend.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      alpha_blend.color_destblend = alpha_blend.alpha_destblend =
+          static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrcAlpha);
+      for (const bool separate : {false, true}) {
+        alpha_blend.separate_alpha_blend = separate;
+        registers.SetBlendControl(0, alpha_blend);
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        const auto mode = separate ? ShaderAlphaBlendSource::SourceAlphaOne
+                                   : ShaderAlphaBlendSource::SourceAlpha;
+        Require(name, "logical alpha blend program", pixel.alpha_blend_source == mode &&
+                    pixel.dual_source_blending,
+                "the separate alpha equation did not reach the compiled pixel program");
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
+        constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
+        draw(pipeline(true, 2, 2), 3, std::bit_cast<std::array<u32, 4>>(destination));
+        const auto blend_pixels = read_color();
+        const std::array<float, 4> expected{separate ? 0.65f : 0.4f, 0.35f, 0.35f, 0.5f};
+        for (size_t component = 0; component < blend_pixels.size(); component++) {
+          Require(name, "logical alpha blend readback",
+                  std::abs(std::bit_cast<float>(blend_pixels[component]) -
+                           expected[component % 4]) < 0.00001f,
+                  "reversed blending changed logical RGB or the separate alpha equation");
+        }
+      }
+      native_pixel_regs.ps_regs.data_addr = pixel_address;
+      export_mapping[0] = color.export_mapping = {};
+      registers.SetBlendControl(0, saved_blend);
+      registers.SetColorInfo(0, saved_target_info);
+      registers.SetTargetOutputMode(0, saved_output_mode);
 
       // Captured Playroom strips contain the fullscreen triangle followed by an
       // out-of-bounds fetch exporting (0,0,0,0). Additive color reveals any extra triangle.
