@@ -7937,8 +7937,7 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
+void TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128), // preheader: s0 = 0
       EncodeMubuf0(0x0c),
@@ -7951,13 +7950,15 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
       0xbf810000u,
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying vector-buffer descriptor did not terminate "
-              "compilation");
+  const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(result.program.info.uses_dma && !result.program.dispatcher_fallback &&
+            SpirvContainsOpcode(result.spirv, 246),
+        "loop-carried vector descriptor lost its structured GPU loop");
+  Check(result.program.info.buffers.size() == 1u && result.program.info.buffers[0].written &&
+            result.resources.flattened_srt.empty() && result.resources.specialization_reads.empty(),
+        "loop-carried vector descriptor was evaluated on the host");
+  CheckSpirvBinaryValidates(result.spirv);
 }
-#endif
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
@@ -14684,9 +14685,7 @@ int main() {
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
-#endif
+  TestNewShaderRecompilerCfgLoopHeaderBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
