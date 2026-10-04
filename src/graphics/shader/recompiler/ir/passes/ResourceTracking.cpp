@@ -371,10 +371,11 @@ public:
 			}
 		}
 		for (const auto& plan: m_indirect_descriptors) {
-			plan.handle->SetArg(0, plan.key);
 			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
+				plan.handle->SetArg(0, plan.key);
 				for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
 			} else {
+				if (plan.reads[0] == nullptr) plan.handle->SetArg(0, plan.key);
 				for (uint32_t dword = 0; dword < 4u; dword++) {
 					plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
 				}
@@ -385,6 +386,20 @@ public:
 			if (plan.reads[0] != nullptr) {
 				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word)
 					m_program.memory_info[plan.memory[word]].planning_only = true;
+			}
+		}
+		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
+		// native descriptor resolution excludes their stale incoming values at each use.
+		for (const auto& plan: m_indirect_descriptors) {
+			if (plan.handle->GetOpcode() != ValueOpcode::GetImageResource || plan.reads[0] == nullptr)
+				continue;
+			for (const auto* read: plan.reads) {
+				const auto first = std::ranges::find_if(m_indirect_descriptors, [&](const auto& candidate) {
+					return candidate.reads[0] == read;
+				});
+				const auto key = first != m_indirect_descriptors.end() ? first->key : Value(0u);
+				const auto uses = read->Uses();
+				for (const auto& use: uses) use.user->SetArg(use.operand, key);
 			}
 		}
 		m_program.descriptor_sources         = std::move(m_sources);
@@ -857,10 +872,17 @@ private:
 		return true;
 	}
 
-	static bool UsesOnly(const Inst& value, std::span<const Inst* const> users) {
-		return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
-			return std::ranges::find(users, use.user) != users.end();
-		});
+	static bool UsesOnlyImageDescriptors(const Inst& value) {
+		if (value.Uses().empty()) return false;
+		std::vector<const Inst*> values {&value};
+		for (size_t index = 0; index < values.size(); ++index) {
+			for (const auto& use: values[index]->Uses()) {
+				if (use.user->GetOpcode() == ValueOpcode::GetImageResource) continue;
+				if (use.user->GetOpcode() != ValueOpcode::Phi) return false;
+				if (std::ranges::find(values, use.user) == values.end()) values.push_back(use.user);
+			}
+		}
+		return true;
 	}
 
 	const MemoryInfo* ScalarReadMemory(const Inst& read, uint32_t& index) const {
@@ -1497,11 +1519,12 @@ private:
 		return false;
 	}
 
-	bool MatchDescriptorTable(Inst& handle, IndirectDescriptorPlan& plan,
+	bool MatchDescriptorTable(Inst& handle, const DescriptorSource& descriptor,
+	                          IndirectDescriptorPlan& plan,
 	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset) {
 		Inst* table_handle = nullptr;
 		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
-			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
 			if (read == nullptr) {
 				return false;
 			}
@@ -1534,8 +1557,7 @@ private:
 				return false;
 			}
 			table_handle = current_handle;
-			const std::array<const Inst*, 1> image_users {&handle};
-			if (handle.NumArgs() == 8u ? !UsesOnly(*read, image_users) :
+			if (handle.NumArgs() == 8u ? !UsesOnlyImageDescriptors(*read) :
 			    std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
@@ -1584,12 +1606,13 @@ private:
 		return true;
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, IndirectDescriptorPlan& plan) {
+	bool TryMakeIndirectImage(Inst& handle, const DescriptorSource& descriptor,
+	                          IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
-		if (!MatchDescriptorTable(handle, plan, table_source, key, table_offset)) return false;
+		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset)) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
@@ -1628,14 +1651,6 @@ private:
 			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
 			indirect.selector_offset =
 			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
-			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
-			const std::array<const Inst*, 1> material_users {key_shift != nullptr ? key_shift : shift};
-			const std::array<const Inst*, 1> key_users {shift};
-			if (!UsesOnly(*material_read, material_users) ||
-			    (key_shift != nullptr && !UsesOnly(*key_shift, key_users)) ||
-			    !UsesOnly(*shift, plan.reads)) {
-				return false;
-			}
 			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
 			if (material_handle == nullptr ||
 			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
@@ -1660,7 +1675,8 @@ private:
 		return true;
 	}
 
-	bool TryMakeIndirectBuffer(Inst& handle, IndirectDescriptorPlan& plan) {
+	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
+	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
 		    handle.Uses().empty()) return false;
 		for (const auto& use: handle.Uses()) {
@@ -1675,7 +1691,7 @@ private:
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
-		if (!MatchDescriptorTable(handle, plan, table_source, key, table_offset) ||
+		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset) ||
 		    table_source.dword_count != 4u || table_offset != 0u) return false;
 		const auto* lane_read = key.Resolve().TryInstruction();
 		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
@@ -1896,9 +1912,19 @@ private:
 				if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) {
 					continue;
 				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				const auto& memory = m_program.memory_info[flags.index];
+				DescriptorSource descriptor;
+				MakeSource(*handle, inst.GetOpcode() == ValueOpcode::StoreBufferU32 ? 4u : 8u,
+				           false, false, memory.resource * 4u, descriptor, flags.pc);
 				IndirectDescriptorPlan plan;
-				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan) ||
-				    TryMakeIndirectBuffer(*handle, plan)) {
+				if (TryMakeIndirectImage(*handle, descriptor, plan) || TryMakeFiniteImage(*handle, plan) ||
+				    TryMakeIndirectBuffer(*handle, descriptor, plan)) {
+					for (const auto& previous: m_indirect_descriptors) {
+						if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
+						    !EquivalentValue(m_program, previous.key, plan.key))
+							Fail(flags.pc, "shared descriptor read has incompatible keys");
+					}
 					m_indirect_descriptors.push_back(std::move(plan));
 				}
 			}

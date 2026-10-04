@@ -36884,18 +36884,21 @@ void CheckImageSamplerSpecialization() {
         0u, 64u, false, static_cast<u32>(Prospero::BufferFormat::k32UInt));
     std::copy_n(output.begin(), 4, user_data.begin() + 48);
     user_data[48] = 0x3000u;
+    if (scalar) user_data[30] = 1u;
     std::vector<u32> code{EncodeVopc(0xc5, InlineU32(0), 0),
                           EncodeSop1(0x24, 24, 106), EncodeSopp(0x08, 0)};
-    size_t scalar_shift = 0;
-    if (scalar) {
+    const auto append_scalar_key = [&](bool numeric_use) {
       code.insert(code.end(), {EncodeVop1(0x02, 20, Vgpr(0)),
                                EncodeSop2(0x00, 20, 20, 21),
                                EncodeSop2(0x26, 20, 20, InlineU32(3)),
                                EncodeSop2(0x1e, 20, 20, InlineU32(2)),
                                EncodeSop2(0x00, 20, 20, InlineU32(8)),
                                EncodeSmem0(0x08, 20, 2), EncodeSmem1(0, 20)});
-      scalar_shift = code.size();
+      if (numeric_use) code.push_back(EncodeVop1(0x01, 17, 20));
       code.push_back(EncodeSop2(0x20, 20, 20, InlineU32(4)));
+    };
+    if (scalar) {
+      append_scalar_key(true);
     } else {
       code.insert(code.end(), {EncodeSop1(0x04, 26, 126), EncodeVop1(0x01, 16, InlineU32(1))});
       // An earlier descriptor waterfall separates the EXECZ witness from the material load.
@@ -36915,13 +36918,41 @@ void CheckImageSamplerSpecialization() {
       code.insert(code.end(), {EncodeSop1(0x04, 28, 126),
                                EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15)});
     code.insert(code.end(), {EncodeSop2(0x1e, 20, 20, InlineU32(5)),
-                             EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20),
-                             EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)});
+                             EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20)});
+    const auto table_read_end = code.size();
+    code.insert(code.end(), {EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)});
     AppendBufferStoreDword(&code, 4, 0);
     if (!scalar) {
       code.insert(code.end(), {EncodeVop1(0x01, 16, InlineU32(0)),
                                EncodeSop1(0x04, 126, 28), EncodeVopc(0xd5, InlineU32(0), 16)});
       code.push_back(EncodeSopp(0x09, static_cast<int16_t>(image_loop - code.size() - 1u)));
+    } else {
+      // Crossed exits introduce stale s16:19 Phi arms before the later s16:23 samples.
+      code.push_back(EncodeVop1(0x01, 5, InlineU32(0)));
+      code.push_back(EncodeSopc(0x06, 30, InlineU32(0)));
+      const auto skip_load = code.size();
+      code.push_back(EncodeSopp(0x05, 0));
+      append_scalar_key(false);
+      code.insert(code.end(), {EncodeSop2(0x1e, 20, 20, InlineU32(5)),
+                               EncodeSmem0(0x0b, 16), EncodeSmem1(0, 20),
+                               EncodeSopc(0x06, 31, InlineU32(0))});
+      const auto later_sample = code.size();
+      code.push_back(EncodeSopp(0x05, 0));
+      code.insert(code.end(), {EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 4, 2)});
+      const auto early_exit = code.size();
+      code.push_back(EncodeSopp(0x02, 0));
+      code[later_sample] = EncodeSopp(0x05, static_cast<int16_t>(code.size() - later_sample - 1u));
+      code.insert(code.end(), {EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 4, 2),
+                               EncodeMimg0(0x24, 1), EncodeMimg1(5, 0, 4, 2)});
+      const auto leave_samples = code.size();
+      code.push_back(EncodeSopp(0x02, 0));
+      code[skip_load] = EncodeSopp(0x05, static_cast<int16_t>(code.size() - skip_load - 1u));
+      code.push_back(EncodeVop1(0x01, 4, InlineU32(0)));
+      code[early_exit] = EncodeSopp(0x02, static_cast<int16_t>(code.size() - early_exit - 1u));
+      code[leave_samples] = EncodeSopp(0x02, static_cast<int16_t>(code.size() - leave_samples - 1u));
+      AppendBufferStoreDword(&code, 4, 0);
+      AppendBufferStoreDword(&code, 5, 0);
+      AppendBufferStoreDword(&code, 17, 0);
     }
     code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
     AppendEnd(&code);
@@ -36935,6 +36966,15 @@ void CheckImageSamplerSpecialization() {
     options.user_data = user_data;
     options.input_info.compute = &compute;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    if (scalar) {
+      bool key_phi = false;
+      for (const auto *block : translated.program.blocks)
+        for (const auto &inst : *block)
+          key_phi |= inst.GetOpcode() == ValueOpcode::GetImageResource &&
+                     inst.Arg(0).Resolve().IsPhi();
+      Require(name, "descriptor key reconvergence", key_phi,
+              "native crossed exits did not retain a descriptor key Phi");
+    }
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
@@ -36981,10 +37021,10 @@ void CheckImageSamplerSpecialization() {
             "GPU-selected texture materialization bypassed strict read provenance");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     if (scalar) {
-      ExpectFatal("ScalarMaterialNumericConsumer", [&] {
-        code.insert(code.begin() + scalar_shift, EncodeVop1(0x01, 17, 20));
+      ExpectFatal("ScalarImageDescriptorNumericConsumer", [&] {
+        code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
         code.pop_back();
-        AppendBufferStoreDword(&code, 17, 0);
+        AppendBufferStoreDword(&code, 18, 0);
         code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
         AppendEnd(&code);
         (void)ShaderRecompiler::TranslateProgram(code, options);
