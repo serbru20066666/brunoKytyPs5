@@ -728,7 +728,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				return sample;
 			};
 			const auto sample = image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
-			                        ? EmitImageMipSwitch(
+			                        ? EmitIndexSwitch(
 			                              state, GatherMip(ctx, inst, mem, *address, layout,
 			                                               image.mip_count),
 			                              image.mip_count, result_type, EmitGather)

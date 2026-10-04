@@ -27360,8 +27360,8 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
       {12, 20, 3, 4, false, true, {5, 6, 7, 8, 0, 0}},
       {12, 2, 0, 0, false, false, {}},
       // RDNA2 swizzling uses four-byte elements; soffset is added afterward.
-      {12, 2, 0, 4, true, true, {3, 11, 19, 0, 0, 0}},
-      {12, 8, 3, 4, true, true, {3, 11, 19, 0, 0, 0}},
+      {12, 2, 0, 4, true, true, {3, 4, 5, 0, 0, 0}},
+      {12, 8, 3, 4, true, true, {3, 4, 5, 0, 0, 0}},
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
@@ -27422,6 +27422,95 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
 
 TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(true);
+}
+
+TestCase BufferLoadFormatXGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  using F = Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct DescriptorCase {
+    F format;
+    u32 selector, stride, records, mode, index, offset, soffset;
+    bool swizzle;
+    u32 expected;
+  };
+  constexpr DescriptorCase cases[] = {
+      {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
+      {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
+      {F::k16UInt, 4, 2, 4, 0, 1, 0, 0, false, 0x80ff},
+      {F::k32UInt, 4, 4, 2, 0, 1, 0, 0, false, 0x8001ff00},
+      {F::k32_32_32_32Float, 7, 16, 1, 0, 0, 0, 0, false, 0x3fc00000},
+      {F::k8SInt, 4, 0, 16, 3, 0, 3, 0, false, 0xffffff80},
+      {F::k16SInt, 4, 0, 16, 3, 0, 2, 0, false, 0xffff80ff},
+      {F::k8UNorm, 4, 0, 16, 3, 0, 2, 0, false, 0x3f800000},
+      {F::k8SNorm, 4, 0, 16, 3, 0, 3, 0, false, 0xbf800000},
+      {F::k8UScaled, 4, 0, 16, 3, 0, 1, 0, false, 0x42fe0000},
+      {F::k8SScaled, 4, 0, 16, 3, 0, 3, 0, false, 0xc3000000},
+      {F::k16Float, 4, 0, 16, 3, 0, 8, 0, false, 0x3f800000},
+      {F::k11_11_10UInt, 5, 0, 16, 3, 0, 0, 0, false, 0x7ef},
+      {F::k10_10_10_2UInt, 7, 0, 16, 3, 0, 0, 0, false, 2},
+      {F::k8_8_8_8UInt, 6, 0, 16, 3, 0, 0, 0, false, 0xff},
+      // Align the whole format first, then advance components from one swizzled base.
+      {F::k16UInt, 4, 0, 16, 3, 0, 1, 0, false, 0x7f01},
+      {F::k16UInt, 4, 0, 4, 3, 0, 3, 0, false, 0},
+      {F::k32_32Float, 5, 8, 2, 0, 1, 0, 4, true, 0x3fc00000},
+      // FORMAT_X still transfers a complete RGBA32 record for range checking.
+      {F::k32_32_32_32Float, 4, 0, 16, 3, 0, 4, 0, false, 0},
+      {F::k32_32_32_32Float, 4, 8, 1, 0, 0, 0, 0, false, 0},
+      {F::k32_32_32_32Float, 1, 0, 16, 3, 0, 4, 0, false, 0x3f800000},
+      {F::k32UInt, 1, 4, 0, 0, 0, 0, 0, false, 1},
+      {F::k32UInt, 0, 4, 1, 0, 0, 0, 0, false, 0},
+      {F::kInvalid, 1, 4, 1, 0, 0, 0, 0, false, 0},
+      {F::k32UInt, 4, 4, 0, 2, 0, 0, 0, false, 0},
+      {F::k32UInt, 4, 0, 4, 3, 0, 0, 8, false, 0},
+  };
+  TestCase test;
+  test.name = "BufferLoadFormatXGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  constexpr std::array payload{0x80ff7f01u, 0x8001ff00u, 0x40003c00u, 0x3fc00000u};
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &input = cases[i];
+    const u32 data_offset = 4096 + i * 64;
+    const std::array<u32, 8> row{
+        static_cast<u32>(GuestBase + data_offset),
+        1u | (input.stride << 16u) | (input.swizzle ? 1u << 31u : 0u),
+        input.records, input.selector | (static_cast<u32>(input.format) << 12u) |
+                           (input.mode << 28u),
+        input.index, input.offset, input.soffset, 0};
+    std::copy(row.begin(), row.end(), test.initial.begin() + 128 + i * 8);
+    std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4);
+    // Read the selection on the GPU, as GTA's descriptor waterfall does.
+    test.initial[64 + i] = std::size(cases) - 1 - i;
+    test.expected.push_back(cases[std::size(cases) - 1 - i].expected);
+  }
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 28, 0);
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeVop1(0x01, 30, 28));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 30));
+  code.push_back(EncodeMubuf0(0x0c, 256));
+  code.push_back(EncodeMubuf1(2, 0, 30));
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(2)));
+  code.push_back(EncodeSop2(0x1e, 20, 20, InlineU32(5)));
+  code.push_back(EncodeSmem0(0x0b, 8, 0));
+  code.push_back(EncodeSmem1(512, 20));
+  code.push_back(EncodeVop1(0x01, 21, 12));
+  code.push_back(EncodeVop1(0x01, 22, 13));
+  code.push_back(EncodeMubuf0(0x00, 0, true, true));
+  code.push_back(EncodeMubuf1(4, 2, 21, 14));
+  AppendBufferStoreDword(&code, 4, 30);
+  code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 28, InlineU32(std::size(cases))));
+  code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpSwitch", "OpLoopMerge"};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
+                  O::S_BUFFER_LOAD_DWORDX8, O::BUFFER_LOAD_FORMAT_X,
+                  O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::S_ENDPGM};
+  return test;
 }
 
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
@@ -27498,23 +27587,27 @@ TestCase BufferStoreFormatXyzwDropsPartialRecord() {
   return test;
 }
 
-TestCase BufferLoadFormatXChecksOnlyTransferredComponent() {
+TestCase BufferLoadFormatXRejectsPartialRecord() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
   AppendVMovU32(&code, 20, 12);
   AppendBufferLoadOpcode(&code, 0x00, 0, 20);
+  // Bounds precede alignment: rounding offset 1 down must not make its full format fit.
+  AppendVMovU32(&code, 20, 1);
+  AppendBufferLoadOpcode(&code, 0x00, 1, 20);
   AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BufferLoadFormatXChecksOnlyTransferredComponent";
+  test.name = "BufferLoadFormatXRejectsPartialRecord";
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.expected = {0x44444444u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0u, 0u, 0x33333333u, 0x44444444u};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 16, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -27544,7 +27637,7 @@ TestCase BufferStoreFormatXRejectsPartialRecord() {
   return test;
 }
 
-TestCase BufferLoadFormatXyChecksOnlyTransferredComponents() {
+TestCase BufferLoadFormatXyRejectsPartialRecord() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -27555,13 +27648,13 @@ TestCase BufferLoadFormatXyChecksOnlyTransferredComponents() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BufferLoadFormatXyChecksOnlyTransferredComponents";
+  test.name = "BufferLoadFormatXyRejectsPartialRecord";
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.expected = {0x33333333u, 0x44444444u, 0x33333333u, 0x44444444u};
+  test.expected = {0u, 0u, 0x33333333u, 0x44444444u};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 16, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -34077,12 +34170,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
+  AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
-  AddCase(BufferLoadFormatXChecksOnlyTransferredComponent);
+  AddCase(BufferLoadFormatXRejectsPartialRecord);
   AddCase(BufferStoreFormatXRejectsPartialRecord);
-  AddCase(BufferLoadFormatXyChecksOnlyTransferredComponents);
+  AddCase(BufferLoadFormatXyRejectsPartialRecord);
   AddCase(BufferStoreFormatXyRejectsPartialRecord);
   AddCase(BufferStoreVariants);
   AddCase(BufferFormatVariants);
@@ -39447,6 +39541,9 @@ int main(int argc, char **argv) {
     CheckIndirectBufferStore(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
+    RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());

@@ -213,7 +213,7 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 		EmitWrite(0);
 		return;
 	}
-	EmitImageMipSwitch(state, mip_lod, image.mip_count, 0, EmitWrite);
+	EmitIndexSwitch(state, mip_lod, image.mip_count, 0, EmitWrite);
 }
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage) {

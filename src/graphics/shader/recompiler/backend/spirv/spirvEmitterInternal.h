@@ -553,17 +553,17 @@ uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
-auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_count,
+auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
                         uint32_t result_type, Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
-	EXIT_IF(mip_count == 0u);
+	EXIT_IF(count == 0u);
 	const auto merge_label = state.builder.AllocateId();
-	std::vector<uint32_t> labels(mip_count);
-	std::vector<uint32_t> words {spv::OpSwitch, mip_lod, merge_label};
-	for (uint32_t mip = 0; mip < mip_count; mip++) {
-		labels[mip] = state.builder.AllocateId();
-		words.push_back(mip);
-		words.push_back(labels[mip]);
+	std::vector<uint32_t> labels(count);
+	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
+	for (uint32_t item = 0; item < count; item++) {
+		labels[item] = state.builder.AllocateId();
+		words.push_back(item);
+		words.push_back(labels[item]);
 	}
 	if constexpr (has_result) {
 		words[2] = labels.front();
@@ -574,13 +574,13 @@ auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_coun
 	if constexpr (has_result) {
 		phi = {spv::OpPhi, result_type, state.builder.AllocateId()};
 	}
-	for (uint32_t mip = 0; mip < mip_count; mip++) {
-		EmitLabel(state, labels[mip]);
+	for (uint32_t item = 0; item < count; item++) {
+		EmitLabel(state, labels[item]);
 		if constexpr (has_result) {
-			phi.push_back(emit(mip));
+			phi.push_back(emit(item));
 			phi.push_back(state.current_label);
 		} else {
-			emit(mip);
+			emit(item);
 		}
 		state.builder.AddFunction(spv::OpBranch, merge_label);
 	}
