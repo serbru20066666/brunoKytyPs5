@@ -3,7 +3,7 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.name = wave_size == 32 ? "FlatStackApertures32" : "FlatStackApertures64";
   auto &code = test.code;
   code = {EncodeSop1(0x04, 8, 237), // private base
-          EncodeSop1(0x04, 10, 235), // shared base
+          EncodeSop1(0x0b, 11, InlineU32(1)), // S_BREV_B32 shared aperture, as in GTA.
           EncodeVop2(0x1a, 20, InlineU32(2), 0),
           EncodeVop2(0x1b, 22, InlineU32(1), 0),
           EncodeVop2(0x1a, 22, InlineU32(31), 22)};
@@ -77,6 +77,8 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.compute_info.scratch_size_dwords = wave_size;
   test.compute_info.lds_size_dwords = wave_size;
   test.has_compute_info = true;
+  test.decoded_counts = {{"S_BREV_B32", 1}};
+  test.ir_counts = {{" = BitReverse32 ", 0}};
   test.forbidden_spirv = {"get_bda_pointer"};
   return test;
 }
