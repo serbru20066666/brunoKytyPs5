@@ -94,6 +94,15 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem) {
+	if (!mem.formatted) return mem.data_bits;
+	const auto format = mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
+	                              : program.info.buffers[mem.resource].descriptor_format;
+	const auto info = Format::GetFormatInfo(format);
+	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
+	           ? 32u : info.component_bits[0];
+}
+
 void EmitMemoryOffsets(EmitterState& state) {
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		const auto word =
@@ -196,24 +205,18 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
+			const auto bits = mem.kind == IR::ResourceKind::Buffer
+			                      ? StorageBufferElementBits(state.program, mem) : 32u;
+			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
+			                      : bits == 16u ? state.storage_buffer_u16_variable
+			                                    : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
-			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
-			                                    ConstantU32(state, 2u));
-			access.add_index_offset = true;
+			    state, mem, variable, TypeStorageBufferPointer(state, bits));
+			access.element_bits = bits;
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
-	access.length = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
-	return access;
-}
-
-uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
-                                uint32_t raw_index) {
-	return access.add_index_offset ? EmitAddU32(state, raw_index, access.index_offset) : raw_index;
 }
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
@@ -251,7 +254,7 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		return pointer;
 	}
 	return EmitStorageBufferElementPointer(state, access, index,
-	                                       TypeStorageBufferElementPointer(state));
+	                                       TypeStorageBufferElementPointer(state, access.element_bits));
 }
 
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,

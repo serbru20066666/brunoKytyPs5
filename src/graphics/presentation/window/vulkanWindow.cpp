@@ -49,6 +49,12 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
+	vk::PhysicalDeviceVulkan11Features features {};
+	features.storageBuffer16BitAccess = VK_TRUE;
+	return features;
+}
+
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.samplerMirrorClampToEdge  = VK_TRUE;
@@ -57,6 +63,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
@@ -209,6 +216,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		depth_clip_control.pNext = &depth_clip_enable;
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
+		vk::PhysicalDeviceVulkan11Features features11 {};
 #if defined(__APPLE__)
 		features12.pNext = &depth_clip_control;
 #else
@@ -216,6 +224,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		fragment_barycentric.pNext = &depth_clip_control;
 		features12.pNext           = &fragment_barycentric;
 #endif
+		features11.pNext       = features12.pNext;
+		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
 
@@ -259,6 +269,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
 		              required_features12.samplerMirrorClampToEdge);
+		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
+		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
+		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
+		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
 		              required_features12.timelineSemaphore);
 		check_feature(features12.shaderOutputLayer, "shaderOutputLayer",
@@ -512,6 +526,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	workgroup_layout.pNext = &depth_clip_control;
 	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
 	                                             : static_cast<void*>(&depth_clip_control);
+	auto features11 = WindowContext::RequiredVulkan11Features();
+	features11.pNext = features12.pNext;
+	features12.pNext = &features11;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "

@@ -249,6 +249,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
+					const auto bits = StorageBufferElementBits(program, memory);
+					requirements.buffer_u8 |= bits == 8u;
+					requirements.buffer_u16 |= bits == 16u;
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 						if (program.stage != ShaderType::Compute) {
 							Fail(program, "buffer ADD_TID is only valid for compute shaders");

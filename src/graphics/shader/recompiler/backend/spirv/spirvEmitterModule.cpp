@@ -123,46 +123,31 @@ uint32_t TypeFunction(EmitterState& state) {
 	return state.function_type;
 }
 
-uint32_t StorageRuntimeArrayType(EmitterState& state) {
-	return state.builder.DecoratedType(
-	    spv::OpTypeRuntimeArray,
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}}, TypeU32(state));
+uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits) {
+	return bits == 32u ? TypeU32(state) : bits == 64u ? TypeScalarU64(state)
+	                                                   : state.builder.Type(spv::OpTypeInt, bits, 0);
 }
 
-uint32_t StorageBufferType(EmitterState& state) {
+uint32_t StorageRuntimeArrayType(EmitterState& state, uint32_t bits) {
+	return state.builder.DecoratedType(
+	    spv::OpTypeRuntimeArray,
+	    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}},
+	    TypeStorageBufferElement(state, bits));
+}
+
+uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32) {
 	return state.builder.DecoratedType(spv::OpTypeStruct,
 	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
 	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
-	                                   StorageRuntimeArrayType(state));
+	                                   StorageRuntimeArrayType(state, bits));
 }
 
-uint32_t TypeStorageBufferPointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state));
+uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, bits));
 }
 
-uint32_t TypeStorageBufferElementPointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state));
-}
-
-uint32_t StorageU64RuntimeArrayType(EmitterState& state) {
-	return state.builder.DecoratedType(
-	    spv::OpTypeRuntimeArray,
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint64_t)}}}, TypeScalarU64(state));
-}
-
-uint32_t StorageBufferU64Type(EmitterState& state) {
-	return state.builder.DecoratedType(spv::OpTypeStruct,
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
-	                                   StorageU64RuntimeArrayType(state));
-}
-
-uint32_t TypeStorageBufferU64Pointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferU64Type(state));
-}
-
-uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, TypeScalarU64(state));
+uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, TypeStorageBufferElement(state, bits));
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -245,13 +230,17 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Buffers:
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				if (state.requirements.buffer_u8) {
+					state.storage_buffer_u8_variable =
+					    Define(ArrayType(StorageBufferType(state, 8)), "buffers_u8");
+				}
+				if (state.requirements.buffer_u16) {
+					state.storage_buffer_u16_variable =
+					    Define(ArrayType(StorageBufferType(state, 16)), "buffers_u16");
+				}
 				if (state.requirements.buffer_int64_atomics) {
 					state.storage_buffer_u64_variable =
-					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationAliased);
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
-					                            spv::DecorationAliased);
+					    Define(ArrayType(StorageBufferType(state, 64)), "buffers_u64");
 				}
 				if (!state.requirements.buffer_writes) {
 					// A program that only reads its buffers says so. The AMD driver then loads
@@ -263,19 +252,22 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
 					                            spv::DecorationNonWritable);
 				}
-				if (state.requirements.coherent_buffers) {
+				for (const auto variable: {state.storage_buffer_variable, state.storage_buffer_u8_variable,
+				                           state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
+					if (variable == 0) continue;
+					if (state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
+					    state.storage_buffer_u64_variable != 0) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationCoherent);
-					if (state.storage_buffer_u64_variable != 0) {
-						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
-						                            spv::DecorationCoherent);
+					if (state.requirements.coherent_buffers) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
 					}
 				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:
-				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");
+				state.bda_pagetable_variable = Define(StorageBufferType(state, 64), "bda_pagetable");
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
@@ -690,6 +682,13 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	if (state.requirements.buffer_u8) {
+		state.builder.RequireExtension("SPV_KHR_8bit_storage");
+		state.builder.RequireCapability(spv::CapabilityStorageBuffer8BitAccess);
+	}
+	if (state.requirements.buffer_u16) {
+		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
+	}
 	// Mesh shaders load their draw parameter record through a device address.
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.stage == ShaderType::Mesh;

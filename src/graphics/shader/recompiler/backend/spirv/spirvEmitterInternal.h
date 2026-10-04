@@ -71,6 +71,8 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	bool buffer_u8                    = false;
+	bool buffer_u16                   = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	// A buffer store or atomic anywhere in the program. Without one, the buffers are declared
@@ -114,6 +116,8 @@ struct EmitterState {
 	uint32_t                                         lane_count                  = 1;
 	uint32_t                                         lane_half                   = 0;
 	uint32_t                                         storage_buffer_variable     = 0;
+	uint32_t                                         storage_buffer_u8_variable = 0;
+	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable       = 0;
@@ -180,10 +184,9 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
-uint32_t TypeStorageBufferPointer(EmitterState& state);
-uint32_t TypeStorageBufferElementPointer(EmitterState& state);
-uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
-uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
+uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
+uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
+uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
@@ -422,6 +425,7 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
+uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
 
@@ -432,9 +436,8 @@ struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
 	uint32_t              length           = 0;
-	uint32_t              index_offset     = 0;
 	uint32_t              byte_offset      = 0;
-	bool                  add_index_offset = false;
+	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
@@ -445,9 +448,6 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
                                                         uint32_t variable, uint32_t pointer_type);
-
-uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
-                                uint32_t raw_index);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);

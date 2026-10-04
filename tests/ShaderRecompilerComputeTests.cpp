@@ -1440,7 +1440,7 @@ struct TestCase {
   bool has_user_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
-  size_t storage_buffer_range_dwords = 0;
+  size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
@@ -1845,7 +1845,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     if (resource < test.storage_buffer_offsets.size()) {
       offset = test.storage_buffer_offsets[resource];
     }
-    Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
+    Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
@@ -11963,6 +11963,32 @@ public:
                 "descriptor rebind lost its clamped guest range or retained a stale host owner");
       }
 
+      {
+        const auto buffer_program = make_buffer_program(ShaderType::Compute, {.read = true});
+        constexpr uint64_t buffer_address = base + 0xe0002;
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(buffer_address);
+        descriptor.fields[1] |= 6u << 16u;
+        descriptor.fields[2] = 2;
+        descriptor.fields[3] = 0x5204;
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        auto &value = snapshot.buffers.emplace_back();
+        std::copy_n(descriptor.fields, 4, value.dwords.begin());
+        value.dword_count = 4;
+        ShaderStageRuntime runtime{&buffer_program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        executor.FindBuffers(bindings);
+        executor.RebindBuffers(bindings);
+        const auto &owner = resources.GetBufferCache().GetBuffer(bindings.buffer_sources[0].id);
+        Require(name, "halfword buffer base and exact tail",
+                bindings.buffers[0].buffer == owner.Handle() &&
+                    bindings.buffers[0].offset + 2 == owner.Offset(buffer_address) &&
+                    bindings.buffers[0].range == 14 &&
+                    bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2,
+                "native binding lost the byte adjustment or rounded the final halfword range");
+      }
+
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
       constexpr auto linear = Prospero::TileMode::kLinear;
       TileSizeAlign stencil_layout{};
@@ -15148,13 +15174,13 @@ public:
         info.buffer = buffer.buffer;
         info.offset = 0;
         info.range = buffer.size;
-        if (test.storage_buffer_range_dwords != 0) {
+        if (test.storage_buffer_range_bytes != 0) {
           const auto resource = buffers->resources[i];
           const auto offset = resource < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[resource]
                                   : 0u;
           info.range = static_cast<vk::DeviceSize>(
-              test.storage_buffer_range_dwords * sizeof(u32) + offset);
+              test.storage_buffer_range_bytes + offset);
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
@@ -17856,10 +17882,12 @@ private:
         if ((queues[i].queueFlags &
              (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) ==
             (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) {
+          vk::PhysicalDeviceVulkan11Features features11{};
           vk::PhysicalDeviceVulkan12Features features12{};
           features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
           vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
-          features12.pNext = &workgroup_layout;
+          features12.pNext = &features11;
+          features11.pNext = &workgroup_layout;
           vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
           workgroup_layout.pNext = &image_atomic64;
           vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
@@ -17874,6 +17902,8 @@ private:
           // scheduler, cache and readback groups remain runnable without a GPU.
           if ((barycentric.fragmentShaderBarycentric != true && !SoftwareGpuAllowed()) ||
               features.features.shaderInt64 != true ||
+              features11.storageBuffer16BitAccess != true ||
+              features12.storageBuffer8BitAccess != true ||
               features12.samplerMirrorClampToEdge != true ||
               features12.shaderOutputViewportIndex != true ||
               features12.shaderBufferInt64Atomics != true ||
@@ -17905,7 +17935,9 @@ private:
 
     vk::PhysicalDeviceFeatures available_features{};
     m_physical_device.getFeatures(&available_features);
+    vk::PhysicalDeviceVulkan11Features available_features11{};
     vk::PhysicalDeviceVulkan12Features available_features12{};
+    available_features12.pNext = &available_features11;
     available_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
     vk::PhysicalDeviceVulkan13Features available_features13{};
@@ -17947,6 +17979,10 @@ private:
             available_features.shaderImageGatherExtended == true &&
                 (m_derivatives_supported || SoftwareGpuAllowed()),
             "image gather or compute derivative quads are not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features11.storageBuffer16BitAccess == true &&
+                available_features12.storageBuffer8BitAccess == true,
+            "8-bit and 16-bit storage buffer access are not supported");
     Require("VulkanHarness", "dispatch",
             m_barycentric_supported || SoftwareGpuAllowed(),
             "fragment shader barycentrics are not supported");
@@ -18050,6 +18086,7 @@ private:
     device_info.sType = vk::StructureType::eDeviceCreateInfo;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
@@ -18059,7 +18096,8 @@ private:
     device_features12.shaderSharedInt64Atomics = true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
-    device_features12.pNext = &workgroup_layout;
+    device_features12.pNext = &device_features11;
+    device_features11.pNext = &workgroup_layout;
     vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
     image_atomic64.shaderImageInt64Atomics = true;
     workgroup_layout.pNext = &image_atomic64;
@@ -27282,7 +27320,7 @@ TestCase BufferStoreDwordAppliesHostOffset() {
 
   std::vector<u32> code;
   AppendVMovLiteral(&code, 0, 0xabcdef01u);
-  code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+  code.push_back(EncodeMubuf0(0x1cu, 2, false, false));
   code.push_back(EncodeMubuf1(0, 0, 20));
   AppendEnd(&code);
 
@@ -27290,11 +27328,11 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   test.name = "BufferStoreDwordAppliesHostOffset";
   test.code = code;
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0};
-  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0xabcdef01u};
-  test.storage_buffer_range_dwords = 1;
-  test.storage_buffer_offsets = {12};
+  test.expected = {0x11111111u, 0xabcdef01u, 0x33333333u, 0};
+  test.storage_buffer_range_bytes = 8;
+  test.storage_buffer_offsets = {2};
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.user_data = MakeStructuredStorageBufferData(4, 1);
+  test.user_data = MakeStructuredStorageBufferData(0, 8);
   test.has_user_data = true;
   return test;
 }
@@ -27322,7 +27360,7 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   test.code = std::move(code);
   test.initial = {0, 0, 0, 0};
   test.expected = {0x12345678u, 0, 0, 0xabcdef01u};
-  test.storage_buffer_range_dwords = 1;
+  test.storage_buffer_range_bytes = 4;
   test.storage_buffer_offsets = {0, 12};
   test.expand_shader_data_storage = true;
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
@@ -27363,6 +27401,99 @@ TestCase BufferLoadVariants() {
            O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_DWORDX2,
            O::BUFFER_LOAD_DWORDX3, O::BUFFER_LOAD_DWORDX4, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase BufferSubwordLoadsAtHostOffset(u32 bytes, u32 component, bool sign) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = bytes == 1 ? (sign ? "BufferSbyteHostOffsetTail" : "BufferUbyteHostOffsetTail")
+              : sign ? "BufferSshortHostOffsetTail"
+              : component == 0 ? "BufferUshortHostOffsetFirst"
+              : component == 2 ? "BufferUshortHostOffsetCarry"
+                               : "BufferUshortHostOffsetTail";
+  // The captured stride-six index buffer uses USHORT IDXEN offsets 4, 2, 0.
+  test.code = {EncodeMubuf0((bytes == 1 ? 0x08u : 0x0au) + sign,
+                            component, true, false),
+               EncodeMubuf1(1, 0, 0),
+               EncodeMubuf0(0x1cu, 0, true, false), EncodeMubuf1(1, 12, 0)};
+  AppendEnd(&test.code);
+  test.initial = {0x800112abu, 0xfedc2345u, 0x80007fffu, 0xfaceffffu,
+                  0xccccccccu, 0xccccccccu, 0xccccccccu};
+  test.expected = test.initial;
+  for (u32 record = 0; record < 2; ++record) {
+    u32 value = 0;
+    std::memcpy(&value, reinterpret_cast<const uint8_t *>(test.initial.data()) +
+                           bytes + record * 6 + component, bytes);
+    if (sign && (value & (1u << (bytes * 8u - 1u))) != 0) {
+      value |= UINT32_MAX << (bytes * 8u);
+    }
+    test.expected[4 + record] = value;
+  }
+  test.expected[6] = 0;
+  test.storage_buffer_range_bytes = 12;
+  test.storage_buffer_offsets = {bytes, 16};
+  test.user_data = MakeStructuredStorageBufferData(6, 2);
+  test.user_data[0] = 0x1000u + bytes;
+  test.user_data[48] = 0x2000u;
+  test.user_data[49] = 4u << 16u;
+  test.user_data[50] = 3;
+  test.user_data[51] = 0x5204;
+  test.has_user_data = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.threads_num[0] = 3;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  test.opcodes = {bytes == 1 ? (sign ? O::BUFFER_LOAD_SBYTE : O::BUFFER_LOAD_UBYTE)
+                            : (sign ? O::BUFFER_LOAD_SSHORT : O::BUFFER_LOAD_USHORT),
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferSubwordHostOffsetOverflow() {
+  auto test = BufferSubwordLoadsAtHostOffset(2, 0, false);
+  test.name = "BufferSubwordHostOffsetOverflow";
+  test.code.clear();
+  AppendVMovLiteral(&test.code, 20, UINT32_MAX);
+  test.code.insert(test.code.end(),
+                   {EncodeMubuf0(0x0au), EncodeMubuf1(1, 0, 20),
+                    EncodeMubuf0(0x1cu, 0, true, false), EncodeMubuf1(1, 12, 0)});
+  AppendVMovLiteral(&test.code, 1, 0xbeef);
+  test.code.insert(test.code.end(), {EncodeMubuf0(0x1au), EncodeMubuf1(1, 0, 20)});
+  AppendEnd(&test.code);
+  test.expected[4] = test.expected[5] = 0;
+  test.opcodes.push_back(ShaderOpcode::V_MOV_B32);
+  test.opcodes.push_back(ShaderOpcode::BUFFER_STORE_SHORT);
+  return test;
+}
+
+TestCase BufferSubwordStoresAtHostOffset(u32 bytes) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = bytes == 1 ? "BufferByteStoreHostOffsetTail" : "BufferShortStoreHostOffsetTail";
+  AppendVMovLiteral(&test.code, 1, bytes == 1 ? 0xa5u : 0xcafeu);
+  test.code.push_back(EncodeMubuf0(bytes == 1 ? 0x18u : 0x1au,
+                                  6u - bytes, true, false));
+  test.code.push_back(EncodeMubuf1(1, 0, 0));
+  AppendEnd(&test.code);
+  test.initial = {0x800112abu, 0xfedc2345u, 0x80007fffu, 0xfaceffffu,
+                  0x13579bdfu, 0x2468ace0u};
+  test.expected = bytes == 1
+      ? std::vector<u32>{0x800112abu, 0xfea52345u, 0x80007fffu, 0xfaceffa5u,
+                         0x13579bdfu, 0x2468ace0u}
+      : std::vector<u32>{0x800112abu, 0xcafe2345u, 0x80007fffu, 0xfacecafeu,
+                         0x13579bdfu, 0x2468ace0u};
+  test.storage_buffer_range_bytes = 12;
+  test.storage_buffer_offsets = {bytes};
+  test.user_data = MakeStructuredStorageBufferData(6, 2);
+  test.user_data[0] = 0x1000u + bytes;
+  test.has_user_data = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.threads_num[0] = 3;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, bytes == 1 ? O::BUFFER_STORE_BYTE : O::BUFFER_STORE_SHORT,
+                  O::S_ENDPGM};
+  return test;
 }
 
 TestCase BufferLoadDwordx4SnapshotsOverlappingAddress() {
@@ -27459,7 +27590,7 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = {0x33333333u, 0x44444444u, 0u, 0u};
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -27670,7 +27801,7 @@ TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = {0x11111111u, 0x22222222u, 0xaaaaaaaau, 0xbbbbbbbbu};
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORDX4, O::S_ENDPGM};
   return test;
 }
@@ -27691,7 +27822,7 @@ TestCase BufferLoadFormatXyzwRejectsPartialRecord() {
   test.code = std::move(code);
   test.initial = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
   test.expected = {0u, 0u, 0u, 0u};
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -27718,7 +27849,7 @@ TestCase BufferStoreFormatXyzwDropsPartialRecord() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = test.initial;
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -27744,7 +27875,7 @@ TestCase BufferLoadFormatXRejectsPartialRecord() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = {0u, 0u, 0x33333333u, 0x44444444u};
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.user_data = MakeStructuredStorageBufferData(
       0, 16, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -27768,7 +27899,7 @@ TestCase BufferStoreFormatXRejectsPartialRecord() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = test.initial;
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -27791,7 +27922,7 @@ TestCase BufferLoadFormatXyRejectsPartialRecord() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = {0u, 0u, 0x33333333u, 0x44444444u};
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.user_data = MakeStructuredStorageBufferData(
       0, 16, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -27816,7 +27947,7 @@ TestCase BufferStoreFormatXyRejectsPartialRecord() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = test.initial;
-  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_range_bytes = 16;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -28126,7 +28257,7 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   test.has_compute_info = true;
   test.user_data = MakeStructuredStorageBufferData(2, 64, false, 11);
   test.has_user_data = true;
-  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
+  test.forbidden_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
   return test;
 }
 
@@ -28485,7 +28616,7 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
   test.code = code;
   test.initial = {0x11111111u, 0x22222222u};
   test.expected = {0x11111111u, 0x22222222u};
-  test.storage_buffer_range_dwords = 1;
+  test.storage_buffer_range_bytes = 4;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(4, 1, false, 20);
   test.has_user_data = true;
@@ -32683,7 +32814,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   TestCase test;
   test.name = "IndirectBufferStore";
   test.initial.assign(64, 0xdeadbeefu);
-  test.storage_buffer_range_dwords = 16;
+  test.storage_buffer_range_bytes = 64;
   test.storage_buffer_offsets = {12, 108};
   test.required_spirv = {"OpSwitch"};
   test.forbidden_spirv = {"PhysicalStorageBuffer"};
@@ -34537,6 +34668,15 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(BufferLoadVariants);
+  for (const u32 component : {4u, 2u, 0u}) {
+    cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
+  }
+  cases.push_back(BufferSubwordLoadsAtHostOffset(2, 4, true));
+  cases.push_back(BufferSubwordLoadsAtHostOffset(1, 5, false));
+  cases.push_back(BufferSubwordLoadsAtHostOffset(1, 5, true));
+  AddCase(BufferSubwordHostOffsetOverflow);
+  cases.push_back(BufferSubwordStoresAtHostOffset(2));
+  cases.push_back(BufferSubwordStoresAtHostOffset(1));
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
