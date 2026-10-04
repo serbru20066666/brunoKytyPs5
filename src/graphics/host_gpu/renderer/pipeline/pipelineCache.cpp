@@ -1980,10 +1980,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 				case ShaderAlphaBlendSource::SourceAlpha:
 					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
 					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
-					if (blend.separate_alpha_blend) {
-						blend.alpha_srcblend  = RemapSourceAlphaFactor(blend.alpha_srcblend);
-						blend.alpha_destblend = RemapSourceAlphaFactor(blend.alpha_destblend);
-					}
+					blend.separate_alpha_blend = false;
 					break;
 				case ShaderAlphaBlendSource::SourceAlphaOne:
 					// The second source carries the mapped source factor; its alpha stays logical Sa.

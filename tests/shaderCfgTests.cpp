@@ -12886,6 +12886,10 @@ void TestBlendMappingClassification() {
       static_cast<uint8_t>(Factor::kOneMinusSrcAlpha);
   Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlphaOne,
         "separate alpha accumulation did not preserve its unit source factor");
+  blend.alpha_srcblend = blend.color_srcblend;
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlpha,
+        "equal separate alpha equations did not reuse the broadcast alpha mode");
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kOne);
   const auto exact = blend;
   for (uint32_t changed = 0; changed < 6; changed++) {
     blend = exact;

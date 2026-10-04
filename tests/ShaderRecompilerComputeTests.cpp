@@ -16476,24 +16476,43 @@ public:
       alpha_blend.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
       alpha_blend.color_destblend = alpha_blend.alpha_destblend =
           static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrcAlpha);
-      for (const bool separate : {false, true}) {
-        alpha_blend.separate_alpha_blend = separate;
+      struct AlphaBlendCase {
+        bool separate;
+        Prospero::BlendFactor alpha_source;
+        ShaderAlphaBlendSource mode;
+        float alpha;
+      };
+      uint64_t broadcast_program = 0;
+      vk::Pipeline broadcast_pipeline{};
+      for (const auto test : {
+          AlphaBlendCase{false, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
+          AlphaBlendCase{true, Prospero::BlendFactor::kSrcAlpha, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
+          AlphaBlendCase{true, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlphaOne, 0.65f}}) {
+        alpha_blend.separate_alpha_blend = test.separate;
+        alpha_blend.alpha_srcblend = static_cast<uint8_t>(test.alpha_source);
         registers.SetBlendControl(0, alpha_blend);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
             registers, user_config, export_mapping, true, native_vertex_info, pixel);
-        const auto mode = separate ? ShaderAlphaBlendSource::SourceAlphaOne
-                                   : ShaderAlphaBlendSource::SourceAlpha;
-        Require(name, "logical alpha blend program", pixel.alpha_blend_source == mode &&
+        Require(name, "logical alpha blend program", pixel.alpha_blend_source == test.mode &&
                     pixel.dual_source_blending,
                 "the separate alpha equation did not reach the compiled pixel program");
         vertex_shader = programs.vertex[0];
         pixel_shader = programs.pixel;
         vertex = native_vertex_info[0];
+        auto &selected = pipeline(true, 2, 2);
+        if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
+          Require(name, "equal blend equation cache reuse",
+                  broadcast_program == 0 || (programs.pixel.id == broadcast_program &&
+                                              selected.pipeline == broadcast_pipeline),
+                  "equivalent separate alpha state created another shader or pipeline");
+          broadcast_program = programs.pixel.id;
+          broadcast_pipeline = selected.pipeline;
+        }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
-        draw(pipeline(true, 2, 2), 3, std::bit_cast<std::array<u32, 4>>(destination));
+        draw(selected, 3, std::bit_cast<std::array<u32, 4>>(destination));
         const auto blend_pixels = read_color();
-        const std::array<float, 4> expected{separate ? 0.65f : 0.4f, 0.35f, 0.35f, 0.5f};
+        const std::array<float, 4> expected{test.alpha, 0.35f, 0.35f, 0.5f};
         for (size_t component = 0; component < blend_pixels.size(); component++) {
           Require(name, "logical alpha blend readback",
                   std::abs(std::bit_cast<float>(blend_pixels[component]) -
