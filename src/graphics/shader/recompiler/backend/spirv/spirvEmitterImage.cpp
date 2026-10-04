@@ -471,9 +471,13 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	const auto numeric_class = ctx.state.program.info.images[mem.resource].numeric_class;
 	const auto vector_type   = ImageVectorType(ctx.state, numeric_class, 4);
 	if (selector < 4u) {
-		const auto value = info.packed_bitfield
-		                       ? ConstantU32(ctx.state, selector == 1u ? 1u : 0u)
-		                       : ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
+		uint32_t value;
+		switch (info.type) {
+			case Format::ComponentType::Uscaled:
+				value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
+				break;
+			default: value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u); break;
+		}
 		return ctx.state.builder.Constant(spv::OpConstantComposite, vector_type, value, value,
 		                                  value, value);
 	}
