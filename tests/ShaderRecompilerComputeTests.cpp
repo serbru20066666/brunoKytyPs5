@@ -36871,13 +36871,28 @@ void CheckImageSamplerSpecialization() {
     user_data[48] = 0x3000u;
     std::vector<u32> code{EncodeVopc(0xc5, InlineU32(0), 0),
                           EncodeSop1(0x24, 24, 106), EncodeSopp(0x08, 0),
-                          EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(15, 1, 0),
-                          EncodeVop2(0x16, 15, InlineU32(4), 15),
-                          EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15),
-                          EncodeSop2(0x1e, 20, 20, InlineU32(5)),
-                          EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20),
-                          EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)};
+                          EncodeSop1(0x04, 26, 126), EncodeVop1(0x01, 16, InlineU32(1))};
+    // An earlier descriptor waterfall separates the EXECZ witness from this material load.
+    const auto previous_loop = code.size();
+    code.insert(code.end(), {EncodeSop1(0x04, 28, 126),
+                             EncodeVop1(0x02, 22, Vgpr(0)), EncodeVopc(0xd2, 22, 0),
+                             EncodeVop1(0x01, 16, InlineU32(0)),
+                             EncodeSop1(0x04, 126, 28), EncodeVopc(0xd5, InlineU32(0), 16)});
+    code.push_back(EncodeSopp(0x09, static_cast<int16_t>(previous_loop - code.size() - 1u)));
+    code.insert(code.end(), {EncodeSop1(0x04, 126, 26),
+                             EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(15, 1, 0),
+                             EncodeVop2(0x16, 15, InlineU32(4), 15),
+                             EncodeVop1(0x01, 16, InlineU32(1))});
+    const auto image_loop = code.size();
+    code.insert(code.end(), {EncodeSop1(0x04, 28, 126),
+                             EncodeVop1(0x02, 20, Vgpr(15)), EncodeVopc(0xd2, 20, 15),
+                             EncodeSop2(0x1e, 20, 20, InlineU32(5)),
+                             EncodeSmem0(0x0b, 12), EncodeSmem1(0, 20),
+                             EncodeMimg0(0x24, 1), EncodeMimg1(4, 0, 3, 2)});
     AppendBufferStoreDword(&code, 4, 0);
+    code.insert(code.end(), {EncodeVop1(0x01, 16, InlineU32(0)),
+                             EncodeSop1(0x04, 126, 28), EncodeVopc(0xd5, InlineU32(0), 16)});
+    code.push_back(EncodeSopp(0x09, static_cast<int16_t>(image_loop - code.size() - 1u)));
     code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
     AppendEnd(&code);
     ShaderComputeInputInfo compute{};
@@ -36932,6 +36947,12 @@ void CheckImageSamplerSpecialization() {
     Require(name, "dirty material rejection",
             !MaterializeResources(plan, dirty, snapshot, specialization),
             "GPU-selected texture materialization bypassed strict read provenance");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    ExpectFatal("MaterialImageWithoutEntryWitness", [&] {
+      code[2] = EncodeSopp(0x00, 0); // S_NOP removes the original nonempty-EXEC witness.
+      (void)ShaderRecompiler::TranslateProgram(code, options);
+    });
+#endif
   }
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");

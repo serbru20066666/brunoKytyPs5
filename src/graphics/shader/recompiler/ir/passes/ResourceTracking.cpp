@@ -1063,19 +1063,35 @@ private:
 		return edge && edge->positive ? edge->condition : Value {};
 	}
 
+	bool GuardedOnEntry(const Block* block, const auto& stops, const auto& accepts) const {
+		std::vector<const Block*> pending {block};
+		for (size_t i = 0; i < pending.size(); ++i) {
+			const auto* current = pending[i];
+			if (stops(current) || current->ImmPredecessors().empty()) return false;
+			for (const auto* previous: current->ImmPredecessors()) {
+				const auto edge = ConditionalEdge(previous, current);
+				if (edge && accepts(*edge)) continue;
+				if (std::ranges::find(pending, previous) == pending.end())
+					pending.push_back(previous);
+			}
+		}
+		return true;
+	}
+
 	bool HasActiveLane(Value mask, const Block* use) const {
 		mask = mask.Resolve();
 		const auto incoming_is_nonempty = [&](const Block* from, const Block* to,
 		                                     Value incoming, const Block* header) {
-			for (size_t depth = 0; depth < m_program.blocks.size(); ++depth) {
-				const auto edge = ConditionalEdge(from, to);
-				if (edge && edge->positive && Implies(edge->condition, incoming)) return true;
-				if (from == header || from->ImmSuccessors().size() != 1u ||
-				    from->ImmPredecessors().size() != 1u) return false;
-				to = from;
-				from = from->ImmPredecessors()[0];
-			}
-			return false;
+			const auto accepts = [&](const EdgePredicate& edge) {
+				return edge.positive && Implies(edge.condition, incoming);
+			};
+			const auto edge = ConditionalEdge(from, to);
+			if (edge && accepts(*edge)) return true;
+			const auto* definition = incoming.Resolve().TryInstruction();
+			return GuardedOnEntry(from, [&](const Block* block) {
+				// A witness before this definition may belong to an earlier loop iteration.
+				return block == header || (definition != nullptr && block == definition->Parent());
+			}, accepts);
 		};
 		const auto* phi = mask.TryInstruction();
 		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
@@ -1401,32 +1417,19 @@ private:
 		}
 		if (increment_block == nullptr) return {};
 
-		const auto guarded_on_entry = [&](const Block* block, const auto& accepts) {
-			std::vector<const Block*> pending {block};
-			for (size_t i = 0; i < pending.size(); ++i) {
-				const auto* current = pending[i];
-				if (current == phi->Parent() || current->ImmPredecessors().empty()) return false;
-				for (const auto* previous: current->ImmPredecessors()) {
-					const auto edge = ConditionalEdge(previous, current);
-					if (edge && accepts(*edge)) continue;
-					if (std::ranges::find(pending, previous) == pending.end())
-						pending.push_back(previous);
-				}
-			}
-			return true;
-		};
+		const auto stops = [&](const Block* block) { return block == phi->Parent(); };
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
 			if ((compare->GetOpcode() != ValueOpcode::SLessThan32 &&
 			     compare->GetOpcode() != ValueOpcode::ULessThan32) || use_of_key.operand != 0u ||
 			    !ValidateRuntimeValue(m_program, compare->Arg(1), RuntimeValueType::Integer)) continue;
-			if (!guarded_on_entry(use, [&](const EdgePredicate& edge) {
+			if (!GuardedOnEntry(use, stops, [&](const EdgePredicate& edge) {
 				return edge.positive && Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
 			LoopBoundProof proof(m_program, *phi, *compare);
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (guarded_on_entry(increment_block, [&](const EdgePredicate& edge) {
+			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
 				return proof.Excludes(edge.condition, edge.positive);
 			})) return compare;
 		}
