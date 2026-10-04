@@ -812,15 +812,6 @@ static bool ensure_stb_font(FontState* font) {
 	return font->has_ttf;
 }
 
-static float stb_font_pixel_height(const FontState* font) {
-	const float scale = (font != nullptr && font->scale_h > 1.0f ? font->scale_h : 16.0f);
-	return static_cast<float>(std::clamp(static_cast<int>(scale + 0.5f), 8, FONT_BITMAP_MAX_DIM));
-}
-
-static float stb_font_scale(FontState* font) {
-	return stbtt_ScaleForPixelHeight(&font->font_info, stb_font_pixel_height(font));
-}
-
 static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
 	if (font == nullptr || !ensure_stb_font(font)) {
 		return static_cast<uint32_t>('?');
@@ -836,31 +827,26 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 		return false;
 	}
 
-	code              = stb_supported_codepoint(font, code);
-	const float scale = stb_font_scale(font);
+	code                = stb_supported_codepoint(font, code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 
 	int advance = 0;
-	int lsb     = 0;
 	int x0      = 0;
 	int y0      = 0;
 	int x1      = 0;
 	int y1      = 0;
-	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, &lsb);
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale, scale, &x0, &y0,
-	                            &x1, &y1);
+	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, nullptr);
+	stbtt_GetCodepointBox(&font->font_info, static_cast<int>(code), &x0, &y0, &x1, &y1);
 
-	const float width     = static_cast<float>(std::max(x1 - x0, 0));
-	const float height    = static_cast<float>(std::max(y1 - y0, 0));
-	const float advance_f = std::max(static_cast<float>(advance) * scale, width);
-
-	metrics->width                = width;
-	metrics->height               = height;
-	metrics->horizontal.bearing_x = static_cast<float>(x0);
-	metrics->horizontal.bearing_y = static_cast<float>(-y0);
-	metrics->horizontal.advance   = advance_f;
+	metrics->width                = static_cast<float>(x1 - x0) * scale_x;
+	metrics->height               = static_cast<float>(y1 - y0) * scale_y;
+	metrics->horizontal.bearing_x = static_cast<float>(x0) * scale_x;
+	metrics->horizontal.bearing_y = static_cast<float>(y1) * scale_y;
+	metrics->horizontal.advance   = static_cast<float>(advance) * scale_x;
 	metrics->vertical.bearing_x   = 0.0f;
 	metrics->vertical.bearing_y   = 0.0f;
-	metrics->vertical.advance     = stb_font_pixel_height(font);
+	metrics->vertical.advance     = font->scale_h;
 
 	return true;
 }
@@ -871,14 +857,15 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 		return false;
 	}
 
-	code              = stb_supported_codepoint(font, code);
-	const float scale = stb_font_scale(font);
+	code                = stb_supported_codepoint(font, code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 
 	int x0 = 0;
 	int y0 = 0;
 	int x1 = 0;
 	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale, scale, &x0, &y0,
+	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale_x, scale_y, &x0, &y0,
 	                            &x1, &y1);
 
 	image->fill(0);
@@ -895,7 +882,7 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 	}
 
 	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
-	                          static_cast<int>(height), FONT_BITMAP_MAX_DIM, scale, scale,
+	                          static_cast<int>(height), FONT_BITMAP_MAX_DIM, scale_x, scale_y,
 	                          static_cast<int>(code));
 
 	return true;
@@ -1436,7 +1423,7 @@ int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontal
 
 	auto* font = static_cast<FontState*>(font_handle);
 	if (ensure_stb_font(font)) {
-		const float scale    = stb_font_scale(font);
+		const float scale = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 		int         ascent   = 0;
 		int         descent  = 0;
 		int         line_gap = 0;
