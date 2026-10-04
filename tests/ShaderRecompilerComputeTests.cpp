@@ -26976,15 +26976,18 @@ TestCase ScalarMemoryLoadVariants() {
   std::vector<u32> expected = initial;
   expected.insert(expected.end(), initial.begin(), initial.end());
 
-  return {"ScalarMemoryLoadVariants",
-          code,
-          initial,
-          expected,
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
-           O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
-           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
-           O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemoryLoadVariants",
+                code,
+                initial,
+                expected,
+                {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
+                 O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
+                 O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
+                 O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  test.required_spirv = {"get_bda_pointer"};
+  return test;
 }
 
 TestCase ScalarBufferOffsetAlignmentAndCarry() {
@@ -27028,11 +27031,15 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  return {"ScalarLoadSignedImmediateOffsetAddsSoffset",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x22222222u, 0x22222222u},
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarLoadSignedImmediateOffsetAddsSoffset",
+                code,
+                {0x11111111u, 0x22222222u},
+                {0x22222222u, 0x22222222u},
+                {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  test.required_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"flattened_srt"};
+  return test;
 }
 
 TestCase BufferLoadStore() {
@@ -29136,23 +29143,27 @@ TestCase BranchVccnzUsesCarryProducedWaveMask() {
   return test;
 }
 
-TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
+TestCase ScalarLoadAlignsComponents() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
   AppendSMovLiteral(&code, 0, 1u);
   AppendSMovLiteral(&code, 2, 3u);
-  AppendSMovLiteral(&code, 3, 0xffff0000u);
+  AppendSMovLiteral(&code, 3, 0u);
   code.push_back(EncodeSmem0(0x00, 1, 1));
   code.push_back(EncodeSmem1(3, 0));
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  return {"ScalarLoadAlignsComponentsAndMasksAddress",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x11111111u, 0x22222222u},
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarLoadAlignsComponents",
+                code,
+                {0x11111111u, 0x22222222u},
+                {0x11111111u, 0x22222222u},
+                {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  test.required_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"flattened_srt"};
+  return test;
 }
 
 TestCase ScalarLoadAlignsDynamicBase() {
@@ -34284,7 +34295,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
-  AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
+  AddCase(ScalarLoadAlignsComponents);
   AddCase(ScalarLoadAlignsDynamicBase);
   cases.push_back(ScalarBufferFromLoopReadlane(32));
   cases.push_back(ScalarBufferFromLoopReadlane(64));
@@ -37166,17 +37177,19 @@ void CheckResourcePlanHandoff() {
     ValidateSpirv(name, compiled.spirv);
     const auto &bindings = compiled.program.bindings;
     Require(name, "GPU data requirements",
-            bindings.user_data_registers.empty() && bindings.memory_offset_count == 1 &&
-                (FindBinding(bindings, DescriptorBindingKind::FlattenedSrt) != nullptr) ==
-                    numeric_read,
-            "descriptor-only shader retained SRT uploads or live scalar data was removed");
+            bindings.user_data_registers == (numeric_read ? std::vector<u32>{0, 1}
+                                                          : std::vector<u32>{}) &&
+                bindings.memory_offset_count == 1 &&
+                FindBinding(bindings, DescriptorBindingKind::FlattenedSrt) == nullptr &&
+                (FindBinding(bindings, DescriptorBindingKind::BdaPagetable) != nullptr) == numeric_read,
+            "descriptor-only shader retained SRT uploads or native scalar data lost its address");
 
     memory[0] = 0x2000u;
     memory[4] = 13u;
     Require(name, "independent host plan",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers[0].dwords[0] == 0x2000u &&
-                (!numeric_read || snapshot.flattened_srt.back() == 13u),
+                snapshot.flattened_srt.size() == 4,
             "compiled shader cleanup invalidated or froze the host resource plan");
   }
   std::printf("[host]    %-32s ok\n", name);

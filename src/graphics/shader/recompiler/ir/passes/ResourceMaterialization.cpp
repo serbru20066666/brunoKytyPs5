@@ -687,6 +687,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 		}
 	}
 	std::vector<ResourceBlock> blocks(program.blocks.size());
+	std::vector<std::vector<uint32_t>> predecessors(blocks.size());
 	for (uint32_t i = 0; i < blocks.size(); i++) {
 		auto&                 block      = blocks[i];
 		const auto&           info       = program.block_info[i];
@@ -710,6 +711,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 				return {};
 			}
 			block.successors.push_back(found->second);
+			predecessors[found->second].push_back(i);
 		}
 		for (const auto& inst: *program.blocks[i]) {
 			const auto op     = inst.GetOpcode();
@@ -739,7 +741,30 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
 	}
-	for (auto& block: blocks) block.condition = predicate(block.condition);
+	// Host branches only matter when they guard a later resource access. Leave
+	// data-only branches (for example a mutable flag checked before a trap) on the GPU.
+	std::vector<uint8_t> resource_reachable(blocks.size());
+	std::vector<uint32_t> pending;
+	for (uint32_t i = 0; i < blocks.size(); ++i) {
+		if (!blocks[i].sources.empty() || !blocks[i].srt_reads.empty()) {
+			resource_reachable[i] = 1;
+			pending.push_back(i);
+		}
+	}
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		for (const auto predecessor: predecessors[index]) {
+			if (resource_reachable[predecessor]) continue;
+			resource_reachable[predecessor] = 1;
+			pending.push_back(predecessor);
+		}
+	}
+	for (auto& block: blocks) {
+		block.condition = std::ranges::any_of(block.successors, [&](uint32_t successor) {
+			return resource_reachable[successor] != 0;
+		}) ? predicate(block.condition) : Value {};
+	}
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
 		return {};
