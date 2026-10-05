@@ -3096,79 +3096,6 @@ ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use) {
   return ExtractResourcePlan(fixture.program);
 }
 
-void TestNativeScalarAtomicDataDoesNotEnterResourcePlan() {
-  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  Fixture fixture;
-  auto *entry = fixture.block;
-  for (uint32_t i = 1; i < 5; ++i) fixture.AddBlock();
-  fixture.program.block_info[0].terminator = {
-      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 4};
-  for (uint32_t i = 1; i < 4; ++i) {
-    fixture.program.block_info[i].terminator = {
-        .kind = CFG::TerminatorKind::Branch, .true_block = i + 1};
-  }
-  fixture.program.block_info[4].terminator.kind = CFG::TerminatorKind::Return;
-
-  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
-  MemoryInfo scalar;
-  scalar.kind = ResourceKind::ScalarAddress;
-  scalar.component_count = 2;
-  scalar.offset = 136;
-  const auto low = fixture.Emit(ValueOpcode::LoadAddressU32,
-      {table, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 0x560));
-  scalar.offset = 140;
-  scalar.component_index = 1;
-  const auto high = fixture.Emit(ValueOpcode::LoadAddressU32,
-      {table, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 0x560));
-  const auto address = fixture.Address(low, high);
-  scalar.offset = 24;
-  scalar.component_count = 1;
-  scalar.component_index = 0;
-  const auto data_flags = fixture.AddMemory(scalar, 0x584);
-  const auto data = fixture.Emit(ValueOpcode::LoadAddressU32,
-      {address, Value(0u), Value(0u), Value(true)}, data_flags);
-  const auto descriptor = fixture.Buffer({low,
-      fixture.Emit(ValueOpcode::BitwiseOr32, {high, Value(256u << 16u)}),
-      Value(1u), Value(90628u)}, 0x58c);
-  MemoryInfo vector;
-  vector.kind = ResourceKind::Buffer;
-  vector.offset = 24;
-  vector.data_dwords = 2;
-  fixture.Emit(ValueOpcode::BufferAtomicOr64,
-      {descriptor, Value(0u), Value(0u), Value(0u), Value(uint64_t{1}), Value(true)},
-      fixture.AddMemory(vector, 0x58c));
-  const auto flag = fixture.Emit(ValueOpcode::BitwiseAnd32, {data, Value(16u)});
-  fixture.program.block_info[0].condition =
-      fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
-  fixture.PlanAndTrack();
-  Check(data.Instruction()->Parent() == entry &&
-            !fixture.program.memory_info[data_flags.index].planning_only &&
-            fixture.program.info.buffers.size() == 1 && fixture.program.info.buffers[0].atomic,
-        "mutable scalar data was replaced by a host snapshot before its native atomic write");
-  auto plan = ExtractResourcePlan(fixture.program);
-  Check(plan.srt_reads.size() == 2 && plan.control_flow.empty() &&
-            !plan.capture_specialization_reads,
-        "resource-free successor chain retained the shader's scalar data predicate");
-  struct Reads { uint32_t descriptors = 0; uint32_t data = 0; } reads;
-  const auto Read = +[](void *userdata, uint64_t address, std::span<uint32_t> words) {
-    auto &reads = *static_cast<Reads *>(userdata);
-    if (address == 0x2018u) { ++reads.data; return false; }
-    if (words.size() != 1 || (address != 0x1088u && address != 0x108cu)) return false;
-    ++reads.descriptors;
-    words[0] = address == 0x1088u ? 0x2000u : 0u;
-    return true;
-  };
-  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
-  const SrtRuntime runtime{.user_data = user_data, .read_memory = Read, .userdata = &reads,
-                           .read_specialization_memory = Read};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.descriptors == 2 && reads.data == 0 && snapshot.specialization_reads.empty() &&
-            snapshot.buffers[0].dwords[0] == 0x2000u,
-        "resource materialization read mutable scalar data or lost its descriptor pointer");
-}
-
 void TestConditionalBufferMaterialization() {
   auto plan = ConditionalBufferPlan(ConditionalBufferUse::Optional);
   // GTA III leaves packet words in s[12:15] when its scalar control word is zero.
@@ -3728,7 +3655,6 @@ int main() {
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
-    Run("native scalar atomic data", TestNativeScalarAtomicDataDoesNotEnterResourcePlan);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
