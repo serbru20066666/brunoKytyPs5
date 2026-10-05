@@ -208,7 +208,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                          bool memory_backed_material = false, uint32_t member_offset = 0,
-                         uint32_t material_stride = 224) {
+                         uint32_t material_stride = 224, uint32_t selector_bits = UINT32_MAX,
+                         uint32_t table_stride = 32, uint32_t table_offset = 0) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -257,17 +258,19 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
   MemoryInfo material_scalar;
   material_scalar.kind = ResourceKind::ScalarBuffer;
   material_scalar.offset = material_immediate;
-  const auto key =
+  auto key =
       fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
                     fixture->AddMemory(material_scalar, 0x10d8));
+  if (selector_bits != UINT32_MAX)
+    key = fixture->Emit(ValueOpcode::BitwiseAnd32, {key, Value(selector_bits)});
   const auto heap_offset =
-      fixture->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+      fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
   std::array<Value, 8> image_words;
   MemoryInfo heap_scalar;
   heap_scalar.kind = ResourceKind::ScalarBuffer;
   for (uint32_t dword = 0; dword < image_words.size(); dword++) {
     auto component = heap_scalar;
-    component.offset = dword * sizeof(uint32_t);
+    component.offset = table_offset + dword * sizeof(uint32_t);
     if (malformed && dword == image_words.size() - 1u) {
       component.offset += sizeof(uint32_t);
     }
@@ -579,6 +582,43 @@ void TestInvariantIndirectImageMaterialization() {
               split_memory.watched_reads == 1u,
           "indirect scalar offsets did not align and bound their components independently");
   }
+
+  // The shader packs flags above a 15-bit cube-image key in the final DWORD of
+  // each 64-byte material record; the image occupies bytes 16..47 of its record.
+  auto packed = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 0x7fffu, 48u, 16u);
+  packed->PlanAndTrack();
+  const auto packed_plan = ExtractResourcePlan(packed->program);
+  LinearTestMemory packed_memory;
+  std::array<uint32_t, 8> packed_data{0x1000u, 64u << 16u, 3u, 0u,
+                                      0x2000u, 48u << 16u, 2u, 0u};
+  for (uint32_t i = 0; i < 3u; ++i)
+    packed_memory.words[(i * 64u + 60u) / 4u] = (0xffffu << 15u) | (i & 1u);
+  for (uint32_t i = 0; i < 2u; ++i) {
+    auto descriptor = image_descriptor;
+    descriptor[0] += i;
+    std::copy(descriptor.begin(), descriptor.end(),
+              packed_memory.words.begin() + (0x1000u + i * 48u + 16u) / 4u);
+  }
+  SrtRuntime packed_runtime{.user_data = packed_data, .userdata = &packed_memory,
+                            .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords == image_descriptor &&
+            snapshot.images[1].dwords[0] == image_descriptor[0] + 1u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 2u,
+        "packed material flags changed the table key or 48-byte descriptor addressing");
+  packed_memory.words[60u / 4u] = 0xffff8002u;
+  packed_memory.fail_address = 0x2070u;
+  Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u &&
+            std::ranges::all_of(snapshot.images[2].dwords, [](uint32_t word) { return word == 0u; }),
+        "masked out-of-range descriptor did not return zero without reading past table bounds");
+  packed_memory.fail_address = 0x205cu;
+  Check(!MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
+        "unreadable in-range DWORD in a 48-byte descriptor record was accepted");
+  auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u,
+                                               UINT32_MAX, 48u, 16u);
+  CheckFatal([&] { overflowing->PlanAndTrack(); }, "not a valid runtime value",
+             "unbounded table offset conflated shader U32 wrap with scalar immediate addition");
 }
 
 void TestGuardedDirectImageTable() {
@@ -1529,6 +1569,9 @@ void TestUniformScalarBufferImage() {
   fixture.PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture.program);
 
+  Check(std::ranges::none_of(plan.descriptor_sources, [](const DescriptorSource& source) {
+          return source.indirect_descriptor.has_value();
+        }), "draw-uniform scalar image was expanded to GPU-selected candidates");
   std::array<uint32_t, 9> user_data{0x1000u, 0u, 0x100u, 0u,
                                     0x2000u, 0u, 0x100u, 0u, 0u};
   LinearTestMemory memory;

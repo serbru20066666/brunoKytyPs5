@@ -503,6 +503,7 @@ struct DescriptorSource {
 		uint32_t table_stride    = 0;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		uint32_t selector_shift  = 0;
+		uint32_t selector_bits   = UINT32_MAX;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

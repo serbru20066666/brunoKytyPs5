@@ -835,7 +835,7 @@ private:
 				const auto& b = *descriptor.indirect_descriptor;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.selector_shift != b.selector_shift ||
+				    a.selector_shift != b.selector_shift || a.selector_bits != b.selector_bits ||
 				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
@@ -968,11 +968,24 @@ private:
 		return stride != 0u && value.GetType() == Type::U32 && !value.IsImmediate();
 	}
 
-	const Inst* MaterialKeyShift(Value key, uint32_t& amount) const {
-		const auto* shift = key.Resolve().TryInstruction();
-		return shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
-		               ImmediateU32(shift->Arg(1), amount) && amount != 0u && amount < 32u
-		           ? shift : nullptr;
+	Value MaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect) const {
+		indirect.selector_shift = 0u;
+		indirect.selector_bits = UINT32_MAX;
+		const auto* inst = key.Resolve().TryInstruction();
+		uint32_t immediate;
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			if (ImmediateU32(inst->Arg(1), immediate)) key = inst->Arg(0);
+			else if (ImmediateU32(inst->Arg(0), immediate)) key = inst->Arg(1);
+			else return key;
+			indirect.selector_bits = immediate;
+			inst = key.Resolve().TryInstruction();
+		}
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+		    ImmediateU32(inst->Arg(1), immediate) && immediate != 0u && immediate < 32u) {
+			indirect.selector_shift = immediate;
+			key = inst->Arg(0);
+		}
+		return key.Resolve();
 	}
 
 	enum class LaneQuantifier { Any, All };
@@ -1647,10 +1660,9 @@ private:
 	                               DescriptorSource& material_source) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
-		uint32_t amount = 0;
-		const auto* shift = MaterialKeyShift(selected->Arg(1), amount);
-		if (shift == nullptr) return false;
-		const auto* loaded = shift->Arg(0).Resolve().TryInstruction();
+		const auto value = MaterialKey(selected->Arg(1), indirect);
+		if (indirect.selector_shift == 0u && indirect.selector_bits == UINT32_MAX) return false;
+		const auto* loaded = value.TryInstruction();
 		if (loaded == nullptr || loaded->GetOpcode() != ValueOpcode::SelectU32 ||
 		    !EquivalentValue(m_program, selected->Arg(0), loaded->Arg(0))) return false;
 		const auto* read = loaded->Arg(1).Resolve().TryInstruction();
@@ -1668,7 +1680,6 @@ private:
 		indirect.selector_first = Value(0u);
 		indirect.key_count = material_source.dwords[2];
 		indirect.selector_offset = memory.offset;
-		indirect.selector_shift = amount;
 		return true;
 	}
 
@@ -1690,9 +1701,8 @@ private:
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
 			plan.reads.fill(nullptr);
-		} else if (table_stride != 32u) {
-			return false;
 		} else if (table_source.dword_count == 2u) {
+			if (table_stride != 32u) return false;
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -1710,13 +1720,11 @@ private:
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else if (!MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
-			const auto* key_shift = MaterialKeyShift(key, indirect.selector_shift);
-			auto* material_read =
-			    (key_shift != nullptr ? key_shift->Arg(0) : key).Resolve().TryInstruction();
+			auto* material_read = MaterialKey(key, indirect).TryInstruction();
 			uint32_t material_memory_index = 0;
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
-			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
 			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
@@ -1735,6 +1743,12 @@ private:
 			}
 			indirect.material_source = InternSource(material_source);
 		}
+		// This plan combines shader byte-offset additions with the scalar immediate.
+		// A nonzero combined offset is exact only when neither can cross U32 wrap.
+		const auto maximum_key = (UINT32_MAX >> indirect.selector_shift) & indirect.selector_bits;
+		if (indirect.workgroup_axis == UINT32_MAX && table_source.dword_count == 4u &&
+		    table_offset != 0u && uint64_t {maximum_key} * table_stride + table_offset + 28u > UINT32_MAX)
+			return false;
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
@@ -2032,6 +2046,8 @@ private:
 				DescriptorSource descriptor;
 				MakeSource(*handle, inst.GetOpcode() == ValueOpcode::StoreBufferU32 ? 4u : 8u,
 				           false, false, memory.resource * 4u, descriptor, flags.pc);
+				uint32_t bad_dword = 0;
+				if (ValidateSource(descriptor, bad_dword)) continue;
 				IndirectDescriptorPlan plan;
 				if (TryMakeIndirectImage(*handle, descriptor, plan) || TryMakeFiniteImage(*handle, plan) ||
 				    TryMakeIndirectBuffer(*handle, descriptor, plan)) {

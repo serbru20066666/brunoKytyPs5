@@ -338,7 +338,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
 			if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
-			    (indirect.selector_shift != 0u && (material.Base48() & 3u) != 0u) ||
+			    ((indirect.selector_shift != 0u || indirect.selector_bits != UINT32_MAX) &&
+			     (material.Base48() & 3u) != 0u) ||
 			    material.SwizzleEnabled() ||
 			    material.AddTid() || material.OutOfBounds() != 0u ||
 			    uint64_t {indirect.selector_offset} + 4u > material.Stride() ||
@@ -394,8 +395,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (indirect.selector_shift == 0u) keys.push_back(0u);
 		}
 		if (indirect.material_source != UINT32_MAX) {
-			if (indirect.selector_shift != 0u) {
-				for (auto& key: keys) key >>= indirect.selector_shift;
+			for (auto& key: keys) key = (key >> indirect.selector_shift) & indirect.selector_bits;
+			if (indirect.selector_shift != 0u || indirect.selector_bits != UINT32_MAX) {
 				keys.push_back(0u); // An out-of-range material load returns zero.
 			}
 			std::ranges::sort(keys);
