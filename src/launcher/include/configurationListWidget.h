@@ -28,6 +28,7 @@ public:
 	~ConfigurationListWidget() override;
 
 	void SetRunEnabled(bool flag) { m_run_enabled = flag; }
+	void SetRuntimeDirectory(const QString& directory) { m_runtime_directory = directory; }
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
@@ -78,6 +79,7 @@ private:
 	bool                          m_run_enabled   = true;
 	Ui::ConfigurationListWidget*  m_ui            = nullptr;
 	QString                       m_settings_file;
+	QString                       m_runtime_directory;
 	QStringList                   m_game_dirs;
 	// Games that were given their recommended settings (Configuration::ApplyRecommendedSettings),
 	// by game path: they get them once, so clearing a game's settings sticks.

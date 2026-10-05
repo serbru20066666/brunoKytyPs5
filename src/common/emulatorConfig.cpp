@@ -165,6 +165,10 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool TrophyEnabled() {
+	return g_config->trophy_enabled;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

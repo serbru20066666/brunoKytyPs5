@@ -101,6 +101,8 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf(
+	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --drain-stats <seconds>              Report GPU waits by cause every N seconds.\n");
 	::printf("  --dcc-gpu-clear <true|false>         Apply GPU-written DCC clears on the GPU. "
@@ -571,6 +573,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trophy-notifications") {
+			if (!ParseBool(value, options.config.trophy_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

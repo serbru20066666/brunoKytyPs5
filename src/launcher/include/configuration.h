@@ -125,6 +125,7 @@ public:
 	bool                   relaxed_readback_enabled    = false;
 	bool                   frame_generation_enabled    = false;
 	bool                   fsr_upscaling_enabled       = false;
+	bool                   trophy_enabled              = true;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -160,6 +161,7 @@ public:
 		relaxed_readback_enabled    = other.relaxed_readback_enabled;
 		frame_generation_enabled    = other.frame_generation_enabled;
 		fsr_upscaling_enabled       = other.fsr_upscaling_enabled;
+		trophy_enabled              = other.trophy_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -243,6 +245,7 @@ public:
 		KYTY_CFG_SET(relaxed_readback_enabled);
 		KYTY_CFG_SET(frame_generation_enabled);
 		KYTY_CFG_SET(fsr_upscaling_enabled);
+		KYTY_CFG_SET(trophy_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -291,6 +294,7 @@ public:
 		frame_generation_enabled =
 		    s->value("frame_generation_enabled", frame_generation_enabled).toBool();
 		fsr_upscaling_enabled = s->value("fsr_upscaling_enabled", fsr_upscaling_enabled).toBool();
+		trophy_enabled = s->value("trophy_enabled", trophy_enabled).toBool();
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
