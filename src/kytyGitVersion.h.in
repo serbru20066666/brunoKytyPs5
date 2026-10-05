@@ -9,13 +9,15 @@
 #define KYTY_SHADER_CACHE_KEY "@KYTY_SHADER_CACHE_KEY@"
 
 // The product name: in the window title, the log, crash reports and the Vulkan application info.
-#define KYTY_PRODUCT_NAME "BryKytyPS5"
+#define KYTY_PRODUCT_NAME "brunoKytyPs5"
+// The version of the fork itself, next to the commit in every build label.
+#define KYTY_FORK_VERSION "0.1.0"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)
-#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " official build " KYTY_RELEASE_TAG
+#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " " KYTY_FORK_VERSION " official build " KYTY_RELEASE_TAG
 #elif defined(KYTY_FORK_BUILD)
-#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH
+#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " " KYTY_FORK_VERSION " fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH
 #else
-#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " source build " KYTY_GIT_HASH
+#define KYTY_BUILD_LABEL KYTY_PRODUCT_NAME " " KYTY_FORK_VERSION " source build " KYTY_GIT_HASH
 #endif

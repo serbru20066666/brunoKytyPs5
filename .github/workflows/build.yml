@@ -1,7 +1,7 @@
-name: Build and Release BryKytyPS5
+name: Build and Release brunoKytyPs5
 
-# Releases are cut by hand (Actions > Build and Release BryKytyPS5 > Run workflow), so only work
-# Bryan has chosen to publish is released, and pushes to the private repo cost no build minutes.
+# Releases are cut by hand (Actions > Build and Release brunoKytyPs5 > Run workflow), so only work
+# has been chosen for publishing is released, and pushes cost no build minutes.
 on:
   workflow_dispatch:
 
@@ -11,8 +11,8 @@ concurrency:
 
 env:
   SCCACHE_GHA_ENABLED: "true"
-  # Official (release-tagged) builds only in the public BryKytyPS5 repository; copies build as forks.
-  KYTY_BUILD_ORIGIN: ${{ github.repository == 'BryanKAdams/BryKytyPS5' && 'Official' || 'Fork' }}
+  # Official (release-tagged) builds only in the public brunoKytyPs5 repository; copies build as forks.
+  KYTY_BUILD_ORIGIN: ${{ github.repository == 'serbru20066666/brunoKytyPs5' && 'Official' || 'Fork' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=BryKytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "value=brunoKytyPs5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build KytyPS5 (Windows)
@@ -137,6 +137,8 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    # This fork is developed and tested on Windows only.
+    if: false
     needs: metadata
     runs-on: macos-15
 
@@ -291,6 +293,8 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    # This fork is developed and tested on Windows only.
+    if: false
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -431,11 +435,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Release BryKytyPS5
+    name: Release brunoKytyPs5
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
-      github.repository == 'BryanKAdams/BryKytyPS5' &&
+      github.repository == 'serbru20066666/brunoKytyPs5' &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')

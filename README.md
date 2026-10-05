@@ -1,19 +1,39 @@
-# BryKytyPS5
+# brunoKytyPs5
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
-**BryKytyPS5** is Bryan's PlayStation 5 emulator: a fork of
-[KytyPS5](https://github.com/KytyPS5/KytyPS5), which is itself based on
-[Kyty](https://github.com/InoriRus/Kyty). It focuses on performance and rendering fixes, measured
-on Astro Bot with AMD hardware, and merges upstream KytyPS5 regularly. The emulator, its binaries
-and its options keep the KytyPS5 names, and the rest of this README is KytyPS5's and applies here
-too.
+**brunoKytyPs5** es un fork del emulador de PlayStation 5
+[KytyPS5](https://github.com/KytyPS5/KytyPS5), hecho a partir de
+[BryKytyPS5](https://github.com/BryanKAdams/BryKytyPS5) (a través de
+[micolee221/KytyPS5](https://github.com/micolee221/KytyPS5)). Todo el crédito del emulador es de
+esos proyectos y de [Kyty](https://github.com/InoriRus/Kyty), en el que se basan.
 
-Upstream KytyPS5: **[weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** (game
-progress, recent fixes and ongoing development) and
-**[development on Discord](https://discord.gg/UNrkMqGaBg)**.
+## Qué busca este fork
+
+Subir los cuadros por segundo en tarjetas **AMD RDNA 2** (la serie Radeon RX 6000), que es la
+misma arquitectura gráfica de la PS5.
+
+- **Equipo de pruebas:** Radeon RX 6800 XT, Intel Core i7-14700KF, Windows 11.
+- **Juegos de referencia:** ASTRO's PLAYROOM y Astro Bot.
+- **Punto de partida:** unos 40 fps en juego con la RX 6800 XT.
+- **Cómo se trabaja:** primero se mide dónde se va el tiempo de cada cuadro (hilo de GPU del
+  emulador, esperas de lectura, tiempo de la tarjeta), después se cambia una cosa y se vuelve a
+  medir en la misma escena. Lo que no mejora la medición no se queda.
+- **Mejoras del original:** se van incorporando las de los últimos cambios de KytyPS5 que ayuden
+  al rendimiento o a la compatibilidad.
+
+El fork se desarrolla y se prueba solo en **Windows**. La versión actual es la **0.1.0**: todavía
+es el código de BryKytyPS5 con el nombre y la información del fork; las mejoras de rendimiento
+propias se anotarán aquí con su medición.
+
+El trabajo de rendimiento en AMD que ya traía BryKytyPS5 está descrito en
+[docs/performance-amd.md](docs/performance-amd.md).
+
+El resto de este documento es el de KytyPS5 y sigue valiendo aquí.
+
+---
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
