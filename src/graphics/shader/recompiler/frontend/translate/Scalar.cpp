@@ -165,9 +165,16 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
-		case O::S_BCNT1_I32_B64:
-			return SimpleInteger(inst, IR::ValueOpcode::BitCount64, IR::Type::U64, false, false,
-			                     true);
+		case O::S_BCNT1_I32_B64: {
+			// Vulkan bit counts operate on 32-bit words; avoid packing only to split again.
+			const auto value  = ReadU32Pair(inst.src0);
+			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[0]}));
+			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[1]}));
+			const auto result = ir.IAdd(low, high);
+			WriteOperand(inst.dst, result);
+			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			return;
+		}
 		case O::S_FF1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::FindILsb32, IR::Type::U32, false, false,
 			                     false);

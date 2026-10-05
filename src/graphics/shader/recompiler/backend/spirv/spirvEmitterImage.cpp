@@ -930,9 +930,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
 		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
 			           const auto pointer      = state.builder.AllocateId();
-			           const auto pointer_type = state.builder.Type(
-			               spv::OpTypePointer, spv::StorageClassImage,
-			               image.atomic64 ? TypeScalarU64(state) : TypeU32(state));
+			           const auto pointer_type =
+			               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,
+			                                  image.atomic64 ? TypeU64(state) : TypeU32(state));
 			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
 			                                     ImageDescriptorPointer(state, mem.resource),
 			                                     CoordU32(ctx, mem, *address, dimension),

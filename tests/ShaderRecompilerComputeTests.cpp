@@ -5089,6 +5089,24 @@ public:
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
+      Require(
+          name, "partial-invalidation keeps disjoint bytes dirty",
+          resources.IsMapped(base + partial_unmap_survivor_offset,
+                             sizeof(partial_unmap_survivor_value)) &&
+              !cache.IsRegionCpuModified(
+                  base + partial_unmap_survivor_offset,
+                  sizeof(partial_unmap_survivor_value)) &&
+              cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
+                                        sizeof(partial_unmap_survivor_value)) &&
+              cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                     sizeof(partial_unmap_survivor_value)) &&
+              !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
+                                      sizeof(partial_unmap_value)),
+          "partial invalidation read back an unrelated mapped page");
+      Require(name, "partial-invalidation survivor read fault",
+              resources.HandleFault(PageFaultAccess::Read,
+                                    base + partial_unmap_survivor_offset),
+              "CPU read did not publish the retained GPU-dirty page");
       uint32_t partial_unmap_survivor_backing = 0;
       std::memcpy(&partial_unmap_survivor_backing,
                   memory + partial_unmap_survivor_offset,
@@ -5106,7 +5124,8 @@ public:
               !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
                                       sizeof(partial_unmap_survivor_value)) &&
               partial_unmap_survivor_backing == partial_unmap_survivor_value,
-          "widened partial invalidation mishandled ownership or backing");
+          "partial invalidation or subsequent CPU read mishandled ownership or "
+          "backing");
       resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,
@@ -21211,6 +21230,114 @@ TestCase Scalar64BitOps() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarDynamic64BitOps() {
+  using O = ShaderOpcode;
+  struct Input {
+    uint64_t lhs;
+    uint64_t rhs;
+    u32 count;
+    u32 offset;
+  };
+  constexpr Input inputs[] = {
+      {0, UINT64_MAX, 0, 0},
+      {UINT64_MAX, 0, 63, 0},
+      {0x8000000000000000ull, 1, 64, 0},
+      {0x0123456789abcdefull, 0xfedcba9876543210ull, 127, 0},
+      {UINT64_MAX, 0xffffffffull, 64, 1},
+      {0x0123456789abcdefull, 0x0123456789abcdefull, 63, 32},
+      {UINT64_MAX, 0x100000000ull, 127, 63},
+      {0, 0, 0, 127},
+      {0x8000000000000001ull, UINT64_MAX, UINT32_MAX, 64},
+  };
+  TestCase test;
+  test.name = "ScalarDynamic64BitOps";
+  for (const auto &input : inputs) {
+    test.initial.insert(test.initial.end(),
+                        {u32(input.lhs), u32(input.lhs >> 32), u32(input.rhs),
+                         u32(input.rhs >> 32), input.count, input.offset,
+                         ((input.count & 127u) << 16) | input.offset});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](uint64_t value, bool scc) {
+    const auto output = static_cast<u32>(test.expected.size());
+    code.push_back(EncodeSMovB32(18, 253));
+    AppendStoreSgprPair(&code, 16, output);
+    AppendStoreSgpr(&code, 18, output + 2);
+    test.expected.insert(test.expected.end(),
+                         {u32(value), u32(value >> 32), u32(scc)});
+  };
+  for (u32 i = 0; i < std::size(inputs); ++i) {
+    const auto [lhs, rhs, count, offset] = inputs[i];
+    for (u32 word = 0; word < 7; ++word) {
+      AppendVMovU32(&code, 30, (i * 7 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, 1, 30);
+      code.push_back(EncodeVop1(0x02, 8 + word, Vgpr(1)));
+    }
+    for (const auto [opcode, value] :
+         std::array<std::pair<u32, uint64_t>, 8>{{{0x0f, lhs & rhs},
+                                                  {0x11, lhs | rhs},
+                                                  {0x13, lhs ^ rhs},
+                                                  {0x15, lhs & ~rhs},
+                                                  {0x17, lhs | ~rhs},
+                                                  {0x19, ~(lhs & rhs)},
+                                                  {0x1b, ~(lhs | rhs)},
+                                                  {0x1d, ~(lhs ^ rhs)}}}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(value != 0)));
+      code.push_back(EncodeSop2(opcode, 16, 8, 10));
+      store(value, value != 0);
+    }
+    for (const bool select_lhs : {false, true}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(!select_lhs)));
+      code.push_back(EncodeSop2(0x0b, 16, 8, 10));
+      store(select_lhs ? lhs : rhs, select_lhs);
+    }
+    // BFM preserves SCC; BFE sets it from the entire extracted result.
+    code.push_back(EncodeSop2(0x25, 16, 12, 13));
+    store(((uint64_t{1} << (count & 63u)) - 1u) << (offset & 63u), true);
+    code.push_back(EncodeSop2(0x29, 16, 8, 14));
+    const auto width = std::min(count & 127u, 64u - (offset & 63u));
+    const auto mask = width == 64 ? UINT64_MAX : (uint64_t{1} << width) - 1u;
+    const auto extracted = (lhs >> (offset & 63u)) & mask;
+    store(extracted, extracted != 0);
+    for (const bool set : {false, true}) {
+      code.push_back(EncodeSop1(0x04, 16, 8));
+      code.push_back(EncodeSop1(set ? 0x1e : 0x1c, 16, 12));
+      const auto bit = uint64_t{1} << (count & 63u);
+      store(set ? lhs | bit : lhs & ~bit, extracted != 0);
+    }
+    code.push_back(EncodeSop1(0x2d, 16, 8));
+    uint64_t quads = 0;
+    for (u32 quad = 0; quad < 16; ++quad) {
+      quads |= uint64_t((lhs >> (quad * 4) & 15u) != 0) << quad;
+    }
+    store(quads, quads != 0);
+    code.push_back(EncodeSop1(0x3b, 16, 8));
+    uint64_t replicated = 0;
+    for (u32 bit = 0; bit < 32; ++bit) {
+      replicated |= ((lhs >> bit) & 1u) * (uint64_t{3} << (2 * bit));
+    }
+    store(replicated, quads != 0);
+    code.push_back(EncodeSMovB32(17, InlineU32(0)));
+    code.push_back(EncodeSop1(0x10, 16, 8));
+    store(std::popcount(lhs), lhs != 0);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {
+      O::V_MOV_B32,       O::BUFFER_LOAD_DWORD,  O::V_READFIRSTLANE_B32,
+      O::S_MOV_B32,       O::S_CMP_EQ_U32,       O::S_AND_B64,
+      O::S_OR_B64,        O::S_XOR_B64,          O::S_ANDN2_B64,
+      O::S_ORN2_B64,      O::S_NAND_B64,         O::S_NOR_B64,
+      O::S_XNOR_B64,      O::S_CSELECT_B64,      O::S_BFM_B64,
+      O::S_BFE_U64,       O::S_MOV_B64,          O::S_BITSET0_B64,
+      O::S_BITSET1_B64,   O::S_QUADMASK_B64,     O::S_BITREPLICATE_B64_B32,
+      O::S_BCNT1_I32_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpTypeInt 64 0", "OpBitwiseAnd", "OpBitwiseOr",
+                         "OpBitwiseXor"};
+  return test;
+}
+
 uint64_t ReferenceAshrI64(uint64_t bits, u32 count) {
   const auto shift = count & 63u;
   // Complementing negative values expresses sign fill using unsigned shifts.
@@ -21284,8 +21411,7 @@ TestCase ScalarAshrI64Edges(bool dynamic) {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {
       {"S_ASHR_I64", std::size(sources) * std::size(counts)}};
-  test.required_spirv = {"OpShiftRightArithmetic"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftRightArithmetic", "OpTypeInt 64 0"};
   return test;
 }
 
@@ -21386,7 +21512,7 @@ TestCase ScalarAshrI64OperandsAndAliases() {
                   O::S_ASHR_I64,         O::V_MOV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"S_ASHR_I64", instructions}};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv.push_back("OpTypeInt 64 0");
   return test;
 }
 
@@ -21448,7 +21574,6 @@ TestCase ScalarAshrI64Masks(u32 wave_size) {
                   O::S_ENDPGM};
   test.decoded_counts = {{"S_ASHR_I64 vcc_lo, vcc_lo", std::size(cases)},
                          {"S_ASHR_I64 exec_lo, exec_lo", std::size(cases)}};
-  test.forbidden_spirv = {"OpTypeInt 64"};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -22770,8 +22895,7 @@ TestCase VectorVop3LshrrevB64Captured() {
   test.expected = {0x789abcdeu, 0x00123456u};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHRREV_B64,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftRightLogical", "OpSelect"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftRightLogical"};
   return test;
 }
 
@@ -22798,8 +22922,7 @@ TestCase VectorVop3LshlrevB64Captured() {
   test.expected = {33u, 0u, 2u, 1u, 0u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftLeftLogical", "OpSelect"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftLeftLogical", "OpTypeInt 64 0"};
   return test;
 }
 
@@ -22807,7 +22930,7 @@ TestCase VectorDynamicU64ShiftEdges() {
   using O = ShaderOpcode;
   TestCase test;
   test.name = "VectorDynamicU64ShiftEdges";
-  test.initial = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u};
+  test.initial = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, UINT32_MAX};
   test.expected = test.initial;
   auto& code = test.code;
   for (const uint64_t source : {uint64_t{0}, uint64_t{1},
@@ -22836,8 +22959,8 @@ TestCase VectorDynamicU64ShiftEdges() {
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64,
                   O::V_LSHRREV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftLeftLogical", "OpShiftRightLogical", "OpSelect"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftLeftLogical", "OpShiftRightLogical",
+                         "OpTypeInt 64 0"};
   return test;
 }
 
@@ -23370,23 +23493,53 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
 
 TestCase VectorMadU64U32UnsignedCarryOut() {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 1, 0xffffffffu);
-  AppendVMovU32(&code, 2, 2);
-  AppendVMovU32(&code, 4, 2);
-  AppendVMovLiteral(&code, 5, 0xffffffffu);
-  AppendVop3B(&code, 0x176u, 10, 20, Vgpr(1), Vgpr(2), Vgpr(4));
-  AppendStoreVgpr(&code, 10, 0);
-  AppendStoreVgpr(&code, 11, 1);
-  AppendStoreSgprPair(&code, 20, 2);
+  struct Input {
+    u32 lhs;
+    u32 rhs;
+    uint64_t addend;
+  };
+  constexpr Input inputs[] = {
+      {0, UINT32_MAX, UINT64_MAX},
+      {UINT32_MAX, 2, 0xffffffff00000002ull},
+      {UINT32_MAX, UINT32_MAX, UINT64_MAX},
+      {0x80000000u, 0x80000000u, 0x4000000000000000ull},
+      {3, 5, 7},
+  };
+  TestCase test;
+  test.name = "VectorMadU64U32UnsignedCarryOut";
+  for (const auto &input : inputs) {
+    test.initial.insert(
+        test.initial.end(),
+        {input.lhs, input.rhs, u32(input.addend), u32(input.addend >> 32)});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < std::size(inputs); ++i) {
+    for (u32 word = 0; word < 4; ++word) {
+      AppendVMovU32(&code, 30, (i * 4 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, word < 2 ? word + 1 : word + 2, 30);
+    }
+    AppendVop3B(&code, 0x176u, 10, 20, Vgpr(1), Vgpr(2), Vgpr(4));
+    const auto output = static_cast<u32>(test.expected.size());
+    AppendStoreVgpr(&code, 10, output);
+    AppendStoreVgpr(&code, 11, output + 1);
+    AppendStoreSgprPair(&code, 20, output + 2);
+    const auto product = uint64_t(inputs[i].lhs) * inputs[i].rhs;
+    const auto sum = product + inputs[i].addend;
+    test.expected.insert(test.expected.end(),
+                         {u32(sum), u32(sum >> 32), u32(sum < product), 0});
+  }
   AppendEnd(&code);
-
-  return {"VectorMadU64U32UnsignedCarryOut",
-          code,
-          {},
-          {0x00000000u, 0x00000001u, 0x00000001u, 0x00000000u},
-          {O::V_MOV_B32, O::V_MAD_U64_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_U64_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // NVIDIA rejected the native widening multiply in a large Astro's Playroom
+  // vertex shader. Keep its 32x32 product portable and its 64-bit addition
+  // native.
+  test.required_spirv = {"OpTypeInt 64 0", "OpUMulExtended", "OpIMul %uint",
+                         "OpIAdd %ulong", "OpULessThan"};
+  test.forbidden_spirv = {"OpIMul %ulong", "OpIMul %long"};
+  return test;
 }
 
 TestCase VectorLaneAndPackedOps() {
@@ -35913,6 +36066,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
+  AddCase(ScalarDynamic64BitOps);
   cases.push_back(ScalarAshrI64Edges(false));
   cases.push_back(ScalarAshrI64Edges(true));
   AddCase(ScalarAshrI64OperandsAndAliases);
@@ -41981,6 +42135,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--suspend-point-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuSuspendPoint();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--native64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarDynamic64BitOps());
+    RunCase(&vulkan, VectorDynamicU64ShiftEdges());
+    RunCase(&vulkan, ScalarAshrI64Edges(false));
+    RunCase(&vulkan, ScalarAshrI64Edges(true));
+    RunCase(&vulkan, VectorCompareInteger64Edges());
+    RunCase(&vulkan, VectorMadU64U32UnsignedCarryOut());
+    RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
+    RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {

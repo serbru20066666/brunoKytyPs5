@@ -104,7 +104,7 @@ struct EmitterState {
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
-	uint32_t                                        native_u64_type = 0;
+	uint32_t                                        u64_type = 0;
 	uint32_t                                        i32_type = 0;
 	uint32_t                                        f32_type = 0;
 	uint32_t                                        f64_type = 0;
@@ -180,7 +180,6 @@ uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
-uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -231,6 +230,12 @@ inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, type, result, value);
 	return result;
+}
+
+inline uint32_t PackU64(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);
+	return Unary(state, spv::OpBitcast, TypeU64(state), pair);
 }
 
 inline uint32_t Binary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t lhs,
@@ -564,8 +569,6 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
-uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
-uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

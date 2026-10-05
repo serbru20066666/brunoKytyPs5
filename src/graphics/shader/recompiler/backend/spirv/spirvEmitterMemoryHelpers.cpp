@@ -140,7 +140,7 @@ void EnsureLdsStorage(EmitterState& state) {
 	};
 	if (state.requirements.shared_int64_atomics) {
 		state.lds_variable = define(TypeU32(state), 4u);
-		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
+		state.lds_u64_variable = define(TypeU64(state), 8u);
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
@@ -421,7 +421,7 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
 	const auto old    = ctx.state.builder.AllocateId();
 	const bool wide   = inst.GetType() == IR::Type::U64;
-	const auto type   = wide ? TypeScalarU64(ctx.state) : TypeU32(ctx.state);
+	const auto type   = wide ? TypeU64(ctx.state) : TypeU32(ctx.state);
 	if (opcode == spv::OpAtomicCompareExchange) {
 		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
@@ -430,13 +430,12 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
 		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
 	} else {
-		auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		if (wide) value = Unary(ctx.state, spv::OpBitcast, type, value);
+		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(opcode, type, old, pointer,
 		                              ConstantU32(ctx.state, scope),
 		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
 	}
-	return wide ? Unary(ctx.state, spv::OpBitcast, TypeU64(ctx.state), old) : old;
+	return old;
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
