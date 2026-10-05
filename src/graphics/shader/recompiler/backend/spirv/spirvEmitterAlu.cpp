@@ -317,6 +317,20 @@ uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value a
 }
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (state.native_half_pack) {
+		// The host's own conversion, two or three instructions, in place of about fifty a lane
+		// that build the half bit by bit. It rounds to nearest where the guest truncates, a
+		// difference of at most one unit in the last place of the half. Truncation never
+		// reaches infinity, so the largest finite half is kept as the limit.
+		const auto limit = ConstantF32(state, 0x477fe000u);
+		const auto floor = ConstantF32(state, 0xc77fe000u);
+		const auto pair  = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+		    EmitExt(state, TypeF32(state), GLSLstd450NClamp, {arg0, floor, limit}),
+		    EmitExt(state, TypeF32(state), GLSLstd450NClamp, {arg1, floor, limit}));
+		return EmitPackHalf2x16(state, pair);
+	}
 	const auto low  = EmitF32ToF16RtzBits(state, arg0);
 	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 	                         EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));

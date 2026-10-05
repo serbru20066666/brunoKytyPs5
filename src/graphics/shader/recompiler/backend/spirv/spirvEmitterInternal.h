@@ -79,6 +79,8 @@ struct SpirvRequirements {
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
 struct EmitterState {
+	// Pack two floats into halves with the host's conversion instead of exact truncation.
+	bool native_half_pack = true;
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),
