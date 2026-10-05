@@ -12373,7 +12373,8 @@ public:
         value.dword_count = 4;
         PreparedBindings buffer_bindings;
         executor.PrepareBindings(buffer_runtime, buffer_bindings);
-        executor.FindBuffers(buffer_bindings);
+        std::array<PreparedBindings *, 1> buffer_stages{&buffer_bindings};
+        executor.FindBuffers(buffer_stages);
         const auto original_id = buffer_bindings.buffer_sources[0].id;
 
         auto &buffer_cache = resources.GetBufferCache();
@@ -12406,7 +12407,8 @@ public:
         ShaderStageRuntime runtime{&buffer_program, &snapshot};
         PreparedBindings bindings;
         executor.PrepareBindings(runtime, bindings);
-        executor.FindBuffers(bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
         executor.RebindBuffers(bindings);
         const auto &owner = resources.GetBufferCache().GetBuffer(bindings.buffer_sources[0].id);
         Require(name, "halfword buffer base and exact tail",
@@ -12415,6 +12417,74 @@ public:
                     bindings.buffers[0].range == 14 &&
                     bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2,
                 "native binding lost the byte adjustment or rounded the final halfword range");
+      }
+
+      {
+        constexpr uint64_t address = base + allocation_size - 0x4000 + 12;
+        constexpr uint64_t mapped_tail = base + allocation_size - address;
+        auto writer = make_buffer_program(ShaderType::Vertex, {.written = true});
+        ShaderRecompiler::IR::CompiledShaderInfo reader{};
+        reader.stage = ShaderType::Pixel;
+        ShaderRecompiler::IR::ResourceSnapshot writer_snapshot, reader_snapshot;
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = UINT32_MAX;
+        auto &value = writer_snapshot.buffers.emplace_back();
+        std::copy_n(descriptor.fields, 4, value.dwords.begin());
+        value.dword_count = 4;
+        ShaderStageRuntime writer_runtime{&writer, &writer_snapshot};
+        ShaderStageRuntime reader_runtime{&reader, &reader_snapshot};
+        PreparedBindings writer_bindings, reader_bindings;
+        const auto check_range = [&](uint64_t expected, const char *description) {
+          executor.PrepareBindings(writer_runtime, writer_bindings);
+          executor.PrepareBindings(reader_runtime, reader_bindings);
+          std::array<PreparedBindings *, 2> stages{&reader_bindings, &writer_bindings};
+          executor.FindBuffers(stages);
+          executor.RebindBuffers(writer_bindings);
+          const auto &source = writer_bindings.buffer_sources[0];
+          const auto &binding = writer_bindings.buffers[0];
+          const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
+          Require(name, description, source.address == address && source.size == expected &&
+                      binding.buffer == owner.Handle() && binding.offset <= owner.Offset(address) &&
+                      binding.range == expected + owner.Offset(address) - binding.offset,
+                  "descriptor discovery or rebind changed the write boundary or base adjustment");
+        };
+        writer_snapshot.specialization_reads = {{address + 0x500, 4},
+            {address - 0x40, 0x40}, {address + 0x80, 0}};
+        reader_snapshot.specialization_reads = {{address + 0x300, 4}, {address + 0x100, 4}};
+        check_range(0x100, "unbounded write stops before nearest cross-stage read");
+        reader_snapshot.specialization_reads.clear();
+        check_range(0x500, "unbounded write stops before same-stage read");
+        writer_snapshot.specialization_reads = {{address - 0x40, 0x40},
+                                               {address + mapped_tail + 0x100, 4}};
+        check_range(mapped_tail, "earlier and unmapped reads preserve mapped tail");
+        writer_snapshot.specialization_reads.clear();
+        check_range(mapped_tail, "unbounded write without reads preserves mapped tail");
+        reader_snapshot.specialization_reads = {{address + 0x100, 4}};
+        value.dwords[2] = 0x300;
+        check_range(0x300, "finite write preserves its declared range");
+        value.dwords[2] = UINT32_MAX;
+        writer.info.buffers[0].written = false;
+        writer.info.buffers[0].read = true;
+        check_range(mapped_tail, "read-only sentinel preserves mapped tail");
+        auto &graphics = context.GetGraphics();
+        auto &storage_limit = graphics.physical_device_properties.limits.maxStorageBufferRange;
+        const auto original_limit = storage_limit;
+        storage_limit = 0x2000;
+        value.dwords[1] |= 16u << 16u;
+        check_range(storage_limit - (graphics.StorageMinAlignment() - 1),
+                    "read-only structured sentinel reserves native alignment prefix");
+        Require(name, "read-only native range fits device", writer_bindings.buffers[0].range <= storage_limit,
+                "read-only cap omitted the native descriptor alignment prefix");
+        value.dwords[2] = 0x300; // A finite 12 KiB descriptor remains finite despite the mock limit.
+        std::array<PreparedBindings *, 1> stages{&writer_bindings};
+        executor.FindBuffers(stages);
+        Require(name, "finite read exceeds mock cap unchanged", writer_bindings.buffer_sources[0].size == 0x3000,
+                "read-only window changed a finite descriptor's declared range");
+        storage_limit = original_limit;
+        check_range(0x3000, "finite structured read preserves native range");
+        value.dwords[2] = UINT32_MAX;
+        check_range(mapped_tail, "read-only structured sentinel preserves smaller mapping");
       }
 
       for (const auto format : {Prospero::BufferFormat::k8UNorm,
@@ -15124,7 +15194,8 @@ public:
         plane_dependency.memoryBarrierCount = 1;
         plane_dependency.pMemoryBarriers = &plane_barrier;
         const auto write_plane = [&] {
-          executor.FindBuffers(plane_bindings);
+          std::array<PreparedBindings *, 1> stages{&plane_bindings};
+          executor.FindBuffers(stages);
           executor.RebindBuffers(plane_bindings);
           const auto &plane_buffer = plane_bindings.buffers[0];
           const vk::BufferCopy plane_copy{0, plane_buffer.offset, plane_size};

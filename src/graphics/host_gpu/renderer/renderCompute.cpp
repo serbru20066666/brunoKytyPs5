@@ -356,7 +356,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
-	FindBuffers(bindings);
+	PreparedBindings* descriptor_stage = &bindings;
+	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -370,7 +371,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
-	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -496,7 +496,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}();
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
-	FindBuffers(bindings);
+	PreparedBindings* descriptor_stage = &bindings;
+	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -513,7 +514,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
-	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
