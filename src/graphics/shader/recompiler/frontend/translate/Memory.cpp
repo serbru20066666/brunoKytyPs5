@@ -546,7 +546,10 @@ void Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	}
 }
 
-void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
+                               IR::ValueOpcode opcode64) {
+	const auto opcode = inst.data_bits == 64u ? opcode64 : opcode32;
+	EXIT_IF(opcode == IR::ValueOpcode::Count);
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
@@ -1041,24 +1044,30 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCompareSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32,
+			                    IR::ValueOpcode::ImageAtomicSwap64);
 		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicIAdd32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicIAdd32,
+			                    IR::ValueOpcode::ImageAtomicIAdd64);
 		case Decoder::Opcode::IMAGE_ATOMIC_SMIN:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMin32);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMIN:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMin32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMin32,
+			                    IR::ValueOpcode::ImageAtomicUMin64);
 		case Decoder::Opcode::IMAGE_ATOMIC_SMAX:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
-			return IMAGE_ATOMIC(inst, inst.data_bits == 64u ? IR::ValueOpcode::ImageAtomicUMax64
-			                                                : IR::ValueOpcode::ImageAtomicUMax32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMax32,
+			                    IR::ValueOpcode::ImageAtomicUMax64);
 		case Decoder::Opcode::IMAGE_ATOMIC_AND:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32,
+			                    IR::ValueOpcode::ImageAtomicAnd64);
 		case Decoder::Opcode::IMAGE_ATOMIC_OR:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32,
+			                    IR::ValueOpcode::ImageAtomicOr64);
 		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32,
+			                    IR::ValueOpcode::ImageAtomicXor64);
 		case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMin32);
 		case Decoder::Opcode::IMAGE_ATOMIC_FMAX:

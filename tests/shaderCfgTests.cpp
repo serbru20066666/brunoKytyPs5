@@ -4417,25 +4417,32 @@ void TestImageAtomicWidthDecoder() {
             decoded.dst.reg == 2u && decoded.dmask == 3u && !decoded.glc,
         "captured image atomic lost its 64-bit data width");
 
-  for (const auto opcode : {0x10u, 0x17u}) {
+  for (const auto opcode : {0x0fu, 0x10u, 0x11u, 0x14u, 0x15u, 0x16u,
+                            0x17u, 0x18u, 0x19u, 0x1au, 0x1eu, 0x1fu}) {
+    const bool compare_swap = opcode == 0x10u;
+    const bool supports_64 = opcode != 0x10u && opcode != 0x14u &&
+                             opcode != 0x16u && opcode != 0x1eu && opcode != 0x1fu;
     for (uint32_t mask = 0; mask < 16u; ++mask) {
-      const uint32_t words[] = {EncodeMimg0(opcode, mask), captured[1]};
-      DecodeInstruction(words, 0, decoded);
-      const bool compare_swap = opcode == 0x10u;
-      const bool supported = mask == (compare_swap ? 3u : 1u) ||
-                             (!compare_swap && mask == 3u);
-      Check((decoded.opcode != Opcode::UNSUPPORTED) == supported,
-            "image atomic accepted an invalid or unsupported width mask");
-      if (supported) {
-        Check(decoded.data_bits == (!compare_swap && mask == 3u ? 64u : 32u),
-              "image atomic DMASK selected the wrong data width");
+      for (const bool glc : {false, true}) {
+        const uint32_t words[] = {EncodeMimg0(opcode, mask, glc), captured[1]};
+        DecodeInstruction(words, 0, decoded);
+        const bool supported = mask == (compare_swap ? 3u : 1u) ||
+                               (supports_64 && mask == 3u);
+        Check((decoded.opcode != Opcode::UNSUPPORTED) == supported,
+              "image atomic accepted an invalid or unsupported width mask");
+        if (supported) {
+          const auto bits = !compare_swap && mask == 3u ? 64u : 32u;
+          Check(decoded.data_bits == bits && decoded.glc == glc &&
+                    decoded.data_dwords == (compare_swap ? 2u : bits / 32u),
+                "image atomic DMASK selected the wrong data width or return mode");
+        }
+        const uint32_t d16_words[] = {words[0], words[1] | (1u << 31u)};
+        DecodeInstruction(d16_words, 0, decoded);
+        Check(decoded.opcode == Opcode::UNSUPPORTED,
+              "image atomic incorrectly accepted D16 data");
       }
     }
   }
-  const uint32_t unsupported[] = {EncodeMimg0(0x11u, 3u), captured[1]};
-  DecodeInstruction(unsupported, 0, decoded);
-  Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.data_bits == 64u,
-        "unsupported 64-bit image atomic silently decoded as 32-bit");
 }
 
 void TestNewShaderDecoderArchitecture() {

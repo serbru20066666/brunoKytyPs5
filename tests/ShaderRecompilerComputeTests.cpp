@@ -34795,20 +34795,68 @@ TestCase ImageAtomicVariants() {
   return test;
 }
 
-template <bool wide> TestCase ImageAtomicUMaxGlcAndExec() {
-  // Input and old texel: high DWORD ordering, unsigned sign boundary, and
-  // equal-high-DWORD ordering must all survive the RG32_UINT -> R64_UINT view.
-  constexpr uint64_t values[][2] = {
-      {0x0000000100000001ull, 0x00000000ffffffffull},
-      {0x00000000ffffffffull, 0x0000000100000001ull},
-      {0x8000000000000000ull, 0x7fffffffffffffffull},
-      {0x12345678ffffffffull, 0x1234567800000001ull},
-      {0xffffffffffffffffull, 0x8000000000000000ull},
-  };
-  constexpr u32 texel_dwords = wide ? 2 : 1;
+// Input and old texel cover high-DWORD ordering, carry/wrap, the unsigned sign
+// boundary, and equal-high-DWORD ordering through the RG32_UINT -> R64_UINT view.
+constexpr uint64_t ImageAtomicInputs[][2] = {
+    {0x0000000100000001ull, 0x00000000ffffffffull},
+    {0x00000000ffffffffull, 0x0000000100000001ull},
+    {0x8000000000000000ull, 0x7fffffffffffffffull},
+    {0x12345678ffffffffull, 0x1234567800000001ull},
+    {0xffffffffffffffffull, 0x8000000000000000ull},
+};
+
+struct ImageAtomicIntegerCase {
+  u32 encoding;
+  ShaderOpcode opcode;
+  const char *name32;
+  const char *name64;
+  const char *spirv;
+  uint64_t expected64[std::size(ImageAtomicInputs)];
+  u32 expected32[std::size(ImageAtomicInputs)];
+};
+
+constexpr ImageAtomicIntegerCase ImageAtomicIntegerCases[] = {
+    {0x0fu, ShaderOpcode::IMAGE_ATOMIC_SWAP,
+     "ImageAtomicSwap32GlcAndExec", "ImageAtomicSwap64GlcAndExec", "OpAtomicExchange",
+     {0x0000000100000001ull, 0x00000000ffffffffull, 0x8000000000000000ull,
+      0x12345678ffffffffull, 0xffffffffffffffffull},
+     {0x00000001u, 0xffffffffu, 0x00000000u, 0xffffffffu, 0xffffffffu}},
+    {0x11u, ShaderOpcode::IMAGE_ATOMIC_ADD,
+     "ImageAtomicAdd32GlcAndExec", "ImageAtomicAdd64GlcAndExec", "OpAtomicIAdd",
+     {0x0000000200000000ull, 0x0000000200000000ull, 0xffffffffffffffffull,
+      0x2468acf100000000ull, 0x7fffffffffffffffull},
+     {0x00000000u, 0x00000000u, 0xffffffffu, 0x00000000u, 0xffffffffu}},
+    {0x15u, ShaderOpcode::IMAGE_ATOMIC_UMIN,
+     "ImageAtomicUMin32GlcAndExec", "ImageAtomicUMin64GlcAndExec", "OpAtomicUMin",
+     {0x00000000ffffffffull, 0x00000000ffffffffull, 0x7fffffffffffffffull,
+      0x1234567800000001ull, 0x8000000000000000ull},
+     {0x00000001u, 0x00000001u, 0x00000000u, 0x00000001u, 0x00000000u}},
+    {0x17u, ShaderOpcode::IMAGE_ATOMIC_UMAX,
+     "ImageAtomicUMax32GlcAndExec", "ImageAtomicUMax64GlcAndExec", "OpAtomicUMax",
+     {0x0000000100000001ull, 0x0000000100000001ull, 0x8000000000000000ull,
+      0x12345678ffffffffull, 0xffffffffffffffffull},
+     {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}},
+    {0x18u, ShaderOpcode::IMAGE_ATOMIC_AND,
+     "ImageAtomicAnd32GlcAndExec", "ImageAtomicAnd64GlcAndExec", "OpAtomicAnd",
+     {0x0000000000000001ull, 0x0000000000000001ull, 0x0000000000000000ull,
+      0x1234567800000001ull, 0x8000000000000000ull},
+     {0x00000001u, 0x00000001u, 0x00000000u, 0x00000001u, 0x00000000u}},
+    {0x19u, ShaderOpcode::IMAGE_ATOMIC_OR,
+     "ImageAtomicOr32GlcAndExec", "ImageAtomicOr64GlcAndExec", "OpAtomicOr",
+     {0x00000001ffffffffull, 0x00000001ffffffffull, 0xffffffffffffffffull,
+      0x12345678ffffffffull, 0xffffffffffffffffull},
+     {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}},
+    {0x1au, ShaderOpcode::IMAGE_ATOMIC_XOR,
+     "ImageAtomicXor32GlcAndExec", "ImageAtomicXor64GlcAndExec", "OpAtomicXor",
+     {0x00000001fffffffeull, 0x00000001fffffffeull, 0xffffffffffffffffull,
+      0x00000000fffffffeull, 0x7fffffffffffffffull},
+     {0xfffffffeu, 0xfffffffeu, 0xffffffffu, 0xfffffffeu, 0xffffffffu}},
+};
+
+TestCase ImageAtomicIntegerGlcAndExec(const ImageAtomicIntegerCase &atomic, bool wide) {
+  const u32 texel_dwords = wide ? 2 : 1;
   TestCase test;
-  test.name = wide ? "ImageAtomicUMax64CapturedGlcAndExec"
-                   : "ImageAtomicUMax32GlcAndExec";
+  test.name = wide ? atomic.name64 : atomic.name32;
   test.user_data = MakeStorageTextureData(wide ? Prospero::BufferFormat::k32_32UInt
                                               : Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
@@ -34816,25 +34864,21 @@ template <bool wide> TestCase ImageAtomicUMaxGlcAndExec() {
   test.expected_storage_image_r32ui = test.storage_image_r32ui;
   auto &code = test.code;
   code.push_back(EncodeSop1(0x04, 12, 126)); // Preserve EXEC.
-  for (u32 i = 0; i < std::size(values); ++i) {
-    const auto input = values[i][0];
-    const auto old = values[i][1];
+  for (u32 i = 0; i < std::size(ImageAtomicInputs); ++i) {
+    const auto input = ImageAtomicInputs[i][0];
+    const auto old = ImageAtomicInputs[i][1];
     const bool glc = i != 0 && i != 4;
     AppendVMovU32(&code, 0, i & 3u);
     AppendVMovU32(&code, 1, i >> 2u);
     AppendVMovLiteral(&code, 2, static_cast<u32>(input));
     AppendVMovLiteral(&code, 3, static_cast<u32>(input >> 32u));
-    // Captured PS5 instruction: f05c0308 00000200, DMASK=3, VDATA=v[2:3].
-    code.insert(code.end(), {0xf05c0108u | (wide ? 0x200u : 0u) |
-                                (glc ? 0x2000u : 0u),
-                            0x00000200u});
+    code.push_back(EncodeMimg0(atomic.encoding, wide ? 3u : 1u, 0, glc));
+    code.push_back(EncodeMimg1(2, 0));
     AppendStoreVgpr(&code, 2, i * 2);
     AppendStoreVgpr(&code, 3, i * 2 + 1);
     test.expected.push_back(static_cast<u32>(glc ? old : input));
     test.expected.push_back(static_cast<u32>((wide && glc ? old : input) >> 32u));
-    const uint64_t result = wide ? std::max(input, old)
-                                 : std::max(static_cast<u32>(input),
-                                            static_cast<u32>(old));
+    const uint64_t result = wide ? atomic.expected64[i] : atomic.expected32[i];
     for (u32 word = 0; word < texel_dwords; ++word) {
       test.storage_image_r32ui[i * texel_dwords + word] =
           static_cast<u32>(old >> (word * 32u));
@@ -34842,23 +34886,30 @@ template <bool wide> TestCase ImageAtomicUMaxGlcAndExec() {
           static_cast<u32>(result >> (word * 32u));
     }
   }
+  // A leaked update must change the inactive texel for every operation.
+  const bool clear_bits = atomic.opcode == ShaderOpcode::IMAGE_ATOMIC_AND ||
+                          atomic.opcode == ShaderOpcode::IMAGE_ATOMIC_UMIN;
+  const u32 inactive = clear_bits ? 0xffffffffu : 0u;
+  for (u32 word = 0; word < texel_dwords; ++word) {
+    test.storage_image_r32ui[5u * texel_dwords + word] = inactive;
+    test.expected_storage_image_r32ui[5u * texel_dwords + word] = inactive;
+  }
   AppendVMovU32(&code, 0, 1);
-  AppendVMovU32(&code, 1, 1); // Untouched zero texel, so an EXEC leak is observable.
+  AppendVMovU32(&code, 1, 1);
   AppendVMovLiteral(&code, 2, 0xabcdef01u);
   AppendVMovLiteral(&code, 3, 0x87654321u);
   code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
-  code.insert(code.end(), {0xf05c2108u | (wide ? 0x200u : 0u), 0x00000200u});
+  code.push_back(EncodeMimg0(atomic.encoding, wide ? 3u : 1u, 0, true));
+  code.push_back(EncodeMimg1(2, 0));
   code.push_back(EncodeSop1(0x04, 126, 12));
-  AppendStoreVgpr(&code, 2, std::size(values) * 2);
-  AppendStoreVgpr(&code, 3, std::size(values) * 2 + 1);
+  AppendStoreVgpr(&code, 2, std::size(ImageAtomicInputs) * 2);
+  AppendStoreVgpr(&code, 3, std::size(ImageAtomicInputs) * 2 + 1);
   test.expected.insert(test.expected.end(), {0xabcdef01u, 0x87654321u});
   AppendEnd(&code);
   test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
-                 ShaderOpcode::IMAGE_ATOMIC_UMAX, ShaderOpcode::BUFFER_STORE_DWORD,
-                 ShaderOpcode::S_ENDPGM};
-  test.required_spirv = {"OpAtomicUMax", "OpImageTexelPointer",
-                         wide ? "R64ui" : "R32ui"};
-  if constexpr (wide) {
+                 atomic.opcode, ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.required_spirv = {atomic.spirv, "OpImageTexelPointer", wide ? "R64ui" : "R32ui"};
+  if (wide) {
     test.required_spirv.push_back("Int64ImageEXT");
     test.required_spirv.push_back("SPV_EXT_shader_image_int64");
   }
@@ -36040,8 +36091,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
-  AddCase(ImageAtomicUMaxGlcAndExec<false>);
-  AddCase(ImageAtomicUMaxGlcAndExec<true>);
+  for (const auto &atomic : ImageAtomicIntegerCases) {
+    cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, false));
+    cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, true));
+  }
   AddCase(ImageAtomicFloatGlcAndExec<true>);
   AddCase(ImageAtomicFloatGlcAndExec<false>);
   AddCase(ImageAtomicFloatSpecialValues<true>);
@@ -41609,8 +41662,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-atomic64-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ImageAtomicUMaxGlcAndExec<false>());
-    RunCase(&vulkan, ImageAtomicUMaxGlcAndExec<true>());
+    for (const auto &atomic : ImageAtomicIntegerCases) {
+      RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(atomic, false));
+      RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(atomic, true));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

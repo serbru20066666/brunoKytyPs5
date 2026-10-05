@@ -372,10 +372,12 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicCompareSwap32:
 		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::ImageAtomicSwap32:
+		case IR::ValueOpcode::ImageAtomicSwap64:
 		case IR::ValueOpcode::BufferAtomicSwap32:
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32:
+		case IR::ValueOpcode::ImageAtomicIAdd64:
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::SharedAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
@@ -385,6 +387,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicSMin32:
 		case IR::ValueOpcode::SharedAtomicSMin32: return spv::OpAtomicSMin;
 		case IR::ValueOpcode::ImageAtomicUMin32:
+		case IR::ValueOpcode::ImageAtomicUMin64:
 		case IR::ValueOpcode::BufferAtomicUMin32:
 		case IR::ValueOpcode::SharedAtomicUMin32: return spv::OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicSMax32:
@@ -395,15 +398,18 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicUMax32:
 		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32:
+		case IR::ValueOpcode::ImageAtomicAnd64:
 		case IR::ValueOpcode::BufferAtomicAnd32:
 		case IR::ValueOpcode::BufferAtomicAnd64:
 		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32:
+		case IR::ValueOpcode::ImageAtomicOr64:
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::ImageAtomicXor32:
+		case IR::ValueOpcode::ImageAtomicXor64:
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
 		default: return spv::OpNop;
