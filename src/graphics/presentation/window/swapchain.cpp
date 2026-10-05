@@ -23,6 +23,7 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -624,15 +625,23 @@ struct Presenter::Impl {
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
 
-	// Frame generation. A new frame goes out in two presents: the generated one at once and the
-	// frame itself half a frame later, from held_thread, so that the two are evenly spaced
-	// without making the caller wait.
-	std::unique_ptr<FrameGeneration>      frame_generation;
-	std::chrono::steady_clock::time_point last_new_frame {};
-	std::mutex                            held_mutex;
-	std::condition_variable               held_cv;
-	bool                                  held_pending = false;
-	std::chrono::steady_clock::time_point held_deadline {};
+	// Frame generation. A new frame goes out in two presents, the generated one and then the
+	// frame itself, both from held_thread at times of its own choosing. A game delivers its
+	// frames unevenly (one vblank apart, then two), so the frames are shown on a steady clock
+	// half a smoothed frame interval apart instead of as they arrive.
+	using Clock = std::chrono::steady_clock;
+	enum class Held : uint8_t { None, Generated, Frame };
+	std::unique_ptr<FrameGeneration> frame_generation;
+	Clock::time_point                last_new_frame {};
+	// The smoothed time between new frames, and when the last frame was (or is to be) shown.
+	float                            frame_interval_ms = 1000.0f / 60.0f;
+	Clock::time_point                last_frame_shown {};
+	std::mutex                       held_mutex;
+	std::condition_variable          held_cv;
+	// What held_thread still has to present of the current frame, and when.
+	Held                             held = Held::None;
+	Clock::time_point                held_generated_at {};
+	Clock::time_point                held_frame_at {};
 	std::jthread                          held_thread;
 };
 
@@ -1253,10 +1262,12 @@ void Presenter::ClearLayer(int bus) {
 void Presenter::Impl::FlushHeld() {
 	{
 		std::lock_guard held_lock(held_mutex);
-		if (!held_pending) {
+		if (held == Held::None) {
 			return;
 		}
-		held_pending = false;
+		// A generated frame that has not gone out yet is dropped: its turn has passed.
+		held             = Held::None;
+		last_frame_shown = Clock::now();
 	}
 	held_cv.notify_all();
 	PresentOnce(true, 0.0f);
@@ -1264,24 +1275,43 @@ void Presenter::Impl::FlushHeld() {
 
 void Presenter::Impl::HeldThread(std::stop_token stop) {
 	for (;;) {
+		Held stage = Held::None;
 		{
 			std::unique_lock held_lock(held_mutex);
-			held_cv.wait(held_lock, [&] { return stop.stop_requested() || held_pending; });
+			held_cv.wait(held_lock, [&] { return stop.stop_requested() || held != Held::None; });
 			if (stop.stop_requested()) {
 				return;
 			}
-			// Someone else may show the frame first (a new frame arriving early, a shutdown).
-			held_cv.wait_until(held_lock, held_deadline,
-			                   [&] { return stop.stop_requested() || !held_pending; });
+			stage               = held;
+			const auto deadline = stage == Held::Generated ? held_generated_at : held_frame_at;
+			// Someone else may show the frame first: a new frame arriving early, or a shutdown.
+			held_cv.wait_until(held_lock, deadline,
+			                   [&] { return stop.stop_requested() || held != stage; });
 			if (stop.stop_requested()) {
 				return;
 			}
-			if (!held_pending) {
+			if (held != stage) {
 				continue;
 			}
 		}
 		Common::LockGuard lock(present_mutex);
-		FlushHeld();
+		{
+			std::lock_guard held_lock(held_mutex);
+			if (held != stage) {
+				continue;
+			}
+			held = stage == Held::Generated ? Held::Frame : Held::None;
+		}
+		if (stage == Held::Generated) {
+			if (!PresentOnce(true, frame_interval_ms)) {
+				// No generated frame this time: the frame itself went out in its place.
+				std::lock_guard held_lock(held_mutex);
+				held             = Held::None;
+				last_frame_shown = Clock::now();
+			}
+		} else {
+			PresentOnce(true, 0.0f);
+		}
 	}
 }
 
@@ -1289,23 +1319,29 @@ void Presenter::Impl::Present(bool new_frame) {
 	FlushHeld();
 	if (frame_generation != nullptr && frame_generation->Available() && new_frame &&
 	    layers[0].frame != nullptr) {
-		const auto now   = std::chrono::steady_clock::now();
-		float      dt_ms = 1000.0f / 60.0f;
-		if (last_new_frame != std::chrono::steady_clock::time_point {}) {
-			dt_ms = std::clamp(
-			    std::chrono::duration<float, std::milli>(now - last_new_frame).count(), 1.0f,
+		const auto now = Clock::now();
+		if (last_new_frame != Clock::time_point {}) {
+			const auto interval = std::clamp(
+			    std::chrono::duration<float, std::milli>(now - last_new_frame).count(), 4.0f,
 			    100.0f);
+			frame_interval_ms += (interval - frame_interval_ms) * 0.1f;
 		}
-		last_new_frame = now;
-		if (PresentOnce(true, dt_ms)) {
-			{
-				std::lock_guard held_lock(held_mutex);
-				held_pending  = true;
-				held_deadline = now + std::chrono::microseconds(
-				                          static_cast<int64_t>(dt_ms * 500.0f));
+		last_new_frame  = now;
+		const auto half = std::chrono::microseconds(static_cast<int64_t>(frame_interval_ms * 500.0f));
+		{
+			std::lock_guard held_lock(held_mutex);
+			// Half an interval after the previous frame, but never in the past, and never so
+			// late that a pause in the game would hold this frame back.
+			auto generated_at = last_frame_shown + half;
+			if (generated_at < now || generated_at > now + 2 * half) {
+				generated_at = now;
 			}
-			held_cv.notify_all();
+			held_generated_at = generated_at;
+			held_frame_at     = generated_at + half;
+			last_frame_shown  = held_frame_at;
+			held              = Held::Generated;
 		}
+		held_cv.notify_all();
 		return;
 	}
 	PresentOnce(new_frame, 0.0f);
@@ -1367,6 +1403,14 @@ bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+		if (frame_generation != nullptr && std::getenv("KYTY_DEBUG_FRAME_PACING") != nullptr) {
+			static auto last = std::chrono::steady_clock::now();
+			const auto  now  = std::chrono::steady_clock::now();
+			LOGF("fg-present %s %.2f ms\n",
+			     generated ? "gen" : (generate_ms > 0.0f ? "real-nogen" : "real"),
+			     std::chrono::duration<float, std::milli>(now - last).count());
+			last = now;
+		}
 		// A generated frame is a present, not a frame of the game.
 		window.UpdateTitle(new_frame && !generated);
 		return generated;
