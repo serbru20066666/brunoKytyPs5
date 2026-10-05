@@ -152,6 +152,7 @@ inline constexpr auto EmitFPOrdGreaterThanEqual32 = EmitFloatCompare32<spv::OpFO
 inline constexpr auto EmitFPUnordGreaterThanEqual32 = EmitFloatCompare32<spv::OpFUnordGreaterThanEqual>;
 uint32_t              EmitFPIsNan32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
+inline constexpr auto EmitFPCmpClass16 = EmitClassMaskF16;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
