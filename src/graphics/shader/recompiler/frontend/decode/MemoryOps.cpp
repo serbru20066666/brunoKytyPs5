@@ -343,7 +343,6 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word0  = code[word_index];
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t offset = word0 & 0xfffu;
-	const uint32_t dlc    = (word0 >> 12u) & 1u;
 	const uint32_t lds    = (word0 >> 13u) & 1u;
 	const uint32_t seg    = (word0 >> 14u) & 0x3u;
 	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
@@ -355,6 +354,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.pc             = pc;
 	inst.word_count     = 2;
 	inst.offset         = seg == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
+	inst.dlc            = ((word0 >> 12u) & 1u) != 0;
 	inst.glc            = ((word0 >> 16u) & 1u) != 0;
 	inst.slc            = ((word0 >> 17u) & 1u) != 0;
 	inst.family         = Family::FLAT;
@@ -364,7 +364,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (dlc != 0 || lds != 0 || inst.glc || inst.slc || seg == 3u) {
+	if (lds != 0 || inst.glc || inst.slc || seg == 3u) {
 		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
 		return;
 	}

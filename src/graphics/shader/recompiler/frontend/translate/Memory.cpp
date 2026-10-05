@@ -129,8 +129,9 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.
 	const bool buffer_atomic = decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
 	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
-	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
-	                  (decoded.glc || decoded.dlc);
+	memory.coherent = (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::Flat ||
+	                   memory.kind == ResourceKind::Global) &&
+	                  !buffer_atomic && (decoded.glc || decoded.dlc);
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
