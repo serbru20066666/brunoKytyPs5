@@ -232,6 +232,10 @@ bool HardwareBufferBoundsEnabled() {
 	return g_config->hardware_buffer_bounds;
 }
 
+bool FrameGenerationEnabled() {
+	return g_config->frame_generation_enabled;
+}
+
 static std::atomic<int> g_relaxed_readback_override {-1};
 
 bool RelaxedReadbackEnabled() {

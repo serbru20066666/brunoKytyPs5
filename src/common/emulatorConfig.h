@@ -82,6 +82,7 @@ struct ConfigOptions {
 	bool                   pipeline_libraries_enabled  = true;
 	bool                   async_pipelines_enabled     = false;
 	bool                   relaxed_readback_enabled    = false;
+	bool                   frame_generation_enabled    = false;
 	bool                   speculative_draws_enabled   = true;
 	bool                   record_thread_enabled       = true;
 	bool                   hardware_buffer_bounds      = true;
@@ -164,6 +165,9 @@ void SetAsyncPipelinesEnabled(bool enabled);
 // of waiting, as on hardware when the CPU reads before the GPU has written; the new bytes follow
 // with the download already under way. Off by default: a value can be a frame old.
 bool RelaxedReadbackEnabled();
+// Shows a generated frame between every two the game presents (AMD FSR 3 frame interpolation),
+// so twice as many frames reach the screen. Needs amd_fidelityfx_vk.dll next to the executable.
+bool FrameGenerationEnabled();
 // Changes it while running (the settings panel).
 void SetRelaxedReadbackEnabled(bool enabled);
 // A second thread prepares draws' shader resources ahead of the GPU thread, which takes them

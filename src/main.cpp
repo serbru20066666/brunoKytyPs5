@@ -105,6 +105,8 @@ static void PrintUsage() {
 	         "separately compiled parts where the driver supports it. Default: true.\n");
 	::printf("  --async-pipelines <true|false>       Skip draws whose new pipeline is still "
 	         "compiling instead of stalling; they appear a few frames late. Default: false.\n");
+	::printf("  --frame-generation <true|false>      Show a generated frame between every two of "
+	         "the game's (AMD FSR 3). Default: false.\n");
 	::printf("  --relaxed-readback <true|false>      Let game threads read memory the GPU is still "
 	         "writing without waiting; a value can be a frame old. Default: false.\n");
 	::printf("  --speculative-draws <true|false>     Prepare draws' shader resources on a second "
@@ -481,6 +483,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--hardware-buffer-bounds") {
 			if (!ParseBool(value, options.config.hardware_buffer_bounds)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--frame-generation") {
+			if (!ParseBool(value, options.config.frame_generation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

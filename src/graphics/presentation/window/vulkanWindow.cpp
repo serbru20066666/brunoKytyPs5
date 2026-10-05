@@ -691,6 +691,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	// Frame generation's compute passes read storage images without a format.
+	device_features.shaderStorageImageReadWithoutFormat =
+	    supported_features2.features.shaderStorageImageReadWithoutFormat;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;

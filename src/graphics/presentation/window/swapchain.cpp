@@ -15,15 +15,20 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/frameGeneration.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -513,8 +518,11 @@ public:
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay();
+	// `generated`, when given, is shown in place of `source`: an image the size of the
+	// swapchain, in the transfer-source layout (see FrameGeneration).
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
-	                               const Presenter::Layer& overlay, bool draw_system_overlay);
+	                               const Presenter::Layer& overlay, bool draw_system_overlay,
+	                               vk::Image generated = nullptr);
 	uint64_t Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
 
@@ -522,6 +530,7 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 
 private:
 	void Destroy();
@@ -554,6 +563,18 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		if (Config::FrameGenerationEnabled()) {
+			frame_generation = std::make_unique<FrameGeneration>(owner.graphic_ctx);
+			held_thread      = std::jthread([this](std::stop_token stop) { HeldThread(stop); });
+		}
+	}
+
+	~Impl() {
+		if (held_thread.joinable()) {
+			held_thread.request_stop();
+			held_cv.notify_all();
+			held_thread.join();
+		}
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -585,6 +606,14 @@ struct Presenter::Impl {
 	}
 	// new_frame is false when the last frame is shown again (the title counts only new ones).
 	void Present(bool new_frame = true);
+	// Presents once. With `generate_ms` above zero (the time since the previous new frame) it
+	// tries to show the frame generated between the previous one and layer 0 instead of layer 0
+	// itself, and returns whether it did.
+	bool PresentOnce(bool new_frame, float generate_ms);
+	// Shows the frame whose generated predecessor went out first, if it is still waiting.
+	// Called with present_mutex held.
+	void FlushHeld();
+	void HeldThread(std::stop_token stop);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -594,6 +623,17 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+
+	// Frame generation. A new frame goes out in two presents: the generated one at once and the
+	// frame itself half a frame later, from held_thread, so that the two are evenly spaced
+	// without making the caller wait.
+	std::unique_ptr<FrameGeneration>      frame_generation;
+	std::chrono::steady_clock::time_point last_new_frame {};
+	std::mutex                            held_mutex;
+	std::condition_variable               held_cv;
+	bool                                  held_pending = false;
+	std::chrono::steady_clock::time_point held_deadline {};
+	std::jthread                          held_thread;
 };
 
 void Swapchain::Create() {
@@ -908,7 +948,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
-                                      const Presenter::Layer& overlay, bool draw_system_overlay) {
+                                      const Presenter::Layer& overlay, bool draw_system_overlay,
+                                      vk::Image generated) {
+	if (generated != nullptr) {
+		source = nullptr;
+	}
 	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
 	// The overlays bind their own graphics pipelines and dynamic state.
@@ -995,6 +1039,16 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
+	} else if (generated != nullptr) {
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(m_extent.width),
+		                                      static_cast<int>(m_extent.height), 1};
+		region.dstSubresource = region.srcSubresource;
+		region.dstOffsets[1]  = region.srcOffsets[1];
+		vk_command.blitImage(generated, vk::ImageLayout::eTransferSrcOptimal,
+		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
+		                     &region, vk::Filter::eNearest);
 	} else {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -1140,6 +1194,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 
 bool Presenter::PresentLastFrame() {
 	Common::LockGuard lock(m_impl->present_mutex);
+	m_impl->FlushHeld();
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
@@ -1168,6 +1223,8 @@ void Presenter::Present(Frame& frame) {
 
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
+	// The held frame is one of the layers about to be replaced.
+	m_impl->FlushHeld();
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
 		m_impl->frames.ValidateForPresent(layer.frame);
@@ -1185,6 +1242,7 @@ void Presenter::ClearLayer(int bus) {
 		return;
 	}
 	Common::LockGuard lock(m_impl->present_mutex);
+	m_impl->FlushHeld();
 	auto& layer = m_impl->layers[bus];
 	if (layer.frame != nullptr) {
 		m_impl->frames.Release(layer.frame);
@@ -1192,7 +1250,68 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
+void Presenter::Impl::FlushHeld() {
+	{
+		std::lock_guard held_lock(held_mutex);
+		if (!held_pending) {
+			return;
+		}
+		held_pending = false;
+	}
+	held_cv.notify_all();
+	PresentOnce(true, 0.0f);
+}
+
+void Presenter::Impl::HeldThread(std::stop_token stop) {
+	for (;;) {
+		{
+			std::unique_lock held_lock(held_mutex);
+			held_cv.wait(held_lock, [&] { return stop.stop_requested() || held_pending; });
+			if (stop.stop_requested()) {
+				return;
+			}
+			// Someone else may show the frame first (a new frame arriving early, a shutdown).
+			held_cv.wait_until(held_lock, held_deadline,
+			                   [&] { return stop.stop_requested() || !held_pending; });
+			if (stop.stop_requested()) {
+				return;
+			}
+			if (!held_pending) {
+				continue;
+			}
+		}
+		Common::LockGuard lock(present_mutex);
+		FlushHeld();
+	}
+}
+
 void Presenter::Impl::Present(bool new_frame) {
+	FlushHeld();
+	if (frame_generation != nullptr && frame_generation->Available() && new_frame &&
+	    layers[0].frame != nullptr) {
+		const auto now   = std::chrono::steady_clock::now();
+		float      dt_ms = 1000.0f / 60.0f;
+		if (last_new_frame != std::chrono::steady_clock::time_point {}) {
+			dt_ms = std::clamp(
+			    std::chrono::duration<float, std::milli>(now - last_new_frame).count(), 1.0f,
+			    100.0f);
+		}
+		last_new_frame = now;
+		if (PresentOnce(true, dt_ms)) {
+			{
+				std::lock_guard held_lock(held_mutex);
+				held_pending  = true;
+				held_deadline = now + std::chrono::microseconds(
+				                          static_cast<int64_t>(dt_ms * 500.0f));
+			}
+			held_cv.notify_all();
+		}
+		return;
+	}
+	PresentOnce(new_frame, 0.0f);
+}
+
+bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
@@ -1200,6 +1319,7 @@ void Presenter::Impl::Present(bool new_frame) {
 	if (swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	bool generated = false;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
@@ -1211,8 +1331,28 @@ void Presenter::Impl::Present(bool new_frame) {
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			vk::Image generated_image = nullptr;
+			if (generate_ms > 0.0f) {
+				// The frame is brought down through its mip chain as presentation does, and the
+				// interpolation takes it from there at the size shown.
+				auto*              source     = layers[0].frame;
+				auto               vk_command = command.Handle();
+				const vk::Extent2D source_extent {source->image.extent.width,
+				                                  source->image.extent.height};
+				source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
+				                vk::AccessFlagBits2::eTransferRead);
+				const auto level = PresentSourceLevel(source_extent, swapchain.Extent(),
+				                                      source->image.mip_levels);
+				RecordPresentDownscale(vk_command, source->image.image, source_extent, level);
+				if (frame_generation->Record(vk_command, source->image.image, level,
+				                             MipExtent(source_extent, level), swapchain.Extent(),
+				                             generate_ms)) {
+					generated_image = frame_generation->Output();
+				}
+			}
+			generated = generated_image != nullptr;
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-			                                draw_system_overlay);
+			                                draw_system_overlay, generated_image);
 			const auto tick = swapchain.Submit(present_scheduler);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
@@ -1227,10 +1367,12 @@ void Presenter::Impl::Present(bool new_frame) {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle(new_frame);
-		return;
+		// A generated frame is a present, not a frame of the game.
+		window.UpdateTitle(new_frame && !generated);
+		return generated;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	return false;
 }
 
 void Presenter::Discard(Frame& frame) {

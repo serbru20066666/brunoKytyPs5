@@ -382,6 +382,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
+	${KYTY_THIRD_PARTY_DIR}/ffx-api/include
 )
 
 if (KYTY_CLANG_CL)
@@ -820,6 +821,8 @@ if(KYTY_CLANG_CL)
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
 	)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
+	# Frame generation loads AMD's FidelityFX library at run time, when it is switched on.
+	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/ffx-api/bin/amd_fidelityfx_vk.dll" $<TARGET_FILE_DIR:kyty_emulator>/amd_fidelityfx_vk.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 	# LINK_FLAGS is a space-delimited string: a -Map path containing spaces would
@@ -851,4 +854,5 @@ if(KYTY_BUILD_LAUNCHER)
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+	install(FILES "${KYTY_THIRD_PARTY_DIR}/ffx-api/bin/amd_fidelityfx_vk.dll" DESTINATION .)
 endif()
