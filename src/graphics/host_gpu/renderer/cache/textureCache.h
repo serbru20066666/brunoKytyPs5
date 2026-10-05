@@ -146,6 +146,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// Queued publications remain authoritative until their guest backing writes complete.
 	[[nodiscard]] bool HasPendingDownload(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	// Drain statistics only: native DCC metadata ranges seen by image lookups.

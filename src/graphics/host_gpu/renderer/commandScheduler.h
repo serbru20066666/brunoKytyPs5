@@ -48,8 +48,10 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Whether `tick` completed and every priority operation deferred up to it has run.
 	[[nodiscard]] bool        IsPublished(uint64_t tick);
+	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Hands later submissions to a dedicated queue thread, which submits them in tick order.
 	// Submit() then returns once the tick is allocated. Host waits on the timeline stay valid
@@ -118,6 +120,7 @@ private:
 	void SubmitThread(std::stop_token stop);
 	void QueueSubmit(SubmitJob& job);
 	void StopSubmitThread();
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
