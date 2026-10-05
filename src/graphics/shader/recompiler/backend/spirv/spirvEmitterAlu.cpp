@@ -231,15 +231,18 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM.
-	a = EmitFlushF32DenormToSignedZero(state, a);
-	b = EmitFlushF32DenormToSignedZero(state, b);
-	c = EmitFlushF32DenormToSignedZero(state, c);
+	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
+	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
+	// a = EmitFlushF32DenormToSignedZero(state, a);
+	// b = EmitFlushF32DenormToSignedZero(state, b);
+	// c = EmitFlushF32DenormToSignedZero(state, c);
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	const auto sum = EmitFPAdd32(state, product, c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return EmitFlushF32DenormToSignedZero(state, sum);
+	// return EmitFlushF32DenormToSignedZero(state, sum);
+	return sum;
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
