@@ -34741,8 +34741,8 @@ void CheckIndirectImageKeySwitch() {
   program.descriptor_sources.resize(2);
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_descriptor =
-      DescriptorSource::IndirectDescriptor{.material_source = 0, .table_source = 0,
-          .selector_stride = 224, .selector_offset = 12, .table_stride = 32};
+      DescriptorSource::IndirectDescriptor{.selectors = {{.source = 0, .stride = 224, .offset = 12}},
+          .table_source = 0, .table_stride = 32};
   program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};

@@ -437,6 +437,8 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		bool split_offsets = false;
+		bool retain_reads = false;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -842,10 +844,9 @@ private:
 			if (current.indirect_descriptor.has_value()) {
 				const auto& a = *current.indirect_descriptor;
 				const auto& b = *descriptor.indirect_descriptor;
-				if (a.material_source != b.material_source || a.table_source != b.table_source ||
-				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.selector_shift != b.selector_shift || a.selector_bits != b.selector_bits ||
-				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
+				if (a.selectors != b.selectors || a.table_source != b.table_source ||
+				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
+				    a.table_stride != b.table_stride ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
@@ -949,7 +950,7 @@ private:
 		return ValidateSource(descriptor, bad_dword);
 	}
 
-	bool MatchMaterialOffset(Value value, uint32_t& stride, uint32_t& offset) const {
+	Value MaterialOffset(Value value, uint32_t& stride, uint32_t& offset) const {
 		stride = 1u;
 		offset = 0u;
 		value = value.Resolve();
@@ -974,24 +975,24 @@ private:
 			value = remaining.Resolve();
 		}
 		// Treat the remaining GPU-derived scalar as any U32 value.
-		return stride != 0u && value.GetType() == Type::U32 && !value.IsImmediate();
+		return stride != 0u && value.GetType() == Type::U32 && !value.IsImmediate() ? value : Value {};
 	}
 
-	Value MaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect) const {
-		indirect.selector_shift = 0u;
-		indirect.selector_bits = UINT32_MAX;
+	Value MaterialKey(Value key, DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+		selector.shift = 0u;
+		selector.bits = UINT32_MAX;
 		const auto* inst = key.Resolve().TryInstruction();
 		uint32_t immediate;
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseAnd32) {
 			if (ImmediateU32(inst->Arg(1), immediate)) key = inst->Arg(0);
 			else if (ImmediateU32(inst->Arg(0), immediate)) key = inst->Arg(1);
 			else return key;
-			indirect.selector_bits = immediate;
+			selector.bits = immediate;
 			inst = key.Resolve().TryInstruction();
 		}
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
 		    ImmediateU32(inst->Arg(1), immediate) && immediate != 0u && immediate < 32u) {
-			indirect.selector_shift = immediate;
+			selector.shift = immediate;
 			key = inst->Arg(0);
 		}
 		return key.Resolve();
@@ -1443,9 +1444,9 @@ private:
 		        static_cast<uint64_t>(UINT32_MAX) + 1u) return false;
 		const auto mask = BoundedSetBitMask(offset.index, active);
 		if (mask.IsEmpty()) return false;
-		indirect.material_source = InternSource(material_source);
-		indirect.selector_stride = static_cast<uint32_t>(offset.stride);
-		indirect.selector_offset = static_cast<uint32_t>(offset.offset + memory.offset);
+		indirect.selectors.push_back({.source = InternSource(material_source),
+		                              .stride = static_cast<uint32_t>(offset.stride),
+		                              .offset = static_cast<uint32_t>(offset.offset + memory.offset)});
 		indirect.key_count = Value(32u);
 		indirect.selector_mask = mask;
 		return true;
@@ -1606,7 +1607,7 @@ private:
 	bool MatchDescriptorTable(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan,
 	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset,
-	                          uint32_t& table_stride) {
+	                          uint32_t& table_stride, uint32_t& table_immediate) {
 		Inst* table_handle = nullptr;
 		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
 			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
@@ -1630,23 +1631,24 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) ||
-			    memory->offset > UINT32_MAX - offset) {
+			    !MatchTableOffset(read->Arg(1), current_key, offset, stride)) {
 				return false;
 			}
-			offset += memory->offset;
 			if (dword == 0u) {
 				key = current_key;
 				table_offset = offset;
+				table_immediate = memory->offset;
 				table_stride = stride;
 			} else if (table_stride != stride || !EquivalentValue(m_program, key, current_key) ||
-			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
+			           uint64_t {table_offset} + table_immediate + dword * sizeof(uint32_t) !=
+			               uint64_t {offset} + memory->offset) {
 				return false;
 			}
+			plan.split_offsets |= offset != table_offset;
 			table_handle = current_handle;
-			if (handle.NumArgs() == 8u
-			        ? WorkgroupAxis(key) == UINT32_MAX && !UsesOnlyImageDescriptors(*read) :
-			    std::ranges::any_of(read->Uses(), [](const Use& use) {
+			if (handle.NumArgs() == 8u) {
+				plan.retain_reads |= !UsesOnlyImageDescriptors(*read);
+			} else if (std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
 					       return consumer.user->GetOpcode() != ValueOpcode::StoreBufferU32;
@@ -1669,8 +1671,9 @@ private:
 	                               DescriptorSource& material_source) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
-		const auto value = MaterialKey(selected->Arg(1), indirect);
-		if (indirect.selector_shift == 0u && indirect.selector_bits == UINT32_MAX) return false;
+		DescriptorSource::IndirectDescriptor::SelectorRead selector;
+		const auto value = MaterialKey(selected->Arg(1), selector);
+		if (selector.shift == 0u && selector.bits == UINT32_MAX) return false;
 		const auto* loaded = value.TryInstruction();
 		if (loaded == nullptr || loaded->GetOpcode() != ValueOpcode::SelectU32 ||
 		    !EquivalentValue(m_program, selected->Arg(0), loaded->Arg(0))) return false;
@@ -1685,10 +1688,11 @@ private:
 		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4)) ||
 		    !MakeRuntimeTableSource(*read, material_source)) return false;
 		// GPU index arithmetic may wrap. Every record in the bounded V# is a candidate.
-		indirect.material_source = InternSource(material_source);
+		selector.source = InternSource(material_source);
+		selector.offset = memory.offset;
+		indirect.selectors.push_back(selector);
 		indirect.selector_first = Value(0u);
 		indirect.key_count = material_source.dwords[2];
-		indirect.selector_offset = memory.offset;
 		return true;
 	}
 
@@ -1699,17 +1703,19 @@ private:
 		Value key;
 		uint32_t table_offset = 0;
 		uint32_t table_stride = 0;
+		uint32_t table_immediate = 0;
 		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
-		                          table_stride)) return false;
+		                          table_stride, table_immediate)) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
+		indirect.table_immediate = table_immediate;
 		indirect.table_stride = table_stride;
 		indirect.workgroup_axis = WorkgroupAxis(key);
 		if (indirect.workgroup_axis != UINT32_MAX) {
 			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
 			// only the image handle is projected onto the bounded workgroup key.
-			plan.reads.fill(nullptr);
+			plan.retain_reads = true;
 		} else if (table_source.dword_count == 2u) {
 			if (table_stride != 32u) return false;
 			const auto* selector = key.Resolve().TryInstruction();
@@ -1729,35 +1735,39 @@ private:
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else if (!MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
-			auto* material_read = MaterialKey(key, indirect).TryInstruction();
-			uint32_t material_memory_index = 0;
-			const auto* memory = material_read != nullptr
-			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
-			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-				return false;
+			std::vector<const Inst*> visited;
+			auto selected = key;
+			for (;;) {
+				DescriptorSource::IndirectDescriptor::SelectorRead selector;
+				const auto* read = MaterialKey(selected, selector).TryInstruction();
+				uint32_t memory_index = 0;
+				const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+				DescriptorSource source;
+				if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+				    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(memory_index, *read) ||
+				    !MakeRuntimeTableSource(*read, source)) break;
+				if (std::ranges::find(visited, read) != visited.end()) return false;
+				visited.push_back(read);
+				selected = MaterialOffset(read->Arg(1), selector.stride, selector.offset);
+				if (selected.IsEmpty()) return false;
+				selector.source = InternSource(source);
+				selector.immediate = memory->offset;
+				indirect.selectors.push_back(selector);
+				material_source = source;
 			}
-			if (!MatchMaterialOffset(material_read->Arg(1), indirect.selector_stride,
-			                         indirect.selector_offset)) {
-				return false;
-			}
-			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-			indirect.selector_offset =
-			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
-			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-			if (material_handle == nullptr ||
-			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_read, material_source)) {
-				return false;
-			}
-			indirect.material_source = InternSource(material_source);
+			if (indirect.selectors.empty()) return false;
+			std::ranges::reverse(indirect.selectors);
 		}
-		// This plan combines shader byte-offset additions with the scalar immediate.
-		// A nonzero combined offset is exact only when neither can cross U32 wrap.
-		const auto maximum_key = (UINT32_MAX >> indirect.selector_shift) & indirect.selector_bits;
-		if (indirect.workgroup_axis == UINT32_MAX && table_source.dword_count == 4u &&
-		    table_offset != 0u && uint64_t {maximum_key} * table_stride + table_offset + 28u > UINT32_MAX)
-			return false;
+		// Separate shader additions may only be merged into a contiguous descriptor
+		// when the selector cannot wrap between those additions.
+		if (plan.split_offsets && indirect.workgroup_axis == UINT32_MAX &&
+		    table_source.dword_count == 4u) {
+			const auto& selector = indirect.selectors.back();
+			const auto maximum_key = (UINT32_MAX >> selector.shift) & selector.bits;
+			if (uint64_t {maximum_key} * table_stride + table_offset + table_immediate + 28u >
+			    UINT32_MAX) return false;
+		}
+		if (plan.retain_reads) plan.reads.fill(nullptr);
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
@@ -1791,9 +1801,10 @@ private:
 		Value key;
 		uint32_t table_offset = 0;
 		uint32_t table_stride = 0;
+		uint32_t table_immediate = 0;
 		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
-		                          table_stride) || table_stride != 16u ||
-		    table_source.dword_count != 4u || table_offset != 0u) return false;
+		                          table_stride, table_immediate) || table_stride != 16u ||
+		    table_source.dword_count != 4u || table_offset != 0u || table_immediate != 0u) return false;
 		const auto* lane_read = key.Resolve().TryInstruction();
 		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
 			return false;
@@ -1825,9 +1836,9 @@ private:
 		indirect.table_stride = table_stride;
 		if (!MakeRuntimeTableSource(*read, material_source) ||
 		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
-		indirect.material_source = InternSource(material_source);
+		indirect.selectors.push_back({.source = InternSource(material_source),
+		                              .offset = memory.offset + lane * 4u});
 		indirect.table_source = InternSource(table_source);
-		indirect.selector_offset = memory.offset + lane * 4u;
 		DescriptorSource source;
 		source.dword_count = 4u;
 		source.dwords.fill(Value(0u));

@@ -281,6 +281,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    uint32_t maximum_resources, Normalize&& normalize) {
 	const auto  descriptor_bytes = dword_count * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
+	const auto* selector = indirect.selectors.empty() ? nullptr : &indirect.selectors.front();
 	auto& keys = program.ThreadScratch().material_keys;
 	const auto read_keys = [&](const ShaderBufferResource& material, uint64_t first,
 	                           uint64_t step, uint64_t count) {
@@ -301,8 +302,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		keys.clear();
 		DescriptorValue material_value;
 		DescriptorValue table_value;
-		if ((indirect.material_source != UINT32_MAX &&
-		     !clean.EvaluateDescriptor(indirect.material_source, material_value)) ||
+		if ((selector != nullptr &&
+		     !clean.EvaluateDescriptor(selector->source, material_value)) ||
 		    !clean.EvaluateDescriptor(indirect.table_source, table_value)) {
 			return false;
 		}
@@ -315,7 +316,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else {
 			return false;
 		}
-		if (indirect.material_source == UINT32_MAX) {
+		if (selector == nullptr) {
 			uint32_t key_count = 0;
 			if (indirect.workgroup_axis != UINT32_MAX) {
 				if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
@@ -327,7 +328,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
 			}
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
-			    (key_count != 0u && uint64_t {indirect.table_offset} +
+			    (key_count != 0u && uint64_t {indirect.table_offset} + indirect.table_immediate +
 			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
 			             UINT32_MAX + 1ull)) {
 				return false;
@@ -338,20 +339,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
 			if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
-			    ((indirect.selector_shift != 0u || indirect.selector_bits != UINT32_MAX) &&
+			    ((selector->shift != 0u || selector->bits != UINT32_MAX) &&
 			     (material.Base48() & 3u) != 0u) ||
 			    material.SwizzleEnabled() ||
 			    material.AddTid() || material.OutOfBounds() != 0u ||
-			    uint64_t {indirect.selector_offset} + 4u > material.Stride() ||
+			    uint64_t {selector->offset} + 4u > material.Stride() ||
 			    !clean.Evaluate(roots.SelectorFirst(source_index), first) ||
 			    !clean.Evaluate(roots.KeyCount(source_index), count) || count > MaxIndirectDescriptorProbes ||
 			    uint64_t {first} + count > material.NumRecords())
 				return false;
 			if (count != 0u && (uint64_t {first} + count - 1u) * material.Stride() +
-			                           indirect.selector_offset + 4u >
+			                           selector->offset + 4u >
 			                       uint64_t {UINT32_MAX} + 1u)
 				return false;
-			if (!read_keys(material, uint64_t {first} * material.Stride() + indirect.selector_offset,
+			if (!read_keys(material, uint64_t {first} * material.Stride() + selector->offset,
 			               material.Stride(), count)) return false;
 		} else if (!indirect.selector_mask.IsEmpty()) {
 			uint32_t mask = 0;
@@ -367,8 +368,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			keys.reserve(std::popcount(mask));
 			while (mask != 0u) {
 				const auto index = std::countr_zero(mask);
-				const auto offset = static_cast<uint64_t>(indirect.selector_offset) +
-				                    static_cast<uint64_t>(index) * indirect.selector_stride;
+				const auto offset = static_cast<uint64_t>(selector->offset) +
+				                    static_cast<uint64_t>(index) * selector->stride;
 				if (offset > UINT32_MAX) return false;
 				uint32_t key = 0;
 				if (!ReadScalarTable(material_base, UINT64_MAX, static_cast<uint32_t>(offset),
@@ -383,8 +384,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			// The first aligned offset includes the immediate added after shader U32 arithmetic.
 			const auto step = std::max<uint64_t>(4u,
-			    std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u));
-			const uint64_t first = indirect.selector_offset;
+			    std::gcd<uint64_t>(selector->stride, uint64_t {1} << 32u));
+			const uint64_t first = (selector->offset % step & ~uint64_t {3}) +
+			                       (selector->immediate & ~3u);
 			const auto size = material.GetSize();
 			const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
 			const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
@@ -392,13 +394,28 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return false;
 			}
 			if (!read_keys(material, first, step, probe_count)) return false;
-			if (indirect.selector_shift == 0u) keys.push_back(0u);
+			if (selector->shift == 0u) keys.push_back(0u);
 		}
-		if (indirect.material_source != UINT32_MAX) {
-			for (auto& key: keys) key = (key >> indirect.selector_shift) & indirect.selector_bits;
-			if (indirect.selector_shift != 0u || indirect.selector_bits != UINT32_MAX) {
-				keys.push_back(0u); // An out-of-range material load returns zero.
+		for (uint32_t step = 0; step < indirect.selectors.size(); ++step) {
+			const auto& read = indirect.selectors[step];
+			if (step != 0u) {
+				DescriptorValue value;
+				ShaderBufferResource material;
+				if (!clean.EvaluateDescriptor(read.source, value) || !DecodeBufferDescriptor(value, material))
+					return false;
+				// Distinct keys can alias after U32 arithmetic and DWORD alignment.
+				for (auto& key: keys) key = (key * read.stride + read.offset) & ~3u;
+				std::ranges::sort(keys);
+				keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+				for (auto& key: keys) {
+					const uint64_t offset = uint64_t {key} + (read.immediate & ~3u);
+					if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime, {&key, 1}))
+						return false;
+				}
 			}
+			for (auto& key: keys) key = (key >> read.shift) & read.bits;
+			if (step == 0u && (read.shift != 0u || read.bits != UINT32_MAX))
+				keys.push_back(0u); // An out-of-range root material load returns zero.
 			std::ranges::sort(keys);
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}
@@ -415,8 +432,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		DescriptorValue candidate;
 		candidate.dword_count = dword_count;
 		if (sources.empty()) {
-			const auto table_offset =
-			    static_cast<uint32_t>(key * indirect.table_stride) + indirect.table_offset;
+			const uint64_t table_offset =
+			    uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
+			    (indirect.table_immediate & ~3u);
 			if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 			                     std::span(candidate.dwords).first(dword_count))) {
 				return false;
@@ -1042,9 +1060,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (!source.indirect_descriptor.has_value()) continue;
 		const auto& indirect                = *source.indirect_descriptor;
 		plan.requires_specialization_memory = true;
-		capture_indirect_reads |= indirect.material_source != UINT32_MAX || !indirect.sources.empty();
-		MarkCleanFlatSlots(plan, Source(plan, indirect.material_source), plan.clean_flat_slots,
-		                   indirect.selector_mask);
+		capture_indirect_reads |= !indirect.selectors.empty() || !indirect.sources.empty();
+		for (const auto& read: indirect.selectors)
+			MarkCleanFlatSlots(plan, Source(plan, read.source), plan.clean_flat_slots);
+		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_mask);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_first);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.key_count);
 		if (indirect.sources.empty()) {

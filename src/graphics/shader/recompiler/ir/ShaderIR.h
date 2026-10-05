@@ -495,15 +495,22 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectDescriptor {
-		uint32_t material_source = UINT32_MAX;
+		struct SelectorRead {
+			uint32_t source = UINT32_MAX;
+			uint32_t stride = 0;
+			uint32_t offset = 0;
+			uint32_t immediate = 0;
+			uint32_t shift = 0;
+			uint32_t bits = UINT32_MAX;
+
+			bool operator==(const SelectorRead& other) const = default;
+		};
+		std::vector<SelectorRead> selectors;
 		uint32_t table_source    = 0;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		uint32_t table_immediate = 0;
 		uint32_t table_stride    = 0;
 		uint32_t workgroup_axis  = UINT32_MAX;
-		uint32_t selector_shift  = 0;
-		uint32_t selector_bits   = UINT32_MAX;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

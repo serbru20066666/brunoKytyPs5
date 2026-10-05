@@ -209,7 +209,8 @@ std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                          bool memory_backed_material = false, uint32_t member_offset = 0,
                          uint32_t material_stride = 224, uint32_t selector_bits = UINT32_MAX,
-                         uint32_t table_stride = 32, uint32_t table_offset = 0) {
+                         uint32_t table_stride = 32, uint32_t table_offset = 0,
+                         uint32_t table_shader_offset = 0, bool nested = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -252,8 +253,20 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                                       {invocation, Value(true)});
   const auto record =
       fixture->Emit(ValueOpcode::IMul32, {selector, Value(material_stride)});
-  const auto member = member_offset == 0 ? record :
+  auto member = member_offset == 0 ? record :
       fixture->Emit(ValueOpcode::IAdd32, {record, Value(member_offset)});
+  if (nested) {
+    std::array<Value, 4> root_words;
+    for (uint32_t word = 0; word < 4u; ++word) root_words[word] = fixture->UserData(12u + word);
+    const auto root = fixture->Buffer(root_words);
+    MemoryInfo root_memory;
+    root_memory.kind = ResourceKind::ScalarBuffer;
+    const auto root_offset = fixture->Emit(ValueOpcode::IMul32, {selector, Value(32u)});
+    const auto pointer = fixture->Emit(ValueOpcode::ReadConstBuffer, {root, root_offset},
+                                       fixture->AddMemory(root_memory, 0x1000));
+    const auto masked = fixture->Emit(ValueOpcode::BitwiseAnd32, {pointer, Value(0xfffffff1u)});
+    member = fixture->Emit(ValueOpcode::IAdd32, {masked, Value(16u)});
+  }
   fixture->Emit(ValueOpcode::ReferenceU32, {member});
   MemoryInfo material_scalar;
   material_scalar.kind = ResourceKind::ScalarBuffer;
@@ -263,8 +276,9 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                     fixture->AddMemory(material_scalar, 0x10d8));
   if (selector_bits != UINT32_MAX)
     key = fixture->Emit(ValueOpcode::BitwiseAnd32, {key, Value(selector_bits)});
-  const auto heap_offset =
-      fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
+  auto heap_offset = fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
+  if (table_shader_offset != 0u)
+    heap_offset = fixture->Emit(ValueOpcode::IAdd32, {heap_offset, Value(table_shader_offset)});
   std::array<Value, 8> image_words;
   MemoryInfo heap_scalar;
   heap_scalar.kind = ResourceKind::ScalarBuffer;
@@ -277,6 +291,10 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
     image_words[dword] =
         fixture->Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
                       fixture->AddMemory(component, 0x10d8));
+  }
+  if (nested) {
+    const auto field = fixture->Emit(ValueOpcode::BitwiseAnd32, {image_words[4], Value(7u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {field});
   }
   const auto image = fixture->Image(image_words, 0x10f0);
   const auto sampler =
@@ -615,10 +633,63 @@ void TestInvariantIndirectImageMaterialization() {
   packed_memory.fail_address = 0x205cu;
   Check(!MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
         "unreadable in-range DWORD in a 48-byte descriptor record was accepted");
-  auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u,
-                                               UINT32_MAX, 48u, 16u);
-  CheckFatal([&] { overflowing->PlanAndTrack(); }, "not a valid runtime value",
-             "unbounded table offset conflated shader U32 wrap with scalar immediate addition");
+  // 0x55555555 * 48 is 0xfffffff0: shader +16 wraps, scalar +16 does not.
+  for (const auto [shader_offset, immediate, key, image_count] :
+       {std::array{0u, 16u, 0x55555555u, 1u}, std::array{16u, 0u, 0x55555555u, 2u},
+        std::array{0xfffffff0u, 32u, 0u, 1u}}) {
+    auto wrapping = MakeIndirectImageFixture(false, 60u, false, 0u, 64u,
+        UINT32_MAX, 48u, immediate, shader_offset);
+    wrapping->PlanAndTrack();
+    const auto wrapping_plan = ExtractResourcePlan(wrapping->program);
+    LinearTestMemory wrapping_memory;
+    wrapping_memory.words[60u / 4u] = key;
+    std::copy(image_descriptor.begin(), image_descriptor.end(),
+              wrapping_memory.words.begin() + 0x1000u / 4u);
+    std::array<uint32_t, 8> data{0x1000u, 64u << 16u, 1u, 0u,
+                                 0x2000u, 48u << 16u, 1u, 0u};
+    SrtRuntime wrapped_runtime{.user_data = data, .userdata = &wrapping_memory,
+                               .read_specialization_memory = ReadLinearTestMemory};
+    Check(MaterializeResources(wrapping_plan, wrapped_runtime, snapshot, specialization) &&
+              snapshot.images.size() == image_count &&
+              std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }) &&
+              (image_count == 1u || snapshot.images[1].dwords == image_descriptor),
+          "descriptor addressing conflated shader U32 wrap with scalar immediate addition");
+  }
+
+  auto nested = MakeIndirectImageFixture(false, 0u, false, 0u, 1u,
+                                         UINT32_MAX, 48u, 0u, 16u, true);
+  nested->PlanAndTrack();
+  const auto nested_plan = ExtractResourcePlan(nested->program);
+  const auto &chain = *nested_plan.descriptor_sources[nested_plan.info.images[0].source].indirect_descriptor;
+  Check(chain.selectors.size() == 2u && chain.selectors[0].stride == 32u &&
+            chain.selectors[0].bits == 0xfffffff1u && chain.selectors[1].offset == 16u &&
+            nested->program.info.buffers.size() == 3u,
+        "nested material selectors lost their ordered reads or live descriptor field");
+  LinearTestMemory nested_memory;
+  nested_memory.words[0] = 0u;
+  nested_memory.words[32u / 4u] = 1u;
+  nested_memory.words[64u / 4u] = 0xffffffffu;
+  nested_memory.words[0x2000u / 4u] = 0u;
+  nested_memory.words[0x2010u / 4u] = 1u;
+  nested_memory.fail_address = 0x3020u;
+  nested_memory.watched_address = 0x3010u;
+  for (uint32_t key = 0; key < 2u; ++key) {
+    auto descriptor = image_descriptor;
+    descriptor[0] += key;
+    std::copy(descriptor.begin(), descriptor.end(),
+              nested_memory.words.begin() + (0x1010u + key * 48u) / 4u);
+  }
+  std::array<uint32_t, 16> nested_data{0x3000u, 16u << 16u, 0x200000u, 0u,
+                                      0x2000u, 48u << 16u, 2u, 0u,
+                                      0, 0, 0, 0, 0x1000u, 32u << 16u, 3u, 0u};
+  SrtRuntime nested_runtime{.user_data = nested_data, .userdata = &nested_memory,
+                            .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(nested_plan, nested_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords == image_descriptor &&
+            snapshot.images[1].dwords[0] == image_descriptor[0] + 1u &&
+            nested_memory.watched_reads == 1u,
+        "nested selector traversal scanned unrelated material fields or repeated aliased offsets");
+
 }
 
 void TestGuardedDirectImageTable() {
@@ -709,8 +780,8 @@ void TestGuardedDirectImageTable() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
-    Check(indirect && indirect->material_source == UINT32_MAX &&
-              indirect->selector_stride == 0u && indirect->table_offset == 344u &&
+    Check(indirect && indirect->selectors.empty() &&
+              indirect->table_offset == 344u &&
               indirect->key_count.Resolve().IsImmediate() &&
               indirect->key_count.Resolve().U32() == 32u &&
               fixture.program.descriptor_sources[indirect->table_source].dword_count == 2u,
@@ -1007,7 +1078,7 @@ void TestBoundedComputeImageLoop() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
-    Check(indirect && indirect->material_source == UINT32_MAX &&
+    Check(indirect && indirect->selectors.empty() &&
               indirect->table_offset == 0x6b0u &&
               indirect->key_count.Resolve() == count.Resolve(),
           "bounded compute loop lost its runtime image count");
@@ -1362,8 +1433,8 @@ void TestUniformizedMaterialImageKeys() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
-    Check(indirect && indirect->selector_stride == 0x90u &&
-              indirect->selector_offset == 0xc00u &&
+    Check(indirect && indirect->selectors.front().stride == 0x90u &&
+              indirect->selectors.front().offset == 0xc00u &&
               indirect->table_offset == 0x20e0u &&
               !indirect->selector_mask.IsEmpty() &&
               indirect->key_count.Resolve().IsImmediate() &&
