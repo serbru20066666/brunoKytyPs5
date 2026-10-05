@@ -70,6 +70,9 @@ struct SpirvRequirements {
 	bool buffer_int64_atomics         = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	// A buffer store or atomic anywhere in the program. Without one, the buffers are declared
+	// read-only.
+	bool buffer_writes                = false;
 	bool float64                      = false;
 };
 

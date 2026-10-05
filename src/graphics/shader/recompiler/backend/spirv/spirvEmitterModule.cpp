@@ -206,6 +206,16 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
 				}
+				if (!state.requirements.buffer_writes) {
+					// A program that only reads its buffers says so. The AMD driver then loads
+					// with a uniform address once per wave, into scalar registers
+					// (s_buffer_load), as the guest's S_BUFFER_LOAD does. Without the decoration
+					// it issues every such load once per lane (buffer_load), with the address
+					// copied to a vector register: ASTRO's PLAYROOM's lighting shader
+					// 6b517f3b5e6b7160 had 166 of those, and none with it.
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationNonWritable);
+				}
 				if (state.requirements.coherent_buffers) {
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
