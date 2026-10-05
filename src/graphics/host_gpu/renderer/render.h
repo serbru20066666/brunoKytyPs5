@@ -163,6 +163,9 @@ public:
 		vk::CompareOp                               depth_compare = vk::CompareOp::eNever;
 		vk::Bool32                                  depth_bias    = VK_FALSE;
 		vk::Bool32                                  stencil_test  = VK_FALSE;
+		vk::Bool32                                  depth_bounds  = VK_FALSE;
+		bool                                        bounds_valid  = false;
+		std::array<float, 2>                        bounds {};
 		bool                                        bias_valid    = false;
 		std::array<float, 3>                        bias {};
 		bool                                        stencil_valid = false;

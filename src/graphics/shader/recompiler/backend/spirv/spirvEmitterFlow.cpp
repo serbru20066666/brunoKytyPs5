@@ -649,7 +649,7 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	};
-	const auto u64      = TypeScalarU64(state);
+	const auto u64      = TypeU64(state);
 	const auto constant = [&](uint64_t value) {
 		return state.builder.Constant(spv::OpConstant, u64, static_cast<uint32_t>(value),
 		                              static_cast<uint32_t>(value >> 32u));

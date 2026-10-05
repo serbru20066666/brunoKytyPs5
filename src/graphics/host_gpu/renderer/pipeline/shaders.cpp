@@ -550,14 +550,6 @@ void BuildGraphicsPipelineState(GraphicsPipelineState& state, GraphicContext& gr
 	                         FitsPushDescriptors(graphics, state.vertex_bindings);
 
 	auto& depth_stencil_info = state.depth_stencil;
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	auto& dynamic_states = state.dynamic_states;
 	dynamic_states       = {
@@ -579,6 +571,10 @@ void BuildGraphicsPipelineState(GraphicsPipelineState& state, GraphicContext& gr
 	if (graphics.attachment_feedback_loop_dynamic_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
+#if !defined(__APPLE__)
+	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+#endif
 	state.shared_dynamic_state_count = static_cast<uint32_t>(dynamic_states.size());
 #if !defined(__APPLE__)
 	if (rendering.color_count != 0) {

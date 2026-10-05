@@ -593,6 +593,12 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const bool  depth_bias_enable = use_front || use_back;
 	const vk::Bool32 depth_bias   = depth_bias_enable ? VK_TRUE : VK_FALSE;
 	const vk::Bool32 stencil_test = depth.stencil_test_enable ? VK_TRUE : VK_FALSE;
+#if defined(__APPLE__)
+	// MoltenVK lacks the depthBounds feature: the test stays off.
+	const vk::Bool32 depth_bounds = VK_FALSE;
+#else
+	const vk::Bool32 depth_bounds = depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE;
+#endif
 
 	const bool fixed_valid = known.fixed_valid;
 	if (!fixed_valid || known.line_width != line_width) {
@@ -616,6 +622,20 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	if (!fixed_valid || known.stencil_test != stencil_test) {
 		vk_buffer.setStencilTestEnable(stencil_test);
 	}
+#if !defined(__APPLE__)
+	if (!fixed_valid || known.depth_bounds != depth_bounds) {
+		vk_buffer.setDepthBoundsTestEnable(depth_bounds);
+	}
+	if (depth_bounds != VK_FALSE) {
+		const std::array bounds {ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax()};
+		if (!known.bounds_valid || known.bounds != bounds) {
+			vk_buffer.setDepthBounds(bounds[0], bounds[1]);
+			known.bounds_valid = true;
+			known.bounds       = bounds;
+		}
+	}
+#endif
+	known.depth_bounds    = depth_bounds;
 	known.fixed_valid     = true;
 	known.line_width      = line_width;
 	known.blend_constants = blend_constants;
@@ -697,6 +717,8 @@ static bool SameDynamicState(const CommandBuffer::GraphicsState& a,
 	       a.blend_constants == b.blend_constants && a.depth_test == b.depth_test &&
 	       a.depth_write == b.depth_write && a.depth_compare == b.depth_compare &&
 	       a.depth_bias == b.depth_bias && a.stencil_test == b.stencil_test &&
+	       a.depth_bounds == b.depth_bounds && a.bounds_valid == b.bounds_valid &&
+	       a.bounds == b.bounds &&
 	       a.bias_valid == b.bias_valid && a.bias == b.bias &&
 	       a.stencil_valid == b.stencil_valid && a.stencil == b.stencil &&
 	       a.color_write_count == b.color_write_count && a.color_write == b.color_write;

@@ -78,6 +78,8 @@ namespace {
 	X(vkCmdSetDepthWriteEnable)                                                                   \
 	X(vkCmdSetDepthCompareOp)                                                                     \
 	X(vkCmdSetStencilTestEnable)                                                                  \
+	X(vkCmdSetDepthBounds)                                                                        \
+	X(vkCmdSetDepthBoundsTestEnable)                                                              \
 	X(vkCmdSetStencilOp)                                                                          \
 	X(vkCmdSetStencilCompareMask)                                                                 \
 	X(vkCmdSetStencilWriteMask)                                                                   \
@@ -104,7 +106,6 @@ namespace {
 	X(vkCmdSetEvent)                                                                              \
 	X(vkCmdResetEvent)                                                                            \
 	X(vkCmdWaitEvents)                                                                            \
-	X(vkCmdSetDepthBounds)                                                                        \
 	X(vkCmdBindVertexBuffers)                                                                     \
 	X(vkCmdDrawIndirect)                                                                          \
 	X(vkCmdBlitImage)                                                                             \
@@ -131,7 +132,6 @@ namespace {
 	X(vkCmdSetCullMode)                                                                           \
 	X(vkCmdSetFrontFace)                                                                          \
 	X(vkCmdSetPrimitiveTopology)                                                                  \
-	X(vkCmdSetDepthBoundsTestEnable)                                                              \
 	X(vkCmdSetRasterizerDiscardEnable)                                                            \
 	X(vkCmdSetPrimitiveRestartEnable)                                                             \
 	X(vkCmdPushDescriptorSet)                                                                     \
@@ -1301,6 +1301,24 @@ void VKAPI_PTR HookCmdSetStencilTestEnable(VkCommandBuffer buffer, VkBool32 enab
 	g_real.vkCmdSetStencilTestEnable(buffer, enable);
 }
 
+void VKAPI_PTR HookCmdSetDepthBoundsTestEnable(VkCommandBuffer buffer, VkBool32 enable) {
+	if (Routed(buffer)) {
+		Emit([=] { g_real.vkCmdSetDepthBoundsTestEnable(buffer, enable); });
+		return;
+	}
+	BeforeDirect();
+	g_real.vkCmdSetDepthBoundsTestEnable(buffer, enable);
+}
+
+void VKAPI_PTR HookCmdSetDepthBounds(VkCommandBuffer buffer, float minimum, float maximum) {
+	if (Routed(buffer)) {
+		Emit([=] { g_real.vkCmdSetDepthBounds(buffer, minimum, maximum); });
+		return;
+	}
+	BeforeDirect();
+	g_real.vkCmdSetDepthBounds(buffer, minimum, maximum);
+}
+
 void VKAPI_PTR HookCmdSetStencilOp(VkCommandBuffer buffer, VkStencilFaceFlags faces,
                                    VkStencilOp fail, VkStencilOp pass, VkStencilOp depth_fail,
                                    VkCompareOp compare) {
@@ -1448,6 +1466,8 @@ struct FallbackHook<Tag, R(VKAPI_PTR*)(VkCommandBuffer, A...)> {
 #define KYTY_HOOK_FUNCTION_vkCmdSetDepthWriteEnable HookCmdSetDepthWriteEnable
 #define KYTY_HOOK_FUNCTION_vkCmdSetDepthCompareOp HookCmdSetDepthCompareOp
 #define KYTY_HOOK_FUNCTION_vkCmdSetStencilTestEnable HookCmdSetStencilTestEnable
+#define KYTY_HOOK_FUNCTION_vkCmdSetDepthBoundsTestEnable HookCmdSetDepthBoundsTestEnable
+#define KYTY_HOOK_FUNCTION_vkCmdSetDepthBounds HookCmdSetDepthBounds
 #define KYTY_HOOK_FUNCTION_vkCmdSetStencilOp HookCmdSetStencilOp
 #define KYTY_HOOK_FUNCTION_vkCmdSetStencilCompareMask HookCmdSetStencilCompareMask
 #define KYTY_HOOK_FUNCTION_vkCmdSetStencilWriteMask HookCmdSetStencilWriteMask

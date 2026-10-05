@@ -2050,9 +2050,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
@@ -2392,9 +2389,6 @@ uint32_t PipelineCache::PrefetchGraphicsPipeline(const HW::Context& ctx, const H
 	                                            : vk::PrimitiveTopology::eTriangleList;
 	static_params.samples                 = samples;
 	static_params.sample_shading_enable   = ps_active && samples > 1 && pixel_info.ps_sample_shading;
-	static_params.depth_bounds_test_enable = with_depth && dc.depth_bounds_enable;
-	static_params.depth_min_bounds         = ctx.GetDepthBoundsMin();
-	static_params.depth_max_bounds         = ctx.GetDepthBoundsMax();
 	static_params.cull_back                = mc.cull_back;
 	static_params.cull_front               = mc.cull_front;
 	static_params.face                     = mc.face;
