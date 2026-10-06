@@ -499,17 +499,16 @@ struct DescriptorSource {
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
-			uint32_t immediate = 0;
-			uint32_t shift = 0;
-			uint32_t bits = UINT32_MAX;
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
-		std::vector<SelectorRead> selectors;
+		std::optional<SelectorRead> selector;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
 		uint32_t table_stride    = 0;
+		uint32_t table_record_bytes = 0;
+		bool     table_scalar = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
 		Value                 selector_first;

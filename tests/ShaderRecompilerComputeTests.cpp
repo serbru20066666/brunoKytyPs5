@@ -34741,7 +34741,9 @@ void CheckIndirectImageKeySwitch() {
   program.descriptor_sources.resize(2);
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_descriptor =
-      DescriptorSource::IndirectDescriptor{.selectors = {{.source = 0, .stride = 224, .offset = 12}},
+      DescriptorSource::IndirectDescriptor{
+          .selector = DescriptorSource::IndirectDescriptor::SelectorRead{
+              .source = 0, .stride = 224, .offset = 12},
           .table_source = 0, .table_stride = 32};
   program.descriptor_sources[1].dword_count = 4;
 
@@ -34790,6 +34792,19 @@ void CheckIndirectImageKeySwitch() {
   Require(name, "nonuniform sampled image operand",
           sampled_image != 0u && std::ranges::find(nonuniform, sampled_image) != nonuniform.end(),
           "the sample operand lacks its nonuniform decoration");
+
+  program.info.images[0].indirect_search_iterations = 0;
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv("DenseIndirectImageTable", spirv);
+  Require(name, "dense image map disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble dense image table shader");
+  Require(name, "bounded dense image selection",
+          CountText(text, "OpULessThan") == 1 &&
+              CountText(text, "OpImageSampleExplicitLod") == 1 &&
+              text.find("SampledImageArrayNonUniformIndexing") != std::string::npos,
+          "dense image selection lost its bounds check or native nonuniform array");
 
   // Materialized children follow all native roots, including unrelated images.
   root.indirect_resources = {0u};
@@ -39287,15 +39302,6 @@ void CheckImageSamplerSpecialization() {
     options.user_data = user_data;
     options.input_info.compute = &compute;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
-    if (scalar) {
-      bool key_phi = false;
-      for (const auto *block : translated.program.blocks)
-        for (const auto &inst : *block)
-          key_phi |= inst.GetOpcode() == ValueOpcode::GetImageResource &&
-                     inst.Arg(0).Resolve().IsPhi();
-      Require(name, "descriptor key reconvergence", key_phi,
-              "native crossed exits did not retain a descriptor key Phi");
-    }
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
@@ -39307,56 +39313,57 @@ void CheckImageSamplerSpecialization() {
                 snapshot.images.size() == count + 1u,
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
-    const auto ordinal = [&](u32 key) {
-      for (u32 i = 0; i < snapshot.flattened_srt[offset]; ++i)
-        if (snapshot.flattened_srt[offset + 1u + 2u * i] == key)
-          return snapshot.flattened_srt[offset + 2u + 2u * i];
-      return UINT32_MAX;
+    const auto ordinal = [&](u32 byte_offset) {
+      const auto word = byte_offset >> 2u;
+      return word < snapshot.flattened_srt[offset]
+                 ? snapshot.flattened_srt[offset + 1u + word] : 0u;
     };
-    Require(name, "shift, wrap and whole-record read",
-            snapshot.flattened_srt[offset] == count + 2u && ordinal(1u) != UINT32_MAX &&
-                ordinal(0x08000001u) == ordinal(1u) && ordinal(count) < snapshot.images.size() &&
-                snapshot.images[ordinal(count)].dwords[0] == 0u &&
-                std::ranges::count(snapshot.specialization_reads,
-                    std::pair<uint64_t, uint64_t>{material_base, (count + 3u) * 4u}) == 1,
-            "material keys lost shift/dedup, scalar wrap/OOB, or bulk strict-read semantics");
+    Require(name, "dense table map and coherent snapshot",
+            specialization.images[0].indirect_search_iterations == 0u &&
+                snapshot.flattened_srt[offset] == (count - 1u) * 8u + 1u &&
+                ordinal(32u) != 0u &&
+                ordinal(count * 32u) == 0u && snapshot.images[0].dwords[0] == 0u &&
+                snapshot.specialization_reads ==
+                    std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
+            "image table lost its dense offsets, explicit null or single coherent read");
     const auto previous = specialization;
     memory[table_base / 4u + 8u] += 0x10000u;
     Require(name, "runtime descriptor refresh",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[1].dwords[0] == 0x11100u,
+                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
             "descriptor addresses were frozen or entered the shader specialization");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
     ValidateSpirv(name, compiled.spirv);
     if (!scalar) {
       user_data[4] += 1u;
-      Require(name, "misaligned material rejection",
-              !MaterializeResources(plan, runtime, snapshot, specialization),
-              "unaligned raw buffer base was treated as separately aligned scalar memory");
+      Require(name, "GPU material reads remain on GPU",
+              MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  specialization == previous && snapshot.specialization_reads ==
+                      std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
+              "GPU material addressing reentered host descriptor selection");
       user_data[4] -= 1u;
     }
     auto dirty = runtime;
     dirty.read_specialization_memory = +[](void*, uint64_t, std::span<u32>) { return false; };
-    Require(name, "dirty material rejection",
+    Require(name, "unreadable image table rejection",
             !MaterializeResources(plan, dirty, snapshot, specialization),
             "GPU-selected texture materialization bypassed strict read provenance");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     if (scalar) {
-      ExpectFatal("ScalarImageDescriptorNumericConsumer", [&] {
-        code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
-        code.pop_back();
-        AppendBufferStoreDword(&code, 18, 0);
-        code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
-        AppendEnd(&code);
-        (void)ShaderRecompiler::TranslateProgram(code, options);
-      });
+      code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
+      code.pop_back();
+      AppendBufferStoreDword(&code, 18, 0);
+      code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
+      AppendEnd(&code);
     } else {
-      ExpectFatal("MaterialImageWithoutEntryWitness", [&] {
-        code[2] = EncodeSopp(0x00, 0); // S_NOP removes the original nonempty-EXEC witness.
-        (void)ShaderRecompiler::TranslateProgram(code, options);
-      });
+      code[2] = EncodeSopp(0x00, 0); // GPU selectors do not need a host nonempty-EXEC witness.
     }
-#endif
+    auto retained = ShaderRecompiler::TranslateProgram(code, options);
+    auto retained_plan = ExtractResourcePlan(retained.program);
+    Require(name, "retained descriptor consumers",
+            MaterializeResources(retained_plan, runtime, snapshot, specialization),
+            "retained GPU descriptor reads could not use the shared image table");
+    compiled = ShaderRecompiler::CompileProgram(std::move(retained), options, specialization);
+    ValidateSpirv(name, compiled.spirv);
   }
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
