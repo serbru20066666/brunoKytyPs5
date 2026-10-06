@@ -21,7 +21,7 @@ Todo a 3840×2160, que es como dibuja el juego, y sin generación de cuadros.
 
 ## Estado
 
-Versión **0.2.0**. Medido en la RX 6800 XT, con el mismo juego y en el mismo sitio antes y después:
+Versión **0.2.1**. Medido en la RX 6800 XT, con el mismo juego y en el mismo sitio antes y después:
 
 ![Cuadros por segundo antes y después](docs/screenshots/fps-antes-y-despues.png)
 
@@ -74,8 +74,21 @@ De dónde sale la mejora:
 
 Además:
 
-- En el lanzador, cada juego tiene casillas para la generación de cuadros y para la lectura
-  relajada, y ASTRO's PLAYROOM recibe sus ajustes recomendados la primera vez que aparece.
+- 0.2.1: ASTRO's PLAYROOM ya no se cierra en GPU Jungle con «Assertion failed: !pos.IsNan()».
+  Su física recibía raíces inversas calculadas como las calcula un procesador Intel; con «AMD CPU
+  patch» (`--amd-cpu`, ahora en los ajustes recomendados) se calculan como en la consola, y sin
+  atrapar cada una como excepción, gracias a los cambios de KytyPS5 que se incorporaron.
+
+### En el lanzador
+
+![Menú del juego en el lanzador](docs/screenshots/lanzador-ajustes-recomendados.png)
+
+- **Apply recommended settings** (clic derecho sobre el juego) pone los ajustes con los que el
+  juego va mejor. ASTRO's PLAYROOM los recibe además solo la primera vez que aparece.
+- **Patches...** activa o desactiva los parches del juego. El paquete trae el de ASTRO's PLAYROOM
+  que apaga la iluminación global por trazado de rayos (`_Patches/PPSA01325.json`); el lanzador lo
+  aplica solo cuando ese archivo está junto a él.
+- En los ajustes de cada juego hay casillas para la generación de cuadros y la lectura relajada.
 
 Falta para la meta: en la selva hay que seguir quitando trabajo al hilo que prepara los dibujos,
 y en la plaza hay que aligerar la carga de la tarjeta.

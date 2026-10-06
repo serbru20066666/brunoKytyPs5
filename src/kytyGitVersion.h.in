@@ -11,7 +11,7 @@
 // The product name: in the window title, the log, crash reports and the Vulkan application info.
 #define KYTY_PRODUCT_NAME "brunoKytyPs5"
 // The version of the fork itself, next to the commit in every build label.
-#define KYTY_FORK_VERSION "0.2.0"
+#define KYTY_FORK_VERSION "0.2.1"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)

@@ -162,6 +162,9 @@ public:
 			shader_validation_enabled = false;
 			shader_optimization_type  = ShaderOptimizationType::Performance;
 			printf_direction          = LogDirection::Silent;
+			// Its physics asserts on a position that is not a number when reciprocal square
+			// roots come out as an Intel processor computes them.
+			amd_cpu_enabled = true;
 #if defined(_WIN32)
 			red_zone_protection_enabled = true;
 #endif
