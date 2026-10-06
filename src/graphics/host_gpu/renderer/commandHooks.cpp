@@ -410,13 +410,18 @@ struct CommandStream::Impl {
 	static constexpr uint64_t WakeBytes = 16u << 10u;
 
 	std::vector<uint8_t>  ring = std::vector<uint8_t>(RingBytes);
-	std::atomic<uint64_t> write {0}; // Bytes appended (published).
-	std::atomic<uint64_t> read {0};  // Consumer: bytes run.
-	std::atomic<uint64_t> signal {0};
-	std::atomic<bool>     sleeping {false};
+	// The owner publishes several packets a draw while the consumer runs them, so what each of
+	// them writes has a cache line of its own: sharing one made every packet take the line from
+	// the other thread, on both sides.
+	alignas(64) std::atomic<uint64_t> write {0}; // Bytes appended (published).
+	alignas(64) std::atomic<uint64_t> read {0};  // Consumer: bytes run.
+	alignas(64) std::atomic<uint64_t> signal {0};
+	std::atomic<bool>                 sleeping {false};
 	// Only the stream's owner (see Slot) appends.
-	uint64_t              pending_write = 0; // Owner: bytes reserved, not yet published.
-	uint64_t              wake_mark     = 0;
+	alignas(64) uint64_t pending_write = 0; // Owner: bytes reserved, not yet published.
+	uint64_t             wake_mark     = 0;
+	uint64_t             read_seen     = 0; // Owner: the consumer's progress when last looked at.
+	uint64_t             packet_count  = 0; // Owner: for the statistics.
 
 	// Reserves a packet of `bytes` (header and closure included) and returns its start.
 	uint8_t* Reserve(size_t bytes) {
@@ -436,7 +441,11 @@ struct CommandStream::Impl {
 		return ring.data() + offset;
 	}
 	void WaitForSpace(size_t bytes) {
-		while (pending_write + bytes - read.load(std::memory_order_acquire) > RingBytes) {
+		if (pending_write + bytes - read_seen <= RingBytes) {
+			return; // Room even if the consumer has run nothing since.
+		}
+		while (pending_write + bytes -
+		           (read_seen = read.load(std::memory_order_acquire)) > RingBytes) {
 			if (sleeping.load(std::memory_order_seq_cst)) {
 				Signal();
 			}
@@ -447,7 +456,7 @@ struct CommandStream::Impl {
 		bytes = (bytes + Align - 1) & ~(Align - 1);
 		EXIT_IF(start != ring.data() + pending_write % RingBytes);
 		pending_write += bytes;
-		packets.store(packets.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		packet_count++;
 		// A plain store: a consumer about to sleep is checked for only every WakeBytes (and on
 		// Wake and Drain), each after a fence ordering it with the consumer's "sleeping, then
 		// check write".
@@ -471,8 +480,7 @@ struct CommandStream::Impl {
 	// Any thread: waits until the consumer has run everything published so far.
 	void Drain();
 	// Statistics (KYTY_DEBUG_STREAM_STATS=1).
-	std::atomic<uint64_t> packets {0};
-	std::atomic<uint64_t> wakes {0};
+	alignas(64) std::atomic<uint64_t> wakes {0};
 	std::atomic<uint64_t> drains {0};
 	std::atomic<uint64_t> sleeps {0};
 };
@@ -1593,7 +1601,7 @@ void CommandStream::Wake() {
 		const auto  now          = Clock::now();
 		if (now - window_start >= std::chrono::seconds(5)) {
 			const auto seconds = std::chrono::duration<double>(now - window_start).count();
-			const std::array<uint64_t, 6> current {impl.packets.load(), impl.write.load(),
+			const std::array<uint64_t, 6> current {impl.packet_count, impl.write.load(),
 			                                       impl.wakes.load(),   impl.drains.load(),
 			                                       impl.sleeps.load(),  g_fallback_calls.load()};
 			std::printf("command-stream: %.1fs packets/s=%.0f MB/s=%.1f wakes/s=%.0f drains/s=%.0f "
@@ -1615,11 +1623,16 @@ void CommandStream::Drain() {
 }
 
 void CommandStream::Consume(std::stop_token stop) {
-	auto&    impl     = *m_impl;
-	uint64_t position = impl.read.load(std::memory_order_relaxed);
-	t_consuming       = &impl;
+	auto&    impl      = *m_impl;
+	uint64_t position  = impl.read.load(std::memory_order_relaxed);
+	uint64_t available = position;
+	t_consuming        = &impl;
 	for (;;) {
-		const auto available = impl.write.load(std::memory_order_acquire);
+		// What was published is run before looking for more: the owner writes that line with
+		// every packet.
+		if (position == available) {
+			available = impl.write.load(std::memory_order_acquire);
+		}
 		if (position == available) {
 			if (stop.stop_requested()) {
 				return;

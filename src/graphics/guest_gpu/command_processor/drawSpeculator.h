@@ -52,7 +52,8 @@ public:
 
 private:
 	enum SlotState : uint32_t { Free, Writing, Ready, Taken };
-	struct Slot {
+	// A slot goes from the worker to the GPU thread and back: no two share a cache line.
+	struct alignas(64) Slot {
 		std::atomic<uint32_t> state {Free};
 		uint64_t              epoch  = 0;
 		uint64_t              seq    = 0;
@@ -80,20 +81,22 @@ private:
 	const int      m_interrupt_event_id;
 
 	std::array<Slot, RingSize> m_ring;
+	// What follows is the GPU thread's own, then what it writes for the worker to read, then what
+	// the worker writes: a cache line each, so that neither takes the other's with every draw.
 	// GPU thread: the next draw's sequence number and the current epoch.
-	uint64_t                   m_gpu_seq = 0;
+	alignas(64) uint64_t       m_gpu_seq = 0;
 	// GPU thread: the buffer cache's and texture cache's GPU-write generations at the last
 	// Release, and the last draw at whose Release either had changed (see Take).
 	uint64_t                   m_seen_buffer_writes = 0;
 	uint64_t                   m_seen_image_writes  = 0;
 	uint64_t                   m_last_write_seq     = 0;
-	std::atomic<uint64_t>      m_gpu_next {0};
+	bool                       m_mismatch = false;
+	alignas(64) std::atomic<uint64_t> m_gpu_next {0};
 	std::atomic<uint64_t>      m_epoch {0};
 	// The worker's walk ended before this draw (NotStopped while walking or idle at the end).
-	std::atomic<uint64_t>      m_stopped_seq {NotStopped};
-	bool                       m_mismatch = false;
+	alignas(64) std::atomic<uint64_t> m_stopped_seq {NotStopped};
 
-	std::mutex                 m_mutex;
+	alignas(64) std::mutex     m_mutex;
 	std::condition_variable    m_wake;
 	std::unique_ptr<Snapshot>  m_snapshot; // Pending restart, under m_mutex.
 	std::unique_ptr<Snapshot>  m_spare;    // The worker's; swapped with m_snapshot to take it.
@@ -112,13 +115,14 @@ private:
 
 	// Counters, printed with KYTY_DEBUG_SPEC_STATS=1.
 	struct Stats {
-		std::atomic<uint64_t> restarts {0};
-		std::atomic<uint64_t> walked {0};
-		std::atomic<uint64_t> speculated {0};
-		std::atomic<uint64_t> behind {0};
+		// The GPU thread's counts, then the worker's.
+		alignas(64) std::atomic<uint64_t> restarts {0};
 		std::atomic<uint64_t> taken {0};
 		std::atomic<uint64_t> missed {0};
 		std::atomic<uint64_t> mismatched {0};
+		alignas(64) std::atomic<uint64_t> walked {0};
+		std::atomic<uint64_t> speculated {0};
+		std::atomic<uint64_t> behind {0};
 		std::atomic<uint64_t> deferred {0};
 		std::atomic<uint64_t> table_unread {0};
 		std::atomic<uint64_t> table_unknown {0};
