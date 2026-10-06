@@ -15612,7 +15612,8 @@ public:
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr,
+                std::span<const Image> sampled_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -15888,7 +15889,7 @@ public:
       write.pBufferInfo = &gds_info;
       writes.push_back(write);
     }
-    const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
+    std::vector<const ShaderRecompiler::IR::DescriptorBinding *> sampled_bindings;
     const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
     const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
     const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
@@ -15901,10 +15902,7 @@ public:
       const auto &image =
           compiled.program.info.images.at(binding.resources.front());
       if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
-        Require(test.name, "dispatch", sampled == nullptr,
-                "Vulkan test harness needs separate sampled images for mixed "
-                "descriptor classes");
-        sampled = &binding;
+        sampled_bindings.push_back(&binding);
       } else if (image.atomic) {
         storage_atomic = &binding;
       } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
@@ -15913,32 +15911,41 @@ public:
         storage_uint = &binding;
       }
     }
-    if (sampled != nullptr) {
-      Require(test.name, "dispatch", sampled_image != nullptr,
+    size_t sampled_count = 0;
+    for (const auto *binding : sampled_bindings) sampled_count += binding->resources.size();
+    sampled_infos.reserve(sampled_count);
+    Require(test.name, "dispatch", sampled_resources.empty() ||
+                sampled_resources.size() == compiled.program.info.images.size(),
+            "sampled resources must match the logical images");
+    for (const auto *sampled : sampled_bindings) {
+      Require(test.name, "dispatch", sampled_image != nullptr || !sampled_resources.empty(),
               "sampled image descriptor requested but no sampled image was "
               "provided");
-      sampled_infos.resize(sampled->resources.size());
+      const auto first_info = sampled_infos.size();
+      sampled_infos.resize(first_info + sampled->resources.size());
       std::vector<u32> mip_indices(compiled.program.info.images.size());
-      for (u32 slot = 0; slot < sampled_infos.size(); slot++) {
-        auto &info = sampled_infos[slot];
-        info.imageView = sampled_image->view;
-        info.imageLayout = sampled_image->layout;
+      for (u32 slot = 0; slot < sampled->resources.size(); slot++) {
+        auto &info = sampled_infos[first_info + slot];
         const auto resource = sampled->resources[slot];
+        const auto *source_image = sampled_resources.empty() ? sampled_image
+                                                             : &sampled_resources[resource];
+        info.imageView = source_image->view;
+        info.imageLayout = source_image->layout;
         if (compiled.program.info.images[resource].mip_mode ==
             ShaderRecompiler::IR::ImageMipMode::Dynamic) {
           const auto mip = test.sampled_image_view_base_mip + mip_indices[resource]++;
-          Require(test.name, "dispatch", mip < sampled_image->mip_levels,
+          Require(test.name, "dispatch", mip < source_image->mip_levels,
                   "sampled mip descriptor exceeds the supplied image");
           vk::ImageViewCreateInfo view{};
-          view.image = sampled_image->image;
+          view.image = source_image->image;
           view.viewType = test.sampled_image_view_type;
-          view.format = sampled_image->format;
+          view.format = source_image->format;
           view.subresourceRange = {
               vk::ImageAspectFlagBits::eColor, mip, 1,
               test.sampled_image_view_base_layer,
               test.sampled_image_view_layers != 0
                   ? test.sampled_image_view_layers
-                  : sampled_image->layers - test.sampled_image_view_base_layer};
+                  : source_image->layers - test.sampled_image_view_base_layer};
           RequireVk(test.name, "dispatch",
                     m_device.createImageView(&view, nullptr, &info.imageView),
                     "vkCreateImageView(sampled mip)");
@@ -15949,9 +15956,9 @@ public:
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
       write.dstBinding = Native(sampled->kind);
-      write.descriptorCount = static_cast<u32>(sampled_infos.size());
+      write.descriptorCount = static_cast<u32>(sampled->resources.size());
       write.descriptorType = vk::DescriptorType::eSampledImage;
-      write.pImageInfo = sampled_infos.data();
+      write.pImageInfo = sampled_infos.data() + first_info;
       writes.push_back(write);
     }
     const auto BindStorage =
@@ -34739,7 +34746,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
-void CheckIndirectImageKeySwitch() {
+void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
@@ -34877,6 +34884,17 @@ void CheckIndirectImageKeySwitch() {
               CountText(text, "OpImageSampleExplicitLod") == 1,
           "materialized images expanded into per-candidate samples");
 
+  program.info.images[root.indirect_resources[103]].dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.info.images[root.indirect_resources[103]].cube = true;
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "mixed contiguous image runs", tools.Disassemble(spirv, &text) &&
+              CountText(text, "OpImageSampleExplicitLod") == 3,
+          "one cube split the native arrays into per-image samples");
+
   program.memory_info[0].image_dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   program.memory_info[0].image_address_components = 4;
@@ -34933,6 +34951,82 @@ void CheckIndirectImageKeySwitch() {
     Require(name, "mixed sample count", samples == 3u,
             "mixed candidate switch did not retain every image");
   }
+  // Keep an unrelated native root between the null image and appended children,
+  // then select both sides of a cube boundary and the unmapped suffix on the GPU.
+  root.indirect_resources = {0u, 2u, 3u, 4u, 5u, 6u};
+  root.indirect_search_iterations = 0;
+  program.info.images.assign(7, candidate);
+  program.info.images[0] = root;
+  program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
+  program.info.images[4].dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.info.images[4].cube = true;
+  for (u32 component = 0; component < 4u; ++component) {
+    constexpr std::array values{1.5f, 1.5f, 0.0f, 0.0f};
+    address.SetArg(component, Value(std::bit_cast<u32>(values[component])));
+  }
+  auto &byte_offset = *block->PrependNewInst(
+      std::next(block->begin()), ValueOpcode::IMul32, {Value(&key), Value(4u)});
+  image.SetArg(0, Value(&byte_offset));
+  auto &output = block->AppendNewInst(ValueOpcode::GetBufferResource,
+                                      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  output.SetFlags<u32>(0u);
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+  auto &store = block->AppendNewInst(
+      ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(&byte_offset), Value(0u), Value(&sample_x), Value(true)});
+  store.SetFlags(MemoryFlags{1u, 0u});
+  program.info.buffers.push_back({.packed_stride = 1, .written = true});
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+
+  TestCase test;
+  test.name = "IndirectImageContiguousRuns";
+  CompiledShader compiled;
+  compiled.program = std::move(program);
+  compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+  constexpr std::array ordinals{0u, 1u, 2u, 3u, 4u, 5u, 2u, 0u};
+  compiled.resources.flattened_srt.push_back(ordinals.size());
+  compiled.resources.flattened_srt.insert(compiled.resources.flattened_srt.end(),
+                                          ordinals.begin(), ordinals.end());
+  std::vector<VulkanHarness::Image> textures;
+  for (u32 resource = 0; resource < 7u; ++resource) {
+    const auto layers = resource == 4u ? 6u : 1u;
+    std::vector<u32> pixels(layers * 4u, std::bit_cast<u32>(float(resource)));
+    textures.push_back(vulkan.CreateImageMips(
+        test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {pixels}, 4u,
+        vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+        resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
+  }
+  const auto native_sampler = vulkan.CreateSampler(test.name);
+  for (const u32 wave_size : {32u, 64u}) {
+    compute.wave_size = wave_size;
+    compute.host_subgroup_size = vulkan.SubgroupSize();
+    compute.threads_num[0] = wave_size;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compiled.program.wave_size = wave_size;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    ValidateSpirv(test.name, compiled.spirv);
+    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+    Require(test.name, "native array run samples", tools.Disassemble(compiled.spirv, &text) &&
+                CountText(text, "OpImageSampleExplicitLod") == 3u * halves,
+            "mixed runs expanded into per-image samples");
+    test.initial.assign(wave_size, 0xdeadbeefu);
+    test.expected.assign(wave_size, 0u);
+    for (u32 lane = 0; lane < ordinals.size(); ++lane) {
+      test.expected[lane] = std::bit_cast<u32>(float(root.indirect_resources[ordinals[lane]]));
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                    native_sampler, textures);
+    const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+    vulkan.DestroyBuffer(&buffer);
+    CompareWords(test, "root, native slots, cube and mapping bounds", test.expected, actual);
+  }
+  vulkan.Device().destroySampler(native_sampler);
+  for (auto &texture : textures) vulkan.DestroyImage(&texture);
+  std::printf("[compute] %-32s ok\n", test.name);
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -42739,8 +42833,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
-    CheckIndirectImageKeySwitch();
     VulkanHarness vulkan;
+    CheckIndirectImageKeySwitch(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -42903,7 +42997,7 @@ int main(int argc, char **argv) {
   CheckIndirectBufferStore(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
-  CheckIndirectImageKeySwitch();
+  CheckIndirectImageKeySwitch(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
