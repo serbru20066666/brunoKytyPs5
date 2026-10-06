@@ -195,7 +195,8 @@ public:
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs,
 	                              vk::ImageAspectFlags feedback_aspects = {},
-	                              bool                 may_defer        = false);
+	                              bool                 may_defer        = false,
+	                              bool                 targets_kept     = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -282,6 +283,19 @@ private:
 	// mostly use the same pipeline, and comparing keys is cheaper than hashing one.
 	GraphicsPipelineKey m_last_graphics_key;
 	Pipeline*           m_last_graphics_pipeline = nullptr;
+	// What that key was built from besides the registers and the targets, and the target state
+	// serial then (see g_target_state_serial): a draw with the previous draw's targets and these
+	// unchanged has its key, and takes the pipeline without building one.
+	struct LastGraphicsInputs {
+		uint64_t              state_serial = 0;
+		vk::PrimitiveTopology topology {};
+		bool                  primitive_restart = false;
+		bool                  pixel_active      = false;
+		bool                  alpha_remap       = false;
+		bool                  sample_shading    = false;
+		bool                  valid             = false;
+	};
+	LastGraphicsInputs m_last_graphics_inputs;
 	// Asynchronous pipelines: draws skipped so far for each pipeline whose parts are compiling.
 	std::unordered_map<GraphicsPipelineKey, uint32_t, GraphicsPipelineKeyHash> m_deferred_draws;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;

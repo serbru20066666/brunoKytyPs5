@@ -2053,7 +2053,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return m_context.GetPipelineCache().GetGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-		    state.programs, feedback_aspects, may_defer);
+		    state.programs, feedback_aspects, may_defer, memo_taken);
 	}();
 	if (found_pipeline == nullptr) {
 		return;

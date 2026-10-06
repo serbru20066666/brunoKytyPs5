@@ -1791,7 +1791,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs,
-    vk::ImageAspectFlags feedback_aspects, bool may_defer) {
+    vk::ImageAspectFlags feedback_aspects, bool may_defer, bool targets_kept) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1806,6 +1806,52 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 
 	Common::LockGuard lock(m_mutex);
 	auto&             ctx = command.GetRegisters();
+
+	// The previous draw's pipeline for a draw with its targets (see LastGraphicsInputs): the key
+	// is half a kilobyte to clear, fill and compare. KYTY_DEBUG_AB=pipelinekeep builds the key for
+	// every draw in every other window; KYTY_VERIFY_PIPELINE_KEEP=1 builds it too and compares.
+	static const bool keep_ab     = AbSelected("pipelinekeep");
+	static const bool keep_verify = std::getenv("KYTY_VERIFY_PIPELINE_KEEP") != nullptr;
+	Pipeline*         kept        = nullptr;
+	if (const auto& last = m_last_graphics_inputs;
+	    targets_kept && last.valid && m_last_graphics_pipeline != nullptr && !feedback_aspects &&
+	    last.state_serial == g_target_state_serial && last.topology == topology &&
+	    last.primitive_restart == primitive_restart_enable && last.pixel_active == ps_active &&
+	    (!ps_active || (last.alpha_remap == ps_input_info->alpha_blend_source_remap &&
+	                    last.sample_shading == ps_input_info->ps_sample_shading)) &&
+	    !(keep_ab && AbFeatureOff())) {
+		const auto& key  = m_last_graphics_key;
+		bool        same = key.ps_shader_id == (ps_active ? pixel_program.id : 0);
+		for (uint32_t i = 0; i < programs.vertex.size() && same; i++) {
+			same = key.vertex_shader_ids[i] == programs.vertex[i].id;
+		}
+		if (same && vs_input_info.stage.program->stage != ShaderType::Mesh) {
+			const auto& input = key.vertex_input;
+			same = input.binding_count == vs_input_info.buffers_num &&
+			       input.attribute_count == vs_input_info.resources_num;
+			for (int i = 0; i < vs_input_info.buffers_num && same; i++) {
+				const auto& buffer = vs_input_info.buffers[i];
+				same = input.bindings[i].stride == buffer.stride &&
+				       input.bindings[i].instance == (buffer.fetch_index != 0);
+			}
+			for (int i = 0; i < vs_input_info.resources_num && same; i++) {
+				const auto binding = vs_input_info.resources_dst[i].buffer_index;
+				same = binding >= 0 && binding < vs_input_info.buffers_num &&
+				       input.attributes[i].binding == static_cast<uint8_t>(binding) &&
+				       input.attributes[i].offset ==
+				           static_cast<uint32_t>(vs_input_info.resources[i].Base48() -
+				                                 vs_input_info.buffers[binding].addr);
+			}
+		} else if (same) {
+			same = key.vertex_input.binding_count == 0 && key.vertex_input.attribute_count == 0;
+		}
+		if (same && !m_last_graphics_pipeline->optimize_pending) {
+			if (!keep_verify) [[likely]] {
+				return m_last_graphics_pipeline;
+			}
+			kept = m_last_graphics_pipeline;
+		}
+	}
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -1958,6 +2004,16 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		m_last_graphics_key      = key;
 		m_last_graphics_pipeline = found;
 	}
+	if (kept != nullptr && kept != found) [[unlikely]] {
+		EXIT("pipeline keep: the kept pipeline is not the one its key finds\n");
+	}
+	m_last_graphics_inputs = {.state_serial      = g_target_state_serial,
+	                          .topology          = topology,
+	                          .primitive_restart = primitive_restart_enable,
+	                          .pixel_active      = ps_active,
+	                          .alpha_remap = ps_active && ps_input_info->alpha_blend_source_remap,
+	                          .sample_shading = ps_active && ps_input_info->ps_sample_shading,
+	                          .valid          = found != nullptr && found == m_last_graphics_pipeline};
 	if (found != nullptr) {
 		if (found->optimize_pending) [[unlikely]] {
 			InstallOptimizedPipeline(*found, command);
