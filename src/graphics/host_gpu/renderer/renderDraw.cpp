@@ -1284,6 +1284,42 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    Config::AsyncPipelinesEnabled() ? ProgramWait::Defer : ProgramWait::Wait);
 }
 
+// KYTY_DEBUG_TARGET_STATS=1 prints, every 5 s, how many draws a second went to each depth target
+// (its address and first slice), with or without colour targets and a pixel shader: which passes
+// a frame's draws belong to.
+static void AccountTarget(const HW::DepthRenderTarget& z, uint32_t color_count, bool ps_active) {
+	static const bool enabled = std::getenv("KYTY_DEBUG_TARGET_STATS") != nullptr;
+	if (!enabled) [[likely]] {
+		return;
+	}
+	struct Key {
+		uint64_t address;
+		uint32_t slice;
+		uint32_t colors;
+		bool     pixel;
+		bool     operator<(const Key& o) const {
+			return std::tie(address, slice, colors, pixel) <
+			       std::tie(o.address, o.slice, o.colors, o.pixel);
+		}
+	};
+	static std::map<Key, uint64_t> totals;
+	static auto                    window_start = std::chrono::steady_clock::now();
+	totals[{z.z_write_base_addr, z.depth_view.slice_start, color_count, ps_active}]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) {
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - window_start).count();
+	for (const auto& [key, count]: totals) {
+		std::printf("target-stats: depth=%010" PRIx64 " slice=%-3u colors=%u ps=%d draws/s=%.0f\n",
+		            key.address, key.slice, key.colors, key.pixel ? 1 : 0,
+		            static_cast<double>(count) / seconds);
+	}
+	std::fflush(stdout);
+	totals.clear();
+	window_start = now;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -1350,6 +1386,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::Targets);
+	AccountTarget(buffer.GetRegisters().GetDepthRenderTarget(), state.color_count, state.ps_active);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
