@@ -57,6 +57,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "ui_configuration_list_widget.h"
 
@@ -243,6 +244,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::edit_configuration);
 	connect(m_ui->delete_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::delete_configuartion);
+	connect(m_ui->trophy_overview_button, &QToolButton::clicked, this,
+	        &ConfigurationListWidget::ViewTrophyOverview);
 	connect(m_ui->cfgs_list, &QTreeWidget::currentItemChanged, this,
 	        &ConfigurationListWidget::SelectItem);
 	connect(m_ui->cfgs_list, &QTreeWidget::itemDoubleClicked, this,
@@ -295,6 +298,7 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
 	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
 	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
+	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
 }
 
 void ConfigurationListWidget::WriteSettings() {
@@ -870,6 +874,20 @@ void ConfigurationListWidget::ViewTrophies() {
 
 	const auto config = CreateConfiguration(*item);
 	TrophyViewerDialog::ShowForGame(config.get(), m_runtime_directory, this);
+}
+
+void ConfigurationListWidget::ViewTrophyOverview() {
+	std::vector<std::unique_ptr<Configuration>> configurations;
+	std::vector<const Configuration*>            games;
+	configurations.reserve(static_cast<size_t>(m_ui->cfgs_list->topLevelItemCount()));
+	games.reserve(static_cast<size_t>(m_ui->cfgs_list->topLevelItemCount()));
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); ++index) {
+		const auto* item =
+		    static_cast<const ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		configurations.push_back(CreateConfiguration(*item));
+		games.push_back(configurations.back().get());
+	}
+	TrophyViewerDialog::ShowOverview(games, m_runtime_directory, this);
 }
 
 void ConfigurationListWidget::open_game_folder() {
