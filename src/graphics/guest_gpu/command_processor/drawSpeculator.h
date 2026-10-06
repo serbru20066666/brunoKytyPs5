@@ -76,6 +76,7 @@ private:
 	[[nodiscard]] bool Interrupted(uint64_t epoch) const;
 	// GPU thread: whether `draw`'s reads still give what they gave (see Take).
 	[[nodiscard]] bool ReadsCurrent(const SpeculatedDraw& draw);
+	void               PrefetchNext();
 
 	RenderContext& m_renderer;
 	const int      m_interrupt_event_id;

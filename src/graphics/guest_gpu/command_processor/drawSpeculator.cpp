@@ -162,7 +162,52 @@ void DrawSpeculator::Restart(const CommandProcessor& processor, std::span<const 
 	m_stats.restarts.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Asks for the cache lines of [data, data + bytes) without waiting for them.
+static void Prefetch(const void* data, size_t bytes) {
+	const auto* line = static_cast<const char*>(data);
+	for (size_t offset = 0; offset < bytes; offset += 64) {
+		_mm_prefetch(line + offset, _MM_HINT_T0);
+	}
+}
+
+// What the GPU thread reads of a speculated draw was written by the worker, on another core, and
+// every line of it has to cross over: fetched as the draw is taken, that wait is most of what
+// taking it costs. So the draw after the one taken is asked for a draw ahead (and the slot after
+// that one, to know by then whether it is ready), and its lines arrive while this draw is drawn.
+// KYTY_DEBUG_AB=specfetch asks for nothing in every other window.
+void DrawSpeculator::PrefetchNext() {
+	static const bool ab = AbSelected("specfetch");
+	if (ab && AbFeatureOff()) {
+		return;
+	}
+	_mm_prefetch(reinterpret_cast<const char*>(&m_ring[(m_gpu_seq + 2) % RingSize]), _MM_HINT_T0);
+	const auto& next = m_ring[(m_gpu_seq + 1) % RingSize];
+	// The worker leaves a ready slot alone, so its pointers can be followed.
+	if (next.state.load(std::memory_order_acquire) != Ready) {
+		return;
+	}
+	const auto& draw = next.draw;
+	Prefetch(&next, 128);
+	for (const auto& stage: draw.stages) {
+		Prefetch(&stage, sizeof(stage));
+		if (!stage.user_data.empty()) {
+			Prefetch(stage.user_data.data(), 64);
+		}
+	}
+	const auto& prepared = draw.prepared;
+	const auto* vertex   = reinterpret_cast<const char*>(&prepared.vertex_info);
+	Prefetch(&prepared, static_cast<size_t>(vertex - reinterpret_cast<const char*>(&prepared)) + 256);
+	Prefetch(&prepared.vertex_info.resources_dst, 128);
+	Prefetch(&prepared.vertex_info.buffers, 128);
+	Prefetch(&prepared.vertex_info.stage,
+	         static_cast<size_t>(vertex + sizeof(prepared.vertex_info) -
+	                             reinterpret_cast<const char*>(&prepared.vertex_info.stage)));
+	Prefetch(&prepared.pixel_info,
+	         sizeof(prepared.pixel_info) + sizeof(prepared.vertex_params) + sizeof(prepared.pixel_params));
+}
+
 SpeculatedDraw* DrawSpeculator::Take(const uint32_t* packet) {
+	PrefetchNext();
 	auto&    slot     = m_ring[m_gpu_seq % RingSize];
 	uint32_t expected = Ready;
 	if (!slot.state.compare_exchange_strong(expected, Taken, std::memory_order_acq_rel)) {
