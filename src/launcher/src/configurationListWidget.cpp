@@ -1,5 +1,6 @@
 #include "configurationListWidget.h"
 
+#include "cheatFile.h"
 #include "common/archive.h"
 #include "compatibilityDatabase.h"
 #include "configuration.h"
@@ -1047,7 +1048,7 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 		        }
 	        });
 	action_patches->setVisible(item != nullptr &&
-	                           PatchesDialog::IsSupportedTitleId(item->GetInfo().title_id));
+	                           Cheats::IsSupportedTitleId(item->GetInfo().title_id));
 	QAction* action_remove_save_data =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
 	                   tr("Remove save data..."), this, SLOT(remove_save_data()));
