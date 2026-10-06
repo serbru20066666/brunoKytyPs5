@@ -96,7 +96,6 @@ inline BindingRepeats g_binding_repeats;
 // work) do nothing.
 struct DrawPhaseTimer {
 	static constexpr uint64_t AllDraws = ~uint64_t {0};
-	static constexpr uint64_t DepthOnlyDraws = ~uint64_t {0} - 1;
 	enum Phase : uint32_t {
 		Setup,            // Draw entry up to shader lookup.
 		VertexParams,     // Vertex stage registers and code hash.

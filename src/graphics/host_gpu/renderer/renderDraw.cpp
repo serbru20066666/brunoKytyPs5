@@ -56,7 +56,6 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
-#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1765,137 +1764,12 @@ void RenderExecutor::RecordPendingWrites(std::span<PreparedBindings* const> stag
 	}
 }
 
-// Shadow maps at half rate (KYTY_SHADOW_HALF_RATE=1). A game renders every layer of its shadow
-// map array every frame, and in ASTRO's PLAYROOM that is six draws in ten. A layer whose light and
-// first mesh have not moved shows the same thing as a frame ago, save for what moves in it. Such a
-// layer is drawn every other frame: on the frames between, its draws and its clear are dropped and
-// it keeps the previous frame's contents, so a moving shadow in it updates at half the frame rate.
-// A layer is one slice of a depth target that is drawn to with no colour written; only targets
-// seen with more than one slice count, which leaves the scene's own depth buffer alone. Whether
-// it has moved is judged on the frames it is drawn: by the contents of the buffers its first draw
-// after the clear binds (the view and the first mesh's transform), against those of the last
-// time. A layer that fails the test is drawn every frame until it passes again.
-namespace ShadowRate {
-
-struct Slice {
-	uint64_t frame       = UINT64_MAX; // The frame of its last draw, drawn or dropped.
-	uint64_t rendered    = UINT64_MAX - 2;
-	uint64_t signature[2] {1, 2};
-	bool     skip        = false;
-	bool     sign        = false; // Its next draw that is not a clear gives the signature.
-};
-
-static bool Enabled() {
-	static const bool enabled = std::getenv("KYTY_SHADOW_HALF_RATE") != nullptr;
-	return enabled;
-}
-
-static std::unordered_map<uint64_t, Slice> g_slices;
-static std::vector<uint64_t>               g_arrays;
-static uint64_t                            g_last_key  = UINT64_MAX;
-static Slice*                              g_last      = nullptr;
-static Slice*                              g_signing   = nullptr;
-static uint64_t                            g_dropped   = 0;
-static uint64_t                            g_drawn     = 0;
-static uint64_t                            g_layers[2] {};
-
-static void Report() {
-	static const bool enabled = std::getenv("KYTY_DEBUG_SHADOW_RATE") != nullptr;
-	static auto       start   = std::chrono::steady_clock::now();
-	const auto        now     = std::chrono::steady_clock::now();
-	if (!enabled || now - start < std::chrono::seconds(5)) {
-		return;
-	}
-	std::printf("shadow-rate: layers drawn=%" PRIu64 " kept=%" PRIu64 " | draws drawn=%" PRIu64
-	            " dropped=%" PRIu64 "\n",
-	            g_layers[0], g_layers[1], g_drawn, g_dropped);
-	std::fflush(stdout);
-	g_layers[0] = g_layers[1] = g_drawn = g_dropped = 0;
-	start = now;
-}
-
-// Whether the draw about to be prepared is dropped.
-static bool Drop(const HW::Context& ctx) {
-	g_signing     = nullptr;
-	const auto& z = ctx.GetDepthRenderTarget();
-	const auto  address = z.z_write_base_addr;
-	if (address == 0 || DrawColorWriteMask(ctx) != 0) {
-		return false;
-	}
-	const auto slice = z.depth_view.slice_start;
-	const auto key   = address ^ (uint64_t {slice} << 52u);
-	if (key != g_last_key) {
-		if (slice != 0 && std::ranges::find(g_arrays, address) == g_arrays.end()) {
-			g_arrays.push_back(address);
-		}
-		g_last_key = key;
-		g_last     = std::ranges::find(g_arrays, address) != g_arrays.end() ? &g_slices[key] : nullptr;
-	}
-	if (g_last == nullptr) {
-		return false;
-	}
-	auto&      layer = *g_last;
-	const auto frame = DrainStats::GameFrames();
-	if (layer.frame != frame) {
-		layer.skip  = layer.rendered + 1 == frame && layer.signature[0] == layer.signature[1];
-		layer.frame = frame;
-		if (!layer.skip) {
-			layer.rendered = frame;
-			layer.sign     = true;
-		}
-		g_layers[layer.skip ? 1 : 0]++;
-		Report();
-	}
-	if (layer.skip) {
-		g_dropped++;
-		return true;
-	}
-	g_drawn++;
-	if (layer.sign && !ctx.GetRenderControl().depth_clear_enable) {
-		g_signing = &layer;
-	}
-	return false;
-}
-
-// The signature of the layer being drawn, from its vertex stage's buffers.
-static void Sign(const ShaderStageRuntime& stage) {
-	auto& layer   = *g_signing;
-	g_signing     = nullptr;
-	layer.sign    = false;
-	uint64_t hash = 0x9e3779b97f4a7c15ull;
-	bool     read = stage && stage.resources != nullptr;
-	if (read) {
-		for (const auto& value: stage.resources->buffers) {
-			ShaderBufferResource buffer {};
-			std::memcpy(buffer.fields, value.dwords.data(), sizeof(buffer.fields));
-			const auto size = std::min<uint64_t>(buffer.GetSize(), 1024);
-			uint8_t    data[1024];
-			if (size == 0) {
-				continue;
-			}
-			if (!LibKernel::Memory::TryReadBacking(buffer.Base48(), data, size)) {
-				read = false;
-				break;
-			}
-			hash = XXH3_64bits_withSeed(data, size, hash ^ size);
-		}
-	}
-	static uint64_t unread = 3;
-	layer.signature[0] = layer.signature[1];
-	layer.signature[1] = read ? hash : ++unread; // Unread: equal to nothing, so drawn every frame.
-}
-
-} // namespace ShadowRate
-
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
-	if (ShadowRate::g_signing != nullptr) [[unlikely]] {
-		ShadowRate::Sign(state.vertex_info[0].stage);
-	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool draw_logged = DrawLog::Hash() != 0 && state.ps_active &&
@@ -2422,10 +2296,6 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance, args.indirect_args};
-	if (ShadowRate::Enabled() && ShadowRate::Drop(buffer.GetRegisters())) {
-		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
-		return;
-	}
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;

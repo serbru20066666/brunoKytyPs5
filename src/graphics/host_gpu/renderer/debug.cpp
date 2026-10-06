@@ -629,9 +629,6 @@ uint64_t DrawPhaseTimer::Hash() {
 		if (text == nullptr) {
 			return uint64_t {0};
 		}
-		if (std::strcmp(text, "depth") == 0) {
-			return DepthOnlyDraws; // The draws without a pixel shader: depth and shadow passes.
-		}
 		return std::strcmp(text, "all") == 0 ? AllDraws : std::strtoull(text, nullptr, 16);
 	}();
 	return hash;
@@ -1002,8 +999,7 @@ void DrawPhaseTimer::End(uint64_t pixel_hash) {
 	// DRAW_INDEX_AUTO draws, also on their own (see Begin).
 	static std::array<uint64_t, Count> auto_totals {};
 	static uint64_t                    auto_draws = 0;
-	if (pixel_hash == Hash() || Hash() == AllDraws ||
-	    (Hash() == DepthOnlyDraws && pixel_hash == 0)) {
+	if (pixel_hash == Hash() || Hash() == AllDraws) {
 		for (uint32_t i = 0; i < Count; i++) {
 			totals[i] += current[i];
 		}
