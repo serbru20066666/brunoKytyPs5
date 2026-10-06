@@ -672,6 +672,58 @@ StreamBuffer& BufferCache::ActiveStream() noexcept {
 	return m_stream_device != nullptr && AbFeatureOff() ? *m_stream_device : m_stream_buffer;
 }
 
+namespace GuestCopies {
+namespace {
+
+// Handed over by the GPU thread (only it counts them) and made by the recording thread.
+uint64_t              g_handed = 0;
+std::atomic<uint64_t> g_made {0};
+
+struct Copy {
+	uint8_t* destination = nullptr;
+	uint64_t address     = 0;
+	uint64_t size        = 0;
+};
+
+// On the recording thread. The backing has no page protection, so the copy cannot fault, and it
+// holds what the CPU wrote even where the GPU has written since.
+void Run(VkCommandBuffer /*buffer*/, const uint8_t* payload) {
+	const auto& copy = *reinterpret_cast<const Copy*>(payload);
+	if (!LibKernel::Memory::TryReadBacking(copy.address, copy.destination, copy.size)) {
+		// The guest unmapped memory a draw still used.
+		std::memset(copy.destination, 0, copy.size);
+	}
+	g_made.fetch_add(1, std::memory_order_release);
+}
+
+} // namespace
+
+bool Pending() noexcept {
+	return g_handed != g_made.load(std::memory_order_acquire);
+}
+
+void Finish() {
+	if (Pending()) {
+		DrainGpuThreadCommands();
+	}
+}
+
+// GPU thread: has the thread recording `buffer` copy `size` guest bytes at `address`, which have
+// a backing, to `destination`; false when its recording is not deferred, and the caller copies.
+static bool HandOver(VkCommandBuffer buffer, uint8_t* destination, uint64_t address,
+                     uint64_t size) {
+	auto* payload = ReserveRecordedCall(buffer, sizeof(Copy));
+	if (payload == nullptr) {
+		return false;
+	}
+	::new (payload) Copy {destination, address, size};
+	g_handed++;
+	CommitRecordedCall(Run);
+	return true;
+}
+
+} // namespace GuestCopies
+
 // KYTY_DEBUG_STREAM_REUSE=0 copies every stream range every time; KYTY_DEBUG_AB=streamreuse
 // alternates.
 static bool StreamReuseEnabled() {
@@ -693,6 +745,8 @@ bool BufferCache::VerifyStreamReuse(const StreamCopy& copy) {
 	}
 	thread_local std::vector<uint8_t> bytes;
 	bytes.resize(copy.size);
+	// The recording thread may not have made the copy yet.
+	GuestCopies::Finish();
 	const bool  read = Libs::LibKernel::Memory::TryReadBacking(copy.vaddr, bytes.data(), copy.size);
 	const auto* kept = copy.stream->Mapped().data() + copy.offset;
 	static std::atomic<uint64_t> checked {0};
@@ -751,12 +805,26 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		auto& stream          = ActiveStream();
 		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			// No GPU-written bytes in the range (IsRegionOnlyCpuModified), so no read protection
-			// either: a plain copy from guest memory, without the backing-store lookup.
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			// These copies were 385 MiB a second and 6% of the GPU thread's time in Astro's
+			// Playroom's hub, while the thread that records its commands was idle 95% of the
+			// time: that thread makes the copy, from the range's backing (see GuestCopies).
+			// Whether the range has one is remembered with its last copy; a range asked for the
+			// first time is looked up. KYTY_DEBUG_AB=defercopy copies here in alternate windows.
+			static const bool defer_ab = AbSelected("defercopy");
+			const bool        known    =
+			    copy_slot != nullptr && copy_slot->vaddr == vaddr && copy_slot->size == size;
+			const bool backed = known ? copy_slot->backed
+			                          : LibKernel::Memory::BackingContains(vaddr, size);
+			if ((defer_ab && AbFeatureOff()) || !backed ||
+			    !GuestCopies::HandOver(command.Handle(), mapped, vaddr, size)) {
+				// No GPU-written bytes in the range (IsRegionOnlyCpuModified), so no read
+				// protection either: a plain copy from guest memory.
+				std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			}
 			stream.Commit();
 			RecordUpload(UploadSource::Stream, vaddr, size);
-			if (copy_slot != nullptr && epoch != 0) {
+			if (copy_slot != nullptr) {
+				// Without an epoch the copy is not kept; the slot still remembers the backing.
 				*copy_slot = {.vaddr        = vaddr,
 				              .size         = size,
 				              .epoch        = epoch,
@@ -764,7 +832,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				              .gpu_writes   = m_gpu_dirty_generation,
 				              .image_writes = m_texture_cache.GpuModifiedGeneration(),
 				              .stream       = &stream,
-				              .offset       = offset};
+				              .offset       = offset,
+				              .backed       = backed};
 			}
 			return {&stream, offset};
 		}

@@ -114,6 +114,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadBacking can read the whole range now.
+bool                   BackingContains(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // Reads guest memory for Thread_Gpu's own use. Bytes the GPU has not written are read without
 // faulting even when GPU writes elsewhere protect their page; GPU-written bytes still read back.

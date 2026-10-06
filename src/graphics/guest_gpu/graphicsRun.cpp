@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/renderer/threadSampler.h"
@@ -930,6 +931,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 
 	ProcessPm4(execution);
+	// The submission is over or blocked, which the guest can see.
+	GuestCopies::Finish();
 	DrainStats::SetPm4Op(DrainStats::NoPm4Op);
 	if (execution.m_buffer_stack.empty()) {
 		m_last_submission_created = pipelines.GraphicsPipelinesCreated() +
@@ -968,6 +971,27 @@ static bool IsDrawOpcode(uint32_t opcode) {
 
 static bool IsDispatchOpcode(uint32_t opcode) {
 	return opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_DISPATCH_INDIRECT;
+}
+
+// Packets that neither write guest memory nor tell the guest how far the GPU got: guest copies
+// the recording thread has yet to make may wait across them (see GuestCopies). Draws, the
+// register writes and index state between them, and the markers that classify user data.
+static bool PassesGuestCopies(uint32_t opcode, uint32_t header) {
+	switch (opcode) {
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES: return true;
+		case Pm4::IT_NOP: return KYTY_PM4_R(header) == Pm4::R_ZERO;
+		default: return IsDrawOpcode(opcode);
+	}
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
@@ -1053,6 +1077,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (GuestCopies::Pending() && !PassesGuestCopies(opcode, packet_header)) {
+			GuestCopies::Finish();
+		}
 		const bool     draw     = IsDrawOpcode(opcode) || IsDispatchOpcode(opcode);
 		const auto&    pipelines = m_renderer.GetPipelineCache();
 		const uint64_t pipelines_before =

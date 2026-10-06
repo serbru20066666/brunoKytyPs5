@@ -29,6 +29,18 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// Guest memory that the thread recording the GPU thread's commands copies for it (see
+// BufferCache::ObtainBuffer). The copy is made in order with the commands, so before anything
+// that uses it is submitted, but after the GPU thread has gone on. The GPU thread therefore
+// finishes them before a packet that can write guest memory or tell the guest how far the GPU
+// got (the guest may then write what was to be copied), and before it stops processing.
+namespace GuestCopies {
+// GPU thread: whether the recording thread still has copies to make.
+[[nodiscard]] bool Pending() noexcept;
+// GPU thread: waits until it has made them all.
+void               Finish();
+} // namespace GuestCopies
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -221,6 +233,9 @@ private:
 		uint64_t image_writes = 0; // TextureCache::GpuModifiedGeneration.
 		Buffer*  stream       = nullptr;
 		uint64_t offset       = 0;
+		// Whether the range had a backing when it was last looked up: the recording thread
+		// copies from the backing (see GuestCopies).
+		bool     backed       = false;
 	};
 	static constexpr size_t StreamCopySlots = 4096;
 	std::vector<StreamCopy> m_stream_copies = std::vector<StreamCopy>(StreamCopySlots);
