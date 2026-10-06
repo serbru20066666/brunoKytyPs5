@@ -434,8 +434,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				mask &= mask - 1u;
 			}
 		} else return false;
-		std::ranges::sort(keys);
-		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		if (selector != nullptr) {
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		}
 	}
 
 	const auto mapping_offset = snapshot.flattened_srt.size();

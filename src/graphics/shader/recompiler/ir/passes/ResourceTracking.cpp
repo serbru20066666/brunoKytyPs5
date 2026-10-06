@@ -1657,7 +1657,7 @@ private:
 				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4)))) return false;
 				table_guard = read->Arg(4);
 			}
-			if (memory == nullptr || memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
+			if (memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
 			    !MemoryIndexBelongsTo(memory_index, *read)) {
 				return false;
 			}
