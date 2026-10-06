@@ -13,8 +13,8 @@ gráfica de la PS5.
 | --- | --- |
 | Equipo de pruebas | Radeon RX 6800 XT, Intel Core i7-14700KF, Windows 11 |
 | Juego de referencia | ASTRO's PLAYROOM (PPSA01325) |
-| Punto de partida | 34–43 fps en juego (GPU Jungle y CPU Plaza) |
-| Ahora (0.2.0) | ≈50 fps en GPU Jungle, ≈52 fps en CPU Plaza |
+| Punto de partida | 34–44 fps en juego (GPU Jungle y CPU Plaza) |
+| Ahora (0.2.0) | ≈50 fps en GPU Jungle y en CPU Plaza |
 | Meta | 60 fps estables |
 
 Todo a 3840×2160, que es como dibuja el juego, y sin generación de cuadros.
@@ -23,10 +23,43 @@ Todo a 3840×2160, que es como dibuja el juego, y sin generación de cuadros.
 
 Versión **0.2.0**. Medido en la RX 6800 XT, con el mismo juego y en el mismo sitio antes y después:
 
-| Zona | 0.1.0 | 0.2.0 | Qué limita ahora |
+![Cuadros por segundo antes y después](docs/screenshots/fps-antes-y-despues.png)
+
+| Zona | Antes | 0.2.0 | Qué limita ahora |
 | --- | --- | --- | --- |
-| GPU Jungle (hierba, al empezar) | 34 fps | ≈50 fps | El procesador |
-| CPU Plaza | ≈52 fps | ≈52 fps | La tarjeta gráfica (≈18 ms por cuadro) |
+| GPU Jungle (hierba, al empezar) | 34,0 fps (0.1.0) | 49,6 fps | El procesador |
+| CPU Plaza | 43,6 fps (base heredada) · 51,1 fps (0.1.0) | 50,3 fps | La tarjeta gráfica (≈18 ms por cuadro) |
+
+Los fps son los que escribe el emulador en el título de la ventana. «Base heredada» es el fork
+tal como partió de KytyPS5 y BryKytyPS5 (commit `a9e1ae5`); 0.1.0 ya traía las primeras mejoras
+de carga de la tarjeta, que son las que se notan en la plaza. Las de 0.2.0 son de procesador y se
+notan donde el procesador era el límite: la selva. En la plaza 0.1.0 y 0.2.0 dan lo mismo, dentro
+de lo que varía la medida de una partida a otra.
+
+### GPU Jungle: de 34 a ≈50 fps
+
+| 0.1.0 · 34,0 fps | 0.2.0 · 49,6 fps |
+| --- | --- |
+| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.2.0](docs/screenshots/astro-jungla-0.2.0.jpg) |
+
+La captura de 0.2.0 es solo del área de juego, sin barra de título: sus 49,6 fps se leyeron del
+título durante esa misma partida. La imagen es igual que antes; lo que cambia es la velocidad.
+
+### CPU Plaza: de 43,6 a ≈50 fps
+
+| Base heredada · 43,6 fps | 0.2.0 · 50,3 fps |
+| --- | --- |
+| ![CPU Plaza con la base heredada](docs/screenshots/astro-plaza-origen-43fps.jpg) | ![CPU Plaza con 0.2.0](docs/screenshots/astro-plaza-0.2.0-50fps.jpg) |
+
+### Generación de cuadros (opcional)
+
+![CPU Plaza con generación de cuadros](docs/screenshots/astro-plaza-0.2.0-generacion-de-cuadros.jpg)
+
+Con AMD FSR 3 se muestra un cuadro generado entre cada dos del juego. En la plaza a 3840×2160,
+con el juego limitado a 50 fps: 47 fps del juego y 94 cuadros mostrados por segundo (se ve en el
+título: `game fps` y `presents/s`). Generar los cuadros cuesta algo de tarjeta, por eso el juego
+no llega a los 50. Suaviza el movimiento; no hace que el juego vaya más rápido. Está apagada por
+defecto y se activa por juego en el lanzador o con `--frame-generation true`.
 
 De dónde sale la mejora:
 
@@ -41,8 +74,6 @@ De dónde sale la mejora:
 
 Además:
 
-- Generación de cuadros con AMD FSR 3, opcional y apagada por defecto. Suaviza el movimiento, no
-  hace que el juego vaya más rápido.
 - En el lanzador, cada juego tiene casillas para la generación de cuadros y para la lectura
   relajada, y ASTRO's PLAYROOM recibe sus ajustes recomendados la primera vez que aparece.
 
