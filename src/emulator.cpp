@@ -167,6 +167,23 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+// Profile-guided optimization: a build instrumented with -fprofile-generate writes its profile
+// from an atexit handler, which quick_exit (how the emulator leaves, see Execute) does not run.
+// The profile runtime's writer is called from a quick_exit handler instead; a build without the
+// runtime links the name to a function that does nothing.
+#if defined(_WIN32) && defined(__clang__)
+extern "C" int __llvm_profile_write_file(void);
+extern "C" int KytyNoProfileToWrite(void) {
+	return 0;
+}
+#pragma comment(linker, "/alternatename:__llvm_profile_write_file=KytyNoProfileToWrite")
+static void WriteExecutionProfile() {
+	(void)__llvm_profile_write_file();
+}
+#else
+static void WriteExecutionProfile() {}
+#endif
+
 static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
@@ -205,6 +222,8 @@ void Run(const RunOptions& options) {
 
 	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
+	EXIT_NOT_IMPLEMENTED(ok != 0);
+	ok = at_quick_exit(WriteExecutionProfile);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
