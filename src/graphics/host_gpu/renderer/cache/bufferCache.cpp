@@ -632,6 +632,16 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+namespace GuestCopies {
+static bool HandOver(VkCommandBuffer buffer, uint8_t* destination, uint64_t address,
+                     uint64_t size);
+// KYTY_DEBUG_AB=deferupload: the GPU thread makes the staging copies itself in alternate windows.
+static bool StagingEnabled() {
+	static const bool ab = AbSelected("deferupload");
+	return !(ab && AbFeatureOff());
+}
+} // namespace GuestCopies
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -643,10 +653,19 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		// Copying on several threads measured no faster (A/B 2026-09-28): the staging memory's
 		// write bandwidth, not one thread's latency, bounds it.
+		// The thread recording the commands makes these copies too (see GuestCopies), in order
+		// before the copy command that reads the staging memory: megabytes a frame where a game
+		// rewrites what its shaders read by address.
 		DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::UploadCopy);
+		const bool                 defer   = GuestCopies::StagingEnabled();
+		const VkCommandBuffer      command = m_scheduler.Current().Handle();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (!defer || !LibKernel::Memory::BackingContains(address, copy.size) ||
+			    !GuestCopies::HandOver(command, mapped + copy.srcOffset, address, copy.size)) {
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
+				            copy.size);
+			}
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -907,8 +926,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+	// A texture's bytes (megabytes for the ones a game streams in) are copied by the thread
+	// recording the commands, before the upload that reads them, while the GPU thread goes on
+	// (see GuestCopies). The image is tracked by now, so a later write makes it upload again.
+	const bool deferred =
+	    staging != nullptr && GuestCopies::StagingEnabled() &&
+	    Libs::LibKernel::Memory::BackingContains(vaddr, size) &&
+	    GuestCopies::HandOver(m_scheduler.Current().Handle(), staging, vaddr, size);
+	if (!deferred &&
+	    (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	                            !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)))) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();

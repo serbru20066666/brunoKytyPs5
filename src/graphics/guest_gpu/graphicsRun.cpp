@@ -988,7 +988,10 @@ static bool PassesGuestCopies(uint32_t opcode, uint32_t header) {
 		case Pm4::IT_INDEX_BASE:
 		case Pm4::IT_INDEX_BUFFER_SIZE:
 		case Pm4::IT_INDEX_TYPE:
-		case Pm4::IT_NUM_INSTANCES: return true;
+		case Pm4::IT_NUM_INSTANCES:
+		// Pipeline events (cache flushes, query controls), several hundred a frame between draws:
+		// a query result written later is no sign of how far the GPU got with the buffers.
+		case Pm4::IT_EVENT_WRITE: return true;
 		case Pm4::IT_NOP: return KYTY_PM4_R(header) == Pm4::R_ZERO;
 		default: return IsDrawOpcode(opcode);
 	}
