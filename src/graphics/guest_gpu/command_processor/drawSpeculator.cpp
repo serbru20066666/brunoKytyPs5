@@ -369,10 +369,17 @@ void DrawSpeculator::Run() {
 		// from a sleep took about as long as the GPU thread needs for a dozen draws, which it then
 		// prepares itself (the walk counts them behind): spin for the restart first.
 		// KYTY_DEBUG_AB=specspin sleeps at once in every other window.
+		// A frame's submissions are a few milliseconds apart, so a walk that slept after half a
+		// millisecond was asleep at most restarts, and the draws the GPU thread prepared before it
+		// was back (some fifty a restart in Astro's Playroom's hub) went unspeculated: it spins for
+		// most of a frame's gap now. KYTY_DEBUG_AB=speclong spins half a millisecond, as before,
+		// in every other window.
 		static const bool spin_ab = AbSelected("specspin");
+		static const bool long_ab = AbSelected("speclong");
 		if (!(spin_ab && AbFeatureOff())) {
-			constexpr auto SpinTime = std::chrono::microseconds(500);
-			const auto     deadline = std::chrono::steady_clock::now() + SpinTime;
+			const auto SpinTime =
+			    std::chrono::microseconds(long_ab && AbFeatureOff() ? 500 : 4000);
+			const auto deadline = std::chrono::steady_clock::now() + SpinTime;
 			for (uint32_t i = 1; !m_restart_pending.load(std::memory_order_acquire) &&
 			                     !m_quitting.load(std::memory_order_acquire);
 			     i++) {
