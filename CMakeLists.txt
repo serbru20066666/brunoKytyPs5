@@ -849,6 +849,8 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+# Game patches the launcher applies when it finds them next to it (_Patches/<title id>.json).
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/patches/" DESTINATION _Patches)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 endif()

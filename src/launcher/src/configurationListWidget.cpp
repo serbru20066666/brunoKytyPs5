@@ -966,7 +966,7 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	    style()->standardIcon(QStyle::SP_FileDialogContentsView), tr("View trophies..."));
 	connect(action_view_trophies, &QAction::triggered, this,
 	        &ConfigurationListWidget::ViewTrophies);
-	QAction* action_patches = menu.addAction(tr("Cheats (experimental)..."));
+	QAction* action_patches = menu.addAction(tr("Patches..."));
 	connect(action_patches, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {
@@ -983,6 +983,32 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	QAction* action_edit =
 	    menu.addAction(style()->standardIcon(QStyle::SP_FileIcon), tr("Edit game settings..."),
 	                   this, SLOT(edit_configuration()));
+	// Only for a game that has recommended settings: they replace the ones it has.
+	QAction* action_recommended = menu.addAction(tr("Apply recommended settings"));
+	connect(action_recommended, &QAction::triggered, this,
+	        [this, item = QPointer<ConfigurationItem>(item)]() {
+		        if (item == nullptr) {
+			        return;
+		        }
+		        auto info = CreateConfiguration(*item);
+		        if (!info->ApplyRecommendedSettings()) {
+			        return;
+		        }
+		        info->custom_settings           = true;
+		        item->GetInfo().custom_settings = true;
+		        auto game_path                  = info->game_path;
+		        delete m_custom_infos.take(game_path);
+		        m_custom_infos.insert(game_path, info.release());
+		        if (!m_recommended_applied.contains(game_path)) {
+			        m_recommended_applied.append(game_path);
+		        }
+		        WriteSettings();
+		        item->Update();
+		        SelectItem(item);
+	        });
+	action_recommended->setVisible(item != nullptr &&
+	                               CreateConfiguration(*item)->ApplyRecommendedSettings());
+	action_recommended->setDisabled(item != nullptr && item->IsRunning());
 	QAction* action_delete =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
 	                   tr("Clear custom settings"), this, SLOT(delete_configuartion()));
