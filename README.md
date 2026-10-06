@@ -14,7 +14,7 @@ gráfica de la PS5.
 | Equipo de pruebas | Radeon RX 6800 XT, Intel Core i7-14700KF, Windows 11 |
 | Juego de referencia | ASTRO's PLAYROOM (PPSA01325) |
 | Punto de partida | 34–44 fps en juego (GPU Jungle y CPU Plaza) |
-| Ahora (0.2.0) | ≈50 fps en GPU Jungle y en CPU Plaza |
+| Ahora (0.2.0) | 44–50 fps en GPU Jungle, ≈50 fps en CPU Plaza |
 | Meta | 60 fps estables |
 
 Todo a 3840×2160, que es como dibuja el juego, y sin generación de cuadros.
@@ -27,7 +27,7 @@ Versión **0.2.0**. Medido en la RX 6800 XT, con el mismo juego y en el mismo si
 
 | Zona | Antes | 0.2.0 | Qué limita ahora |
 | --- | --- | --- | --- |
-| GPU Jungle (hierba, al empezar) | 34,0 fps (0.1.0) | 49,6 fps | El procesador |
+| GPU Jungle (hierba, al empezar) | 34,0 fps (0.1.0) | 44,5 fps | El procesador |
 | CPU Plaza | 43,6 fps (base heredada) · 51,1 fps (0.1.0) | 50,3 fps | La tarjeta gráfica (≈18 ms por cuadro) |
 
 Los fps son los que escribe el emulador en el título de la ventana. «Base heredada» es el fork
@@ -36,14 +36,14 @@ de carga de la tarjeta, que son las que se notan en la plaza. Las de 0.2.0 son d
 notan donde el procesador era el límite: la selva. En la plaza 0.1.0 y 0.2.0 dan lo mismo, dentro
 de lo que varía la medida de una partida a otra.
 
-### GPU Jungle: de 34 a ≈50 fps
+### GPU Jungle: de 34 a 44,5 fps
 
-| 0.1.0 · 34,0 fps | 0.2.0 · 49,6 fps |
+| 0.1.0 · 34,0 fps | 0.2.0 · 44,5 fps |
 | --- | --- |
-| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.2.0](docs/screenshots/astro-jungla-0.2.0.jpg) |
+| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.2.0](docs/screenshots/astro-jungla-0.2.0-44fps.jpg) |
 
-La captura de 0.2.0 es solo del área de juego, sin barra de título: sus 49,6 fps se leyeron del
-título durante esa misma partida. La imagen es igual que antes; lo que cambia es la velocidad.
+El mismo sitio con las dos versiones: un 31 % más de cuadros por segundo. Más adentro del nivel
+0.2.0 llega a ≈50 fps.
 
 ### CPU Plaza: de 43,6 a ≈50 fps
 
