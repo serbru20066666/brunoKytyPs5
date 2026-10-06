@@ -14,84 +14,90 @@ gráfica de la PS5.
 | Equipo de pruebas | Radeon RX 6800 XT, Intel Core i7-14700KF, Windows 11 |
 | Juego de referencia | ASTRO's PLAYROOM (PPSA01325) |
 | Punto de partida | 34–44 fps en juego (GPU Jungle y CPU Plaza) |
-| Ahora (0.2.0) | 44–50 fps en GPU Jungle, ≈50 fps en CPU Plaza |
+| Ahora (0.3.0) | 60 fps en CPU Plaza (1440p con FSR), 41–47 fps en GPU Jungle |
 | Meta | 60 fps estables |
 
-Todo a 3840×2160, que es como dibuja el juego, y sin generación de cuadros.
+Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.2.1**. Medido en la RX 6800 XT, con el mismo juego y en el mismo sitio antes y después:
+Versión **0.3.0**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
 ![Cuadros por segundo antes y después](docs/screenshots/fps-antes-y-despues.png)
 
-| Zona | Antes | 0.2.0 | Qué limita ahora |
-| --- | --- | --- | --- |
-| GPU Jungle (hierba, al empezar) | 34,0 fps (0.1.0) | 44,5 fps | El procesador |
-| CPU Plaza | 43,6 fps (base heredada) · 51,1 fps (0.1.0) | 50,3 fps | La tarjeta gráfica (≈18 ms por cuadro) |
+| Zona | Antes | 0.3.0 |
+| --- | --- | --- |
+| CPU Plaza, dibujando a 3840×2160 | 43,6 fps (base heredada) · 50,3 fps (0.2.0) | 51,8 fps |
+| CPU Plaza, dibujando a 2560×1440 con FSR | — | **60,0 fps estables** |
+| GPU Jungle, entrada, a 3840×2160 | 34,0 fps (0.1.0) · 44,5 fps (0.2.0) | 46,9 fps |
+| GPU Jungle, más adentro (acantilado) | — | 41–45 fps a cualquier resolución |
 
-Los fps son los que escribe el emulador en el título de la ventana. «Base heredada» es el fork
-tal como partió de KytyPS5 y BryKytyPS5 (commit `a9e1ae5`); 0.1.0 ya traía las primeras mejoras
-de carga de la tarjeta, que son las que se notan en la plaza. Las de 0.2.0 son de procesador y se
-notan donde el procesador era el límite: la selva. En la plaza 0.1.0 y 0.2.0 dan lo mismo, dentro
-de lo que varía la medida de una partida a otra.
+«Base heredada» es el fork tal como partió de KytyPS5 y BryKytyPS5 (commit `a9e1ae5`).
 
-### GPU Jungle: de 34 a 44,5 fps
+### La configuración recomendada: 1440p con FSR a pantalla completa
 
-| 0.1.0 · 34,0 fps | 0.2.0 · 44,5 fps |
+![CPU Plaza a 60 fps con 1440p y FSR](docs/screenshots/astro-plaza-0.3.0-1440p-fsr-60fps.jpg)
+
+ASTRO's PLAYROOM dibuja a 3840×2160 y a esa resolución la tarjeta va al límite. Con el parche
+que viene en el paquete dibuja a 2560×1440, y el emulador escala la imagen a la pantalla con
+**AMD FSR 1** (sus dos pasadas, EASU y RCAS). La plaza pasa a 60 fps estables, y en todo el juego
+hay menos tirones porque la tarjeta deja de ir justa. No lleva generación de cuadros: los 60 son
+del juego.
+
+![Escalado normal frente a FSR 1](docs/screenshots/fsr-comparacion.png)
+
+Recorte al 100 % de la misma escena, de 2560×1440 a 3840×2160. FSR 1 es el más reciente que se
+puede usar aquí: FSR 2, 3 y 4 necesitan vectores de movimiento y profundidad que el juego no
+entrega al emulador. Es una casilla por juego (**FSR upscaling**) y `--fsr-upscaling true`; con
+`--fsr-softness 0`–`20` se elige cuánto marca los bordes (10 por defecto).
+
+### GPU Jungle: de 34 a 47 fps, y lo que falta
+
+| 0.1.0 · 34,0 fps | 0.3.0 · 46,9 fps |
 | --- | --- |
-| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.2.0](docs/screenshots/astro-jungla-0.2.0-44fps.jpg) |
+| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.3.0](docs/screenshots/astro-jungla-0.3.0-47fps.jpg) |
 
-El mismo sitio con las dos versiones: un 31 % más de cuadros por segundo. Más adentro del nivel
-0.2.0 llega a ≈50 fps.
+En la selva limita el procesador, no la tarjeta: el juego emite entre 8000 y 10 600 dibujos por
+cuadro y un solo hilo los prepara, así que bajar la resolución ahí da estabilidad pero no fps.
+Lo que se ha recortado de ese hilo en 0.3.0, cada cosa medida encendiéndola y apagándola en la
+misma partida y comprobada contra el camino sin atajo:
 
-### CPU Plaza: de 43,6 a ≈50 fps
+- Los destinos de render de un dibujo sirven para el siguiente mientras nada de lo que dependen
+  cambia: −7,6 % de procesador por dibujo.
+- El pipeline del dibujo anterior se toma sin reconstruir su clave: −3,2 %.
+- Lo que escribe cada hilo va en su propia línea de caché (los hilos se la quitaban con cada
+  comando): −4 %.
+- Los datos del siguiente dibujo se piden por adelantado al hilo que se adelanta: −1,2 %.
 
-| Base heredada · 43,6 fps | 0.2.0 · 50,3 fps |
-| --- | --- |
-| ![CPU Plaza con la base heredada](docs/screenshots/astro-plaza-origen-43fps.jpg) | ![CPU Plaza con 0.2.0](docs/screenshots/astro-plaza-0.2.0-50fps.jpg) |
+En total, el coste por dibujo bajó un 13 % (de 2,21 a 1,92 µs con los cronómetros puestos). Para
+60 fps en lo más cargado de la selva hace falta alrededor de un 20 % más, y eso ya no sale de
+recortes así: pide repartir la preparación de cada dibujo entre dos hilos, que es el trabajo
+siguiente.
 
-### Generación de cuadros (opcional)
+Probado y descartado, por si alguien lo intenta: actualizar las sombras de las luces quietas un
+cuadro sí y otro no ahorra un 30 % de dibujos con la cámara quieta, pero en la selva las sombras
+parpadean; y fijar los hilos a núcleos distintos no cambia nada.
 
-![CPU Plaza con generación de cuadros](docs/screenshots/astro-plaza-0.2.0-generacion-de-cuadros.jpg)
+### También en 0.3.0
 
-Con AMD FSR 3 se muestra un cuadro generado entre cada dos del juego. En la plaza a 3840×2160,
-con el juego limitado a 50 fps: 47 fps del juego y 94 cuadros mostrados por segundo (se ve en el
-título: `game fps` y `presents/s`). Generar los cuadros cuesta algo de tarjeta, por eso el juego
-no llega a los 50. Suaviza el movimiento; no hace que el juego vaya más rápido. Está apagada por
-defecto y se activa por juego en el lanzador o con `--frame-generation true`.
-
-De dónde sale la mejora:
-
-- El juego emite unos 8000 dibujos por cuadro y un solo hilo los prepara todos. Más de la mitad
-  van a un mapa de sombras de 16 capas, y por cada uno se recorría toda su tabla de páginas para
-  volver a encontrarlo. Ahora se recuerda, igual que el búfer de profundidad con stencil.
-- Las copias de memoria que acompañan a cada dibujo las hace el hilo que graba los comandos, que
-  estaba casi siempre libre.
-- El hilo que se adelanta a preparar los shaders ya no se duerme entre dibujos ni entre envíos.
-- Los shaders que no escriben en sus búferes los declaran de solo lectura, lo que quita cerca de
-  un 10 % de carga a la tarjeta.
-
-Además:
-
-- 0.2.1: ASTRO's PLAYROOM ya no se cierra en GPU Jungle con «Assertion failed: !pos.IsNan()».
-  Su física recibía raíces inversas calculadas como las calcula un procesador Intel; con «AMD CPU
-  patch» (`--amd-cpu`, ahora en los ajustes recomendados) se calculan como en la consola, y sin
-  atrapar cada una como excepción, gracias a los cambios de KytyPS5 que se incorporaron.
+- ASTRO's PLAYROOM ya no se cierra en GPU Jungle con «Assertion failed: !pos.IsNan()». Su física
+  recibía raíces inversas calculadas como las calcula un procesador Intel; con «AMD CPU patch»
+  (`--amd-cpu`, en los ajustes recomendados) se calculan como en la consola, sin atrapar cada una
+  como excepción, gracias a los cambios de KytyPS5 que se incorporaron.
+- Generación de cuadros con AMD FSR 3, opcional y apagada por defecto.
 
 ### En el lanzador
 
 ![Menú del juego en el lanzador](docs/screenshots/lanzador-ajustes-recomendados.png)
 
 - **Apply recommended settings** (clic derecho sobre el juego) pone los ajustes con los que el
-  juego va mejor. ASTRO's PLAYROOM los recibe además solo la primera vez que aparece.
-- **Patches...** activa o desactiva los parches del juego. El paquete trae el de ASTRO's PLAYROOM
-  que apaga la iluminación global por trazado de rayos (`_Patches/PPSA01325.json`); el lanzador lo
-  aplica solo cuando ese archivo está junto a él.
-- En los ajustes de cada juego hay casillas para la generación de cuadros y la lectura relajada.
-
-Falta para la meta: en la selva hay que seguir quitando trabajo al hilo que prepara los dibujos,
-y en la plaza hay que aligerar la carga de la tarjeta.
+  juego va mejor; para ASTRO's PLAYROOM, entre otros: pantalla completa, FSR upscaling y AMD CPU
+  patch. El juego los recibe además solo la primera vez que aparece.
+- **Patches...** activa o desactiva los parches del juego. El paquete trae
+  `_Patches/PPSA01325.json` con tres: los dos que apagan la iluminación global por trazado de
+  rayos y el que hace que el juego dibuje a 2560×1440. Para volver a 3840×2160, desmarca ese.
+- En los ajustes de cada juego hay casillas para FSR upscaling, generación de cuadros y lectura
+  relajada.
 
 ## Cómo se trabaja
 
