@@ -83,6 +83,9 @@ struct ConfigOptions {
 	bool                   async_pipelines_enabled     = false;
 	bool                   relaxed_readback_enabled    = false;
 	bool                   frame_generation_enabled    = false;
+	bool                   fsr_upscaling_enabled       = false;
+	// FSR 1's sharpening, in tenths of a stop: 0 the sharpest, 20 the softest.
+	uint32_t               fsr_softness_tenths         = 10;
 	bool                   speculative_draws_enabled   = true;
 	bool                   record_thread_enabled       = true;
 	bool                   hardware_buffer_bounds      = true;
@@ -168,6 +171,8 @@ bool RelaxedReadbackEnabled();
 // Shows a generated frame between every two the game presents (AMD FSR 3 frame interpolation),
 // so twice as many frames reach the screen. Needs amd_fidelityfx_vk.dll next to the executable.
 bool FrameGenerationEnabled();
+bool FsrUpscalingEnabled();
+uint32_t FsrSoftnessTenths();
 // Changes it while running (the settings panel).
 void SetRelaxedReadbackEnabled(bool enabled);
 // A second thread prepares draws' shader resources ahead of the GPU thread, which takes them

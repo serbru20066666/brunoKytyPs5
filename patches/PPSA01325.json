@@ -22,9 +22,65 @@
                 }
             ],
             "name": "Select the common GI-unavailable state"
+        },
+        {
+            "enabled": true,
+            "memory": [
+                {
+                    "off": "48b8000f0000",
+                    "offset": "0x183eea5",
+                    "on": "48b8000a0000"
+                },
+                {
+                    "off": "000070080000",
+                    "offset": "0x183eea9",
+                    "on": "0000a0050000"
+                },
+                {
+                    "off": "41bc70080000",
+                    "offset": "0x1c2bec4",
+                    "on": "41bca0050000"
+                },
+                {
+                    "off": "41be000f0000",
+                    "offset": "0x1c2beca",
+                    "on": "41be000a0000"
+                },
+                {
+                    "off": "f6ba000f0000",
+                    "offset": "0x1c2bfe5",
+                    "on": "f6ba000a0000"
+                },
+                {
+                    "off": "24b970080000",
+                    "offset": "0x1c2bff4",
+                    "on": "24b9a0050000"
+                },
+                {
+                    "off": "41be70080000",
+                    "offset": "0x1c2e5f7",
+                    "on": "41bea0050000"
+                },
+                {
+                    "off": "00bb000f0000",
+                    "offset": "0x1c2e5fc",
+                    "on": "00bb000a0000"
+                },
+                {
+                    "off": "28bb70080000",
+                    "offset": "0x1d59e8c",
+                    "on": "28bba0050000"
+                },
+                {
+                    "off": "41bc000f0000",
+                    "offset": "0x1d59e92",
+                    "on": "41bc000a0000"
+                }
+            ],
+            "name": "Render at 2560x1440 instead of 3840x2160"
         }
     ],
-    "name": "ASTRO's PLAYROOM: NO ray-traced GI",
+    "name": "ASTRO's PLAYROOM: NO ray-traced GI, 1440p rendering",
     "process": "eboot.bin",
     "source_sha256": "4591e749a53c324d234eebdc0a92617802143c6dc0fa9e31ad5e30825076243a",
     "version": "01.905.000"

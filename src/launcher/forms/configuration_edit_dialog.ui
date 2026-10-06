@@ -185,6 +185,12 @@
           <property name="text"><string>Frame generation (FSR 3)</string></property>
          </widget>
         </item>
+        <item row="10" column="1">
+         <widget class="QCheckBox" name="checkBox_fsr_upscaling">
+          <property name="toolTip"><string>Scale a frame smaller than the window with AMD FSR 1 (for a game patched to render below the window's resolution). Sharper than plain scaling.</string></property>
+          <property name="text"><string>FSR upscaling (FSR 1)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

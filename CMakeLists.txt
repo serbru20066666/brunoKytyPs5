@@ -334,6 +334,8 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_downscale.frag"
+	"${gpu_tiler_shader_dir}/gpu_video_out_fsr_easu.frag"
+	"${gpu_tiler_shader_dir}/gpu_video_out_fsr_rcas.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -344,7 +346,8 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
 		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
+		        "-I${gpu_tiler_shader_dir}" "-I${KYTY_THIRD_PARTY_DIR}/fsr1"
+		        -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}"

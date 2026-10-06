@@ -105,6 +105,10 @@ static void PrintUsage() {
 	         "separately compiled parts where the driver supports it. Default: true.\n");
 	::printf("  --async-pipelines <true|false>       Skip draws whose new pipeline is still "
 	         "compiling instead of stalling; they appear a few frames late. Default: false.\n");
+	::printf("  --fsr-upscaling <true|false>         Scale a frame smaller than the window with AMD "
+	         "FSR 1.\n");
+	::printf("  --fsr-softness <0-20>                How soft FSR 1 leaves edges: 0 the sharpest, "
+	         "10 by default.\n");
 	::printf("  --frame-generation <true|false>      Show a generated frame between every two of "
 	         "the game's (AMD FSR 3). Default: false.\n");
 	::printf("  --relaxed-readback <true|false>      Let game threads read memory the GPU is still "
@@ -486,6 +490,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--fsr-upscaling") {
+			if (!ParseBool(value, options.config.fsr_upscaling_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--fsr-softness") {
+			const auto tenths = std::strtoul(value.c_str(), nullptr, 10);
+			if (tenths > 20) {
+				::printf("invalid fsr-softness (0-20): %s\n", value.c_str());
+				return false;
+			}
+			options.config.fsr_softness_tenths = static_cast<uint32_t>(tenths);
 		} else if (arg == "--frame-generation") {
 			if (!ParseBool(value, options.config.frame_generation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

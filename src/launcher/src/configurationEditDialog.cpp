@@ -234,6 +234,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_relaxed_readback->setChecked(info.relaxed_readback_enabled);
 	m_ui->checkBox_frame_generation->setChecked(info.frame_generation_enabled);
+	m_ui->checkBox_fsr_upscaling->setChecked(info.fsr_upscaling_enabled);
 #if !defined(_WIN32)
 	// The frame generation library is only shipped for Windows.
 	m_ui->checkBox_frame_generation->setVisible(false);
@@ -386,6 +387,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.relaxed_readback_enabled  = ui.checkBox_relaxed_readback->isChecked();
 	info.frame_generation_enabled  = ui.checkBox_frame_generation->isChecked();
+	info.fsr_upscaling_enabled     = ui.checkBox_fsr_upscaling->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();

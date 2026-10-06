@@ -95,6 +95,7 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   relaxed_readback_enabled    = false;
 	bool                   frame_generation_enabled    = false;
+	bool                   fsr_upscaling_enabled       = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -128,6 +129,7 @@ public:
 		tessellation_enabled        = other.tessellation_enabled;
 		relaxed_readback_enabled    = other.relaxed_readback_enabled;
 		frame_generation_enabled    = other.frame_generation_enabled;
+		fsr_upscaling_enabled       = other.fsr_upscaling_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -165,6 +167,10 @@ public:
 			// Its physics asserts on a position that is not a number when reciprocal square
 			// roots come out as an Intel processor computes them.
 			amd_cpu_enabled = true;
+			// Its patch renders at 2560x1440, which holds the frame rate steadier than 3840x2160;
+			// FSR scales that to the whole screen.
+			fsr_upscaling_enabled = true;
+			fullscreen_enabled    = true;
 #if defined(_WIN32)
 			red_zone_protection_enabled = true;
 #endif
@@ -201,6 +207,7 @@ public:
 		KYTY_CFG_SET(tessellation_enabled);
 		KYTY_CFG_SET(relaxed_readback_enabled);
 		KYTY_CFG_SET(frame_generation_enabled);
+		KYTY_CFG_SET(fsr_upscaling_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -247,6 +254,7 @@ public:
 		    s->value("relaxed_readback_enabled", relaxed_readback_enabled).toBool();
 		frame_generation_enabled =
 		    s->value("frame_generation_enabled", frame_generation_enabled).toBool();
+		fsr_upscaling_enabled = s->value("fsr_upscaling_enabled", fsr_upscaling_enabled).toBool();
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

@@ -236,6 +236,14 @@ bool FrameGenerationEnabled() {
 	return g_config->frame_generation_enabled;
 }
 
+bool FsrUpscalingEnabled() {
+	return g_config->fsr_upscaling_enabled;
+}
+
+uint32_t FsrSoftnessTenths() {
+	return g_config->fsr_softness_tenths;
+}
+
 static std::atomic<int> g_relaxed_readback_override {-1};
 
 bool RelaxedReadbackEnabled() {

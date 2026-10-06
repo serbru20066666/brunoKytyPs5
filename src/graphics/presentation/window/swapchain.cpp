@@ -6,6 +6,8 @@
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_fsr_easu_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_fsr_rcas_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
@@ -498,6 +500,172 @@ void PresentFilter::Release(vk::Device device) {
 	m_format      = vk::Format::eUndefined;
 }
 
+void PresentFsr::Draw(vk::CommandBuffer command, vk::Pipeline pipeline, vk::ImageView source_view,
+                      vk::ImageView target_view, vk::Extent2D target, const void* constants,
+                      uint32_t constants_size) const {
+	const vk::DescriptorImageInfo image {m_sampler, source_view,
+	                                     vk::ImageLayout::eShaderReadOnlyOptimal};
+	vk::WriteDescriptorSet        write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	write.pImageInfo      = &image;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_layout, 0, 1, &write);
+	command.pushConstants(m_layout, vk::ShaderStageFlagBits::eFragment, 0, constants_size, constants);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = target_view;
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eDontCare;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = target;
+	rendering.layerCount           = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	const vk::Viewport viewport {
+	    0.0f, 0.0f, static_cast<float>(target.width), static_cast<float>(target.height),
+	    0.0f, 1.0f};
+	const vk::Rect2D scissor {{0, 0}, target};
+	command.setViewport(0, 1, &viewport);
+	command.setScissor(0, 1, &scissor);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+}
+
+void PresentFsr::Record(GraphicContext& graphics, vk::CommandBuffer command,
+                        vk::ImageView source_view, vk::Extent2D source, vk::ImageView target_view,
+                        vk::Format target_format, vk::Extent2D target) {
+	const auto device = graphics.device;
+	if (m_layout == nullptr) {
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eLinear;
+		sampler.minFilter    = vk::Filter::eLinear;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_sampler),
+		                     "create FSR sampler");
+		m_descriptors = CreatePushedSamplerLayout(device);
+		const vk::PushConstantRange  constants {vk::ShaderStageFlagBits::eFragment, 0, 64};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.setLayoutCount         = 1;
+		layout.pSetLayouts            = &m_descriptors;
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges    = &constants;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_layout),
+		                     "create FSR pipeline layout");
+	}
+	if (m_easu != nullptr && m_format != target_format) {
+		device.destroyPipeline(m_easu, nullptr);
+		device.destroyPipeline(m_rcas, nullptr);
+		m_easu = nullptr;
+		m_rcas = nullptr;
+	}
+	if (m_easu == nullptr) {
+		m_easu   = CreateFullscreenPipeline(device, m_layout, GPU_VIDEO_OUT_FSR_EASU_SPV,
+		                                    target_format, false);
+		m_rcas   = CreateFullscreenPipeline(device, m_layout, GPU_VIDEO_OUT_FSR_RCAS_SPV,
+		                                    target_format, false);
+		m_format = target_format;
+	}
+	if (m_scaled != nullptr && (m_scaled->extent.width != target.width ||
+	                            m_scaled->extent.height != target.height ||
+	                            m_scaled->format != target_format)) {
+		device.destroyImageView(m_scaled_view, nullptr);
+		graphics.DeleteImage(*m_scaled);
+		m_scaled.reset();
+		m_scaled_view = nullptr;
+	}
+	if (m_scaled == nullptr) {
+		m_scaled = std::make_unique<VulkanImage>();
+		vk::ImageCreateInfo create {};
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {target.width, target.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = target_format;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!graphics.CreateImage(create, *m_scaled)) {
+			EXIT("failed to allocate the FSR image, extent=%ux%u\n", target.width, target.height);
+		}
+		vk::ImageViewCreateInfo view {};
+		view.image            = m_scaled->image;
+		view.viewType         = vk::ImageViewType::e2D;
+		view.format           = target_format;
+		view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		RequireVulkanSuccess(device.createImageView(&view, nullptr, &m_scaled_view),
+		                     "create FSR image view");
+	}
+
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags source_access,
+	                         vk::AccessFlags target_access, vk::PipelineStageFlags source_stage,
+	                         vk::PipelineStageFlags target_stage) {
+		vk::ImageMemoryBarrier change {};
+		change.srcAccessMask       = source_access;
+		change.dstAccessMask       = target_access;
+		change.oldLayout           = from;
+		change.newLayout           = to;
+		change.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		change.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		change.image               = m_scaled->image;
+		change.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.pipelineBarrier(source_stage, target_stage, vk::DependencyFlags {}, 0, nullptr, 0,
+		                        nullptr, 1, &change);
+	};
+	// FsrEasuCon: the whole source to the whole target.
+	const auto  bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+	const float sw   = static_cast<float>(source.width);
+	const float sh   = static_cast<float>(source.height);
+	const float tw   = static_cast<float>(target.width);
+	const float th   = static_cast<float>(target.height);
+	const uint32_t easu[16] {
+	    bits(sw / tw),        bits(sh / th),        bits(0.5f * sw / tw - 0.5f), bits(0.5f * sh / th - 0.5f),
+	    bits(1.0f / sw),      bits(1.0f / sh),      bits(1.0f / sw),             bits(-1.0f / sh),
+	    bits(-1.0f / sw),     bits(2.0f / sh),      bits(1.0f / sw),             bits(2.0f / sh),
+	    bits(0.0f),           bits(4.0f / sh),      0,                           0};
+	barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal, {},
+	        vk::AccessFlagBits::eColorAttachmentWrite, vk::PipelineStageFlagBits::eFragmentShader,
+	        vk::PipelineStageFlagBits::eColorAttachmentOutput);
+	Draw(command, m_easu, source_view, m_scaled_view, target, easu, sizeof(easu));
+	barrier(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+	        vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
+	        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	        vk::PipelineStageFlagBits::eFragmentShader);
+	// FsrRcasCon: the sharpness in stops, 0 the sharpest. AMD suggests 0.2, which draws the
+	// stair steps of a frame with little antialiasing; a stop is the default here.
+	const float    sharpness = std::exp2(-0.1f * static_cast<float>(Config::FsrSoftnessTenths()));
+	const uint32_t rcas[16] {bits(sharpness), 0, 0, 0};
+	Draw(command, m_rcas, m_scaled_view, target_view, target, rcas, sizeof(rcas));
+}
+
+void PresentFsr::Release(GraphicContext& graphics) {
+	const auto device = graphics.device;
+	device.destroyPipeline(m_easu, nullptr);
+	device.destroyPipeline(m_rcas, nullptr);
+	device.destroyPipelineLayout(m_layout, nullptr);
+	device.destroyDescriptorSetLayout(m_descriptors, nullptr);
+	device.destroySampler(m_sampler, nullptr);
+	if (m_scaled != nullptr) {
+		device.destroyImageView(m_scaled_view, nullptr);
+		graphics.DeleteImage(*m_scaled);
+		m_scaled.reset();
+	}
+	m_easu        = nullptr;
+	m_rcas        = nullptr;
+	m_layout      = nullptr;
+	m_descriptors = nullptr;
+	m_sampler     = nullptr;
+	m_scaled_view = nullptr;
+	m_format      = vk::Format::eUndefined;
+}
+
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
@@ -553,6 +721,7 @@ private:
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	PresentFilter                  m_filter;
+	PresentFsr                     m_fsr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -803,6 +972,7 @@ void Swapchain::Destroy() {
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
 	m_filter.Release(graphics.device);
+	m_fsr.Release(graphics);
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -982,12 +1152,17 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	uint32_t     source_level = 0;
 	vk::Extent2D blit_extent {};
 	bool         filtered = false;
+	bool         fsr      = false; // Scaled up with FSR 1 (see PresentFsr); drawn, like filtered.
 	if (source != nullptr) {
 		const vk::Extent2D source_extent {source->image.extent.width, source->image.extent.height};
 		source_level = PresentSourceLevel(source_extent, m_extent, source->image.mip_levels);
 		RecordPresentDownscale(vk_command, source->image.image, source_extent, source_level);
 		blit_extent = MipExtent(source_extent, source_level);
 		filtered    = PresentNeedsFilter(blit_extent, m_extent);
+		fsr         = Config::FsrUpscalingEnabled() && source_level == 0 &&
+		              blit_extent.width <= m_extent.width && blit_extent.height <= m_extent.height &&
+		              (blit_extent.width < m_extent.width || blit_extent.height < m_extent.height);
+		filtered    = filtered || fsr;
 		if (filtered) {
 			if (source->mips_view == nullptr) {
 				vk::ImageViewCreateInfo view {};
@@ -1026,7 +1201,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, write_stage,
 	                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &to_transfer);
 
-	if (filtered) {
+	if (fsr) {
+		m_fsr.Record(m_window.graphic_ctx, vk_command, source->mips_view, blit_extent,
+		             m_image_views[m_image_index], m_format, m_extent);
+	} else if (filtered) {
 		m_filter.Record(m_window.graphic_ctx.device, vk_command, source->mips_view, source_level,
 		                blit_extent, m_image_views[m_image_index], m_format, m_extent);
 	} else if (source != nullptr) {

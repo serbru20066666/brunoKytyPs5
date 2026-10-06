@@ -229,6 +229,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--relaxed-readback" << BoolArg(info.relaxed_readback_enabled);
 	args << "--frame-generation" << BoolArg(info.frame_generation_enabled);
+	args << "--fsr-upscaling" << BoolArg(info.fsr_upscaling_enabled);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}

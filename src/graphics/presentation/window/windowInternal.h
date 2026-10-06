@@ -64,6 +64,38 @@ private:
 	vk::Pipeline            m_pipeline    = nullptr;
 };
 
+// AMD FidelityFX Super Resolution 1 for a frame smaller than the image it is presented to
+// (--fsr-upscaling): its scaling pass (EASU) draws the frame at the target's size into an image of
+// its own, and its sharpening pass (RCAS) draws that to the target. Both work on the encoded
+// colours a game presents, which is what they are designed for.
+class PresentFsr final {
+public:
+	PresentFsr()  = default;
+	~PresentFsr() = default;
+	KYTY_CLASS_NO_COPY(PresentFsr);
+
+	// Draws level 0 (extent `source`) of `source_view` over all of `target_view`. The source is
+	// in eShaderReadOnlyOptimal; the target is in eColorAttachmentOptimal.
+	void Record(GraphicContext& graphics, vk::CommandBuffer command, vk::ImageView source_view,
+	            vk::Extent2D source, vk::ImageView target_view, vk::Format target_format,
+	            vk::Extent2D target);
+	void Release(GraphicContext& graphics);
+
+private:
+	void Draw(vk::CommandBuffer command, vk::Pipeline pipeline, vk::ImageView source_view,
+	          vk::ImageView target_view, vk::Extent2D target, const void* constants,
+	          uint32_t constants_size) const;
+
+	vk::Format                   m_format      = vk::Format::eUndefined;
+	vk::Sampler                  m_sampler     = nullptr;
+	vk::DescriptorSetLayout      m_descriptors = nullptr;
+	vk::PipelineLayout           m_layout      = nullptr;
+	vk::Pipeline                 m_easu        = nullptr;
+	vk::Pipeline                 m_rcas        = nullptr;
+	std::unique_ptr<VulkanImage> m_scaled;
+	vk::ImageView                m_scaled_view = nullptr;
+};
+
 struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
