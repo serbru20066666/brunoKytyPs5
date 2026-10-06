@@ -268,6 +268,13 @@ bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
 	return true;
 }
 
+bool IsBoundedDescriptorTable(const ResourcePlan& program,
+                              const DescriptorSource::IndirectDescriptor& indirect) {
+	const auto* table = Source(program, indirect.table_source);
+	return indirect.sources.empty() && !indirect.selector &&
+	       indirect.workgroup_axis == UINT32_MAX && table != nullptr && table->dword_count == 4u;
+}
+
 template <typename Roots, typename Specialization, typename Normalize>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    const Roots&                                roots,
@@ -332,8 +339,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else {
 			return false;
 		}
-		if (selector == nullptr && table_value.dword_count == 4u &&
-		    indirect.workgroup_axis == UINT32_MAX) {
+		if (IsBoundedDescriptorTable(program, indirect)) {
 			if (!indirect.table_scalar && table.Format() == Prospero::BufferFormat::kInvalid) {
 				descriptors[resource_index] = {.dword_count = dword_count};
 				return true;
@@ -1434,10 +1440,13 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
+			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
 			        program, roots, image.source, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
-				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128))
+				        // A broad heap also contains resources for other typed image operations.
+				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {

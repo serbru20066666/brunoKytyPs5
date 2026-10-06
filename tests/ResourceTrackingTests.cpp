@@ -384,6 +384,61 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed image table tracking was not transactional");
 }
 
+void TestBoundedImageViewEligibility() {
+  using Type = Libs::Graphics::Prospero::ImageType;
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u,
+                              0x2000u, 48u << 16u, 5u, 0u};
+  LinearTestMemory memory;
+  memory.fail_address = 0x3000u;
+  const auto descriptor = [](uint32_t identity, Type type) {
+    return std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u),
+        0u, 0u, 0u, 0u};
+  };
+  const std::array types{Type::kColor2D, Type::kCube, Type::kColor3D,
+                         Type::kColor2DArray, Type::kColor2D};
+  for (uint32_t row = 0; row < types.size(); ++row) {
+    const auto value = descriptor(0x20u + row, types[row]);
+    std::copy(value.begin(), value.end(), memory.words.begin() + (0x1010u + row * 48u) / 4u);
+  }
+  SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 4u && memory.reads == 1u,
+        "unrelated cube/3D heap entries prevented a typed 2D table view");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 53u &&
+            snapshot.flattened_srt[mapping + 5u] == 1u &&
+            snapshot.flattened_srt[mapping + 17u] == 0u &&
+            snapshot.flattened_srt[mapping + 29u] == 0u &&
+            snapshot.flattened_srt[mapping + 41u] == 2u &&
+            snapshot.flattened_srt[mapping + 53u] == 3u &&
+            snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
+            snapshot.images[2].dwords == descriptor(0x23u, Type::kColor2DArray) &&
+            snapshot.images[3].dwords == descriptor(0x24u, Type::kColor2D),
+        "typed table eligibility changed byte offsets or discarded compatible views");
+
+  // An explicitly selected descriptor is not an unrelated entry in a broad heap.
+  const auto image_source = plan.info.images[0].source;
+  std::vector<uint32_t> selected;
+  for (auto type : {Type::kColor2D, Type::kColor3D}) {
+    DescriptorSource source;
+    source.dword_count = 8u;
+    const auto value = descriptor(0x30u, type);
+    for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
+    selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
+    plan.descriptor_sources.push_back(source);
+  }
+  plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "explicitly selected incompatible descriptor was silently normalized to null");
+}
+
 void TestWaterfallImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   const auto make = [](bool equality, bool scalar) {
@@ -3517,6 +3572,7 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
