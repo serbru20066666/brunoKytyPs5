@@ -58,6 +58,7 @@ constexpr char CONF_SECTION_NAME[] = "GameConfigurations";
 constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
 constexpr char CONF_GAME_DIRS[]    = "game_dirs";
+constexpr char CONF_RECOMMENDED[]  = "recommended_settings_applied";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
 
@@ -308,6 +309,7 @@ void ConfigurationListWidget::WriteSettings() {
 	s->beginGroup(CONF_LAUNCHER);
 	m_game_dirs = NormalizeGameDirectories(m_game_dirs);
 	s->setValue(CONF_GAME_DIRS, m_game_dirs);
+	s->setValue(CONF_RECOMMENDED, m_recommended_applied);
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
 
@@ -351,6 +353,7 @@ void ConfigurationListWidget::ReadSettings() {
 	if (m_game_dirs.isEmpty()) {
 		m_game_dirs = NormalizeGameDirectories(SettingsStringList(s->value(CONF_GAME_DIR)));
 	}
+	m_recommended_applied = SettingsStringList(s->value(CONF_RECOMMENDED));
 	s->endGroup();
 
 	s->beginGroup(CONF_GLOBAL);
@@ -626,6 +629,19 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
 
 		SetGameFiles(*info, base, game_path, metadata, archive);
+		// A game with recommended settings gets them as its own the first time it is found; they
+		// are saved with the rest when the launcher writes its settings.
+		if (!info->custom_settings && !m_recommended_applied.contains(game_path)) {
+			auto custom = std::make_unique<Configuration>();
+			custom->CopyEmulatorSettingsFrom(m_global_info);
+			custom->CopyGameInfoFrom(*info);
+			if (custom->ApplyRecommendedSettings()) {
+				custom->custom_settings = true;
+				info->custom_settings   = true;
+				m_custom_infos.insert(game_path, custom.release());
+				m_recommended_applied.append(game_path);
+			}
+		}
 		const auto* compatibility = m_compatibility->Find(info->title_id);
 		if (compatibility != nullptr) {
 			info->game_status  = compatibility->status;

@@ -75,6 +75,9 @@ private:
 	Ui::ConfigurationListWidget*  m_ui            = nullptr;
 	QString                       m_settings_file;
 	QStringList                   m_game_dirs;
+	// Games that were given their recommended settings (Configuration::ApplyRecommendedSettings),
+	// by game path: they get them once, so clearing a game's settings sticks.
+	QStringList                   m_recommended_applied;
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;

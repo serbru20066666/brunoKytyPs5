@@ -173,6 +173,18 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
+        <item row="8" column="1">
+         <widget class="QCheckBox" name="checkBox_relaxed_readback">
+          <property name="toolTip"><string>Let game threads read memory the GPU is still writing without waiting; a value can be a frame old. Much faster in games that read it back every frame.</string></property>
+          <property name="text"><string>Relaxed readback (faster)</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_frame_generation">
+          <property name="toolTip"><string>Show a generated frame between every two of the game's (AMD FSR 3). Motion looks smoother; the game itself does not run faster.</string></property>
+          <property name="text"><string>Frame generation (FSR 3)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

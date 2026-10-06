@@ -93,6 +93,8 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   relaxed_readback_enabled    = false;
+	bool                   frame_generation_enabled    = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -124,6 +126,8 @@ public:
 		fullscreen_enabled          = other.fullscreen_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
+		relaxed_readback_enabled    = other.relaxed_readback_enabled;
+		frame_generation_enabled    = other.frame_generation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -142,6 +146,28 @@ public:
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
 		host_input_mapping = other.host_input_mapping;
+	}
+
+	// The settings a game is known to need or to run best with, over the ones it has. The
+	// launcher gives them to a game as its own settings the first time it finds it. Returns
+	// whether the title has any.
+	bool ApplyRecommendedSettings() {
+		const auto id = title_id.trimmed().toUpper();
+		if (id == QLatin1String("PPSA01325")) {
+			// ASTRO's PLAYROOM. Its threads read back what the GPU writes every frame, and
+			// waiting for each read costs most of the frame rate.
+			present_mode              = PresentMode::Immediate;
+			readback_linear_images    = true;
+			relaxed_readback_enabled  = true;
+			shader_validation_enabled = false;
+			shader_optimization_type  = ShaderOptimizationType::Performance;
+			printf_direction          = LogDirection::Silent;
+#if defined(_WIN32)
+			red_zone_protection_enabled = true;
+#endif
+			return true;
+		}
+		return false;
 	}
 
 	void CopyGameInfoFrom(const Configuration& other) {
@@ -170,6 +196,8 @@ public:
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
+		KYTY_CFG_SET(relaxed_readback_enabled);
+		KYTY_CFG_SET(frame_generation_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -212,6 +240,10 @@ public:
 		KYTY_CFG_GET(fullscreen_enabled);
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
+		relaxed_readback_enabled =
+		    s->value("relaxed_readback_enabled", relaxed_readback_enabled).toBool();
+		frame_generation_enabled =
+		    s->value("frame_generation_enabled", frame_generation_enabled).toBool();
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
