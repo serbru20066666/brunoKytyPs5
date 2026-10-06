@@ -1061,19 +1061,36 @@ void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto *connect_symbol = symbols.Find(
+      {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *getsockopt_symbol = symbols.Find(
+      {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
       {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *sendto_symbol = symbols.Find(
+      {"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *recv_symbol = symbols.Find(
       {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *recvfrom_symbol = symbols.Find(
+      {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
       {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  Check(send_symbol && recv_symbol && errno_symbol,
-        "Net send, receive and errno exports resolve with the guest ABI versions");
+  Check(connect_symbol && getsockopt_symbol && send_symbol && sendto_symbol &&
+            recv_symbol && recvfrom_symbol && errno_symbol,
+        "Net socket and errno exports resolve with the guest ABI versions");
+  using Connect = int (KYTY_SYSV_ABI *)(int, const void *, uint32_t);
+  using Getsockopt = int (KYTY_SYSV_ABI *)(int, int, int, void *, uint32_t *);
   using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
+  using Sendto = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int, const void *, uint32_t);
   using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
+  using Recvfrom = int (KYTY_SYSV_ABI *)(int, void *, size_t, int, void *, uint32_t *);
   using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto net_connect = reinterpret_cast<Connect>(connect_symbol->vaddr);
+  const auto net_getsockopt = reinterpret_cast<Getsockopt>(getsockopt_symbol->vaddr);
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
+  const auto net_sendto = reinterpret_cast<Sendto>(sendto_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
+  const auto net_recvfrom = reinterpret_cast<Recvfrom>(recvfrom_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   const auto [reader, writer] = CreateTcpPair();
   const int enabled = 1;
@@ -1082,10 +1099,15 @@ void CheckSocketWakeup() {
   int socket_error = -1;
   uint32_t error_size = sizeof(socket_error);
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-  Check(Net::Getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
             socket_error == 0 && error_size == sizeof(socket_error) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-        "SO_ERROR reports socket status without changing guest errno");
+        "Net SO_ERROR reports socket status without changing either guest errno");
+  Check(net_getsockopt(writer, 0xffff, 0x1007, nullptr, &error_size) ==
+            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net getsockopt translates an invalid output buffer");
 
   std::array<uint64_t, 16> readable {};
   const auto bit = uint64_t {1} << (reader % 64);
@@ -1122,6 +1144,51 @@ void CheckSocketWakeup() {
             *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
         "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
+  const int datagram = Net::Socket(2, 2, 0);
+  const int datagram_writer = Net::Socket(2, 2, 0);
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  std::array<uint8_t, 16> peer {}, expected_peer {};
+  uint32_t address_size = address.size(), peer_size = peer.size();
+  uint32_t expected_peer_size = expected_peer.size();
+  Check(datagram >= 0 && datagram_writer >= 0 &&
+            Net::Bind(datagram, address.data(), address.size()) == 0 &&
+            Net::Bind(datagram_writer, address.data(), address.size()) == 0 &&
+            Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
+            Net::Getsockname(datagram_writer, expected_peer.data(), &expected_peer_size) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0,
+        "create nonblocking loopback datagrams for Net ABI verification");
+  received.fill(0);
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_sendto(datagram_writer, payload, sizeof(payload), 0,
+                   address.data(), address_size) == sizeof(payload) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net sendto delivers to a guest sockaddr and preserves errno on success");
+  Check(net_recvfrom(datagram, received.data(), received.size(), 0,
+                     peer.data(), &peer_size) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
+            peer_size == expected_peer_size && peer == expected_peer &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net recvfrom returns datagram bytes and sender address while preserving errno");
+  Check(net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
+            Libs::Network::NET_ERROR_EWOULDBLOCK &&
+            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "Net recvfrom translates nonblocking failure with an omitted sender address");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_connect(datagram_writer, address.data(), address_size) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL &&
+            net_sendto(datagram_writer, payload, sizeof(payload), 0, nullptr, 0) ==
+                sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL &&
+            net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
+                sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "Net connect selects the peer used by sendto with an omitted destination");
+  Check(net_connect(-1, address.data(), address_size) == Libs::Network::NET_ERROR_EBADF &&
+            *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net connect translates an invalid socket");
+  Check(net_sendto(-1, payload, sizeof(payload), 0, address.data(), address_size) ==
+            Libs::Network::NET_ERROR_EBADF && *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net sendto translates an invalid socket");
+  Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
+        "close Net loopback datagrams");
   Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
             *net_errno == Libs::Posix::POSIX_EBADF,
         "Net send translates an invalid socket instead of returning POSIX minus one");
@@ -1138,10 +1205,12 @@ void CheckSocketWakeup() {
   const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
   Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
   const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
+  const auto broken_sendto = net_sendto(disconnected, payload, sizeof(payload), 0, nullptr, 0);
   std::signal(SIGPIPE, previous_sigpipe);
   Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
+            broken_sendto == Libs::Network::NET_ERROR_EPIPE &&
             *net_errno == Libs::Posix::POSIX_EPIPE,
-        "Net send reports a broken pipe without raising host SIGPIPE");
+        "Net send and sendto report a broken pipe without raising host SIGPIPE");
   Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
 #endif
 #if defined(_WIN32)
