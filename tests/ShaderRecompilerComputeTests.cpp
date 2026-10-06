@@ -21487,16 +21487,23 @@ TestCase ScalarBrevB32PreservesScc() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase ScalarSextI16Captured() {
+TestCase ScalarSextMasks(u32 bits, u32 wave_size) {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = "ScalarSextI16Captured";
-  constexpr u32 wave_size = 64, high = 0x80000001u;
-  test.initial = {0xdead0000u, 0xabcd7fffu, 0x12348000u, 0xabcfffffu};
+  test.name = bits == 8 ? (wave_size == 32 ? "ScalarSextI8MasksWave32"
+                                         : "ScalarSextI8MasksWave64")
+                       : (wave_size == 32 ? "ScalarSextI16MasksWave32"
+                                         : "ScalarSextI16MasksWave64");
+  constexpr u32 high = 0x80000001u;
+  test.initial = bits == 8
+                     ? std::vector<u32>{0xdeadff00u, 0xabcdff7fu, 0x12340080u, 0xabcf00ffu}
+                     : std::vector<u32>{0xdead0000u, 0xabcd7fffu, 0x12348000u, 0xabcfffffu};
+  const u32 extended_values[] = {0u, bits == 8 ? 0x7fu : 0x7fffu,
+                                bits == 8 ? 0xffffff80u : 0xffff8000u, 0xffffffffu};
   test.expected = test.initial;
   auto &code = test.code;
   for (u32 i = 0; i < 4u; ++i) {
-    const auto extended = static_cast<u32>(static_cast<int32_t>(static_cast<int16_t>(test.initial[i])));
+    const auto extended = extended_values[i];
     for (const bool scc : {false, true}) {
       AppendVMovU32(&code, 30, i * 4u);
       AppendBufferLoadDword(&code, 3, 30);
@@ -21504,7 +21511,8 @@ TestCase ScalarSextI16Captured() {
       AppendSMovLiteral(&code, 107, high);
       code.push_back(EncodeSopc(0x06, InlineU32(scc ? 1u : 0u), InlineU32(1)));
       code.push_back(EncodeSop1(0x04, 126, 128)); // Scalar operations execute with empty EXEC.
-      code.push_back(0xbeea1a0bu); // Captured s_sext_i32_i16 vcc_lo, s11.
+      // The I16 word is captured s_sext_i32_i16 vcc_lo, s11.
+      code.push_back(bits == 8 ? 0xbeea190bu : 0xbeea1a0bu);
       code.push_back(EncodeSMovB32(20, 106));
       code.push_back(EncodeSMovB32(21, 107));
       code.push_back(EncodeSMovB32(22, 253));
@@ -21525,16 +21533,50 @@ TestCase ScalarSextI16Captured() {
   AppendEnd(&code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
-                  O::S_MOV_B64, O::S_CMP_EQ_U32, O::S_SEXT_I32_I16,
+                  O::S_MOV_B64, O::S_CMP_EQ_U32,
+                  bits == 8 ? O::S_SEXT_I32_I8 : O::S_SEXT_I32_I16,
                   O::V_CNDMASK_B32, O::V_MOV_B32, O::V_ADD_NC_U32,
                   O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{"S_SEXT_I32_I16", 8u}};
+  test.decoded_counts = {{bits == 8 ? "S_SEXT_I32_I8 vcc_lo, s11"
+                                  : "S_SEXT_I32_I16 vcc_lo, s11", 8u}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarSextConstantsAndAliases() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ScalarSextConstantsAndAliases";
+  auto &code = test.code;
+  for (const u32 opcode : {0x19u, 0x1au}) {
+    const u32 literal = opcode == 0x19u ? 0x12345680u : 0x12348000u;
+    const u32 extended = opcode == 0x19u ? 0xffffff80u : 0xffff8000u;
+    for (const bool scc : {false, true}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(scc ? 1u : 0u), InlineU32(1)));
+      code.push_back(EncodeSop1(opcode, 10, 255));
+      code.push_back(literal);
+      code.push_back(EncodeSop1(opcode, 10, 10)); // In-place source/destination.
+      code.push_back(EncodeSop1(opcode, 11, InlineU32(0)));
+      code.push_back(EncodeSop1(opcode, 12, InlineU32(64)));
+      code.push_back(EncodeSop1(opcode, 13, 193)); // Inline -1.
+      code.push_back(EncodeSMovB32(14, 253));
+      const u32 expected[] = {extended, 0, 64, 0xffffffffu, scc ? 1u : 0u};
+      for (u32 word = 0; word < 5u; ++word) {
+        AppendStoreSgpr(&code, 10u + word, test.expected.size());
+        test.expected.push_back(expected[word]);
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_CMP_EQ_U32, O::S_SEXT_I32_I8, O::S_SEXT_I32_I16,
+                  O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_SEXT_I32_I8", 10u}, {"S_SEXT_I32_I16", 10u}};
   return test;
 }
 
@@ -37000,7 +37042,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBitcmpB64DynamicOperands);
   AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
-  AddCase(ScalarSextI16Captured);
+  for (const u32 bits : {8u, 16u}) {
+    cases.push_back(ScalarSextMasks(bits, 32));
+    cases.push_back(ScalarSextMasks(bits, 64));
+  }
+  AddCase(ScalarSextConstantsAndAliases);
   cases.push_back(ScalarBrevB64OperandsAndMasks(32));
   cases.push_back(ScalarBrevB64OperandsAndMasks(64));
   AddCase(ScalarBfeI32CapturedRawSignExtends);
@@ -42989,7 +43035,11 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-sext-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarSextI16Captured());
+    for (const u32 bits : {8u, 16u}) {
+      RunCase(&vulkan, ScalarSextMasks(bits, 32));
+      RunCase(&vulkan, ScalarSextMasks(bits, 64));
+    }
+    RunCase(&vulkan, ScalarSextConstantsAndAliases());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
