@@ -49,10 +49,11 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	// When the lookup finds exactly one image with the same backing, *unique_generation receives
-	// the generation of the images over the request's range (RangeGeneration), else 0: until an
-	// image over the range is registered or unregistered, the same request finds the same image,
-	// and RefindImage does the rest of FindImage for it.
+	// When the lookup finds exactly one image with the same backing, or one image that holds the
+	// request as a view (see OverlapLookup), *unique_generation receives the generation of the
+	// images over the request's range (RangeGeneration), else 0: until an image over the range is
+	// registered or unregistered, the same request finds the same image, and RefindImage does the
+	// rest of FindImage for it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      uint64_t* unique_generation = nullptr);
 	// FindImage's bookkeeping for a request FindImage resolved to id under generation (see
@@ -89,13 +90,17 @@ public:
 	// marking it written and committing the write change nothing, and it is not enrolled for
 	// downloads.
 	[[nodiscard]] bool IsStorageCurrent(ImageId id, uint64_t generation) const noexcept;
-	// The same for FindDepthTarget with a depth-only request: the target is also GPU-owned and a
-	// depth target already, with the request's metadata, and no surface metadata entry was added
-	// or removed since meta_generation (SurfaceMetaGeneration before that acquisition), so the
-	// entry it made is still there.
+	// The same for FindDepthTarget: the target is also GPU-owned and a depth target already, with
+	// the request's stencil and metadata, and no surface metadata entry was added or removed since
+	// meta_generation (SurfaceMetaGeneration before that acquisition), so the entry it made is
+	// still there. A request with stencil also associates and refreshes the stencil plane's
+	// record: `stencil` is the record that acquisition associated and stencil_generation the
+	// plane's RangeGeneration before it, so the record is still the one a lookup would find, and
+	// it must be this GC tick's, the image's and clean.
 	[[nodiscard]] bool     IsDepthTargetCurrent(ImageId id, uint64_t generation,
-	                                            uint64_t meta_generation,
-	                                            const ImageDesc& desc) const noexcept;
+	                                            uint64_t meta_generation, const ImageDesc& desc,
+	                                            ImageId  stencil,
+	                                            uint64_t stencil_generation) const noexcept;
 	// Bumped whenever an image becomes GPU-modified.
 	[[nodiscard]] uint64_t GpuModifiedGeneration() const noexcept {
 		return m_gpu_modified_generation.load(std::memory_order_acquire);
@@ -119,7 +124,10 @@ public:
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// *stencil receives the stencil plane's record that a request with stencil associated (see
+	// IsDepthTargetCurrent), else no image.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            ImageId* stencil = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -365,6 +373,32 @@ private:
 	std::vector<ImageLookup> m_image_lookups =
 	    std::vector<ImageLookup>(ImageLookupSets * ImageLookupWays);
 	uint64_t m_image_lookup_clock = 0;
+	// What FindImage found for a request that no image backs exactly but one image holds as a
+	// view: a shadow map array bound as a depth target a few slices at a time (more than half of
+	// the 8000 draws a frame of Astro's Playroom's hub), a depth target read as a texture. Such a
+	// lookup resolves the overlap, and when that neither creates nor frees an image it only read
+	// the request, the binding, and fields of the image that never change, besides whether it has
+	// a stencil plane and metadata. So the result stays right until an image over the range is
+	// registered or unregistered, or the image's stencil plane or metadata come or go, which
+	// advances the range's generation too (FindDepthTarget, MaterializeColorClearNow). The request
+	// is kept whole: the overlap rules read more of it than SameBacking does. Caller holds m_lock.
+	struct OverlapLookup {
+		uint64_t    generation   = 0;
+		ImageInfo   info;
+		BindingType binding      = BindingType::Texture;
+		bool        exact_format = false;
+		ImageId     id;
+	};
+	static constexpr size_t    OverlapLookups = 128;
+	std::vector<OverlapLookup> m_overlap_lookups = std::vector<OverlapLookup>(OverlapLookups);
+	[[nodiscard]] OverlapLookup& OverlapLookupFor(const ImageInfo& info) noexcept {
+		auto hash = info.data.address ^ (info.data.size * 0x9e3779b97f4a7c15ull);
+		hash ^= hash >> 29u;
+		hash *= 0xbf58476d1ce4e5b9ull;
+		hash ^= hash >> 32u;
+		return m_overlap_lookups[static_cast<size_t>(hash % OverlapLookups)];
+	}
+	[[nodiscard]] static bool SameImageInfo(const ImageInfo& a, const ImageInfo& b) noexcept;
 	// Each cache counts from its own base, so a generation remembered from one cache (a test's
 	// earlier context, say) never matches another's.
 	[[nodiscard]] static uint64_t        NextGenerationBase() noexcept {

@@ -245,6 +245,15 @@ TextureCache::~TextureCache() {
 	});
 }
 
+bool TextureCache::SameImageInfo(const ImageInfo& a, const ImageInfo& b) noexcept {
+	return a.data == b.data && a.stencil == b.stencil && a.metadata == b.metadata &&
+	       a.htile_clear_mask == b.htile_clear_mask && a.pixel_format == b.pixel_format &&
+	       a.guest_format == b.guest_format && a.type == b.type && a.extent == b.extent &&
+	       a.resources == b.resources && a.pitch == b.pitch &&
+	       a.bytes_per_block == b.bytes_per_block && a.samples == b.samples &&
+	       a.tile_mode == b.tile_mode && a.bgra16 == b.bgra16 && a.mip_layout == b.mip_layout;
+}
+
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
                                bool exact_format) {
 	if (cached.data.address != requested.data.address) {
@@ -1441,6 +1450,10 @@ TextureCache::MaterializeColorClearNow(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image = m_slot_images[id];
 		changed |= !(image.info.metadata == desc.info.metadata);
+		// The overlap rules read whether an image has metadata (see OverlapLookup).
+		if (image.registered && image.info.HasMetadata() != desc.info.HasMetadata()) {
+			AdvanceImageSetGeneration(image.info.data);
+		}
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		if (m_surface_metas.erase(range.address) != 0) {
@@ -1794,6 +1807,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 		int32_t view_mip        = -1;
 		int32_t view_layer      = -1;
 		int32_t backing_matches = 0;
+		// The images over the request's range, and the first of them.
+		size_t  candidate_count = 0;
+		ImageId first_candidate {};
 		const auto       lookup     = [&] {
 			result          = {};
 			view_mip        = -1;
@@ -1801,6 +1817,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			backing_matches = 0;
 			const auto candidates =
 			    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			candidate_count = candidates.size();
+			first_candidate = candidates.empty() ? ImageId {} : candidates.front();
 			for (const auto id: candidates) {
 				const auto& image = m_slot_images[id];
 				if (SameBacking(image.info, desc.info, exact_format)) {
@@ -1874,9 +1892,50 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 				result = {};
 			}
 		}
+		// A request that one image holds as a view: see OverlapLookup. KYTY_DEBUG_AB=overlapmemo
+		// resolves every such overlap in alternate windows.
+		static const bool overlap_ab      = AbSelected("overlapmemo");
+		const bool        overlap_enabled = memo_enabled && !(overlap_ab && AbFeatureOff());
+		auto&             overlap         = OverlapLookupFor(desc.info);
+		bool overlap_hit = remembered == nullptr && overlap_enabled &&
+		                   overlap.generation == range_generation && overlap.binding == desc.type &&
+		                   overlap.exact_format == exact_format &&
+		                   SameImageInfo(overlap.info, desc.info);
+		if (overlap_hit && verify_memo) [[unlikely]] {
+			// KYTY_VERIFY_IMAGE_MEMO=1: the overlap is resolved again and must give the same image
+			// without creating or freeing one.
+			const auto remembered_id = overlap.id;
+			lookup();
+			const bool same = result == remembered_id && backing_matches == 0 && view_mip < 0 &&
+			                  view_layer < 0 && RangeGeneration(desc.info.data) == range_generation;
+			static std::atomic<uint64_t> checked {0};
+			static std::atomic<uint64_t> missed {0};
+			const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (!same && missed.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::printf("image-memo verify: 0x%016" PRIx64 " size 0x%" PRIx64
+				            " remembered a different overlap (matches %d, mip %d, layer %d)\n",
+				            desc.info.data.address, desc.info.data.size, backing_matches, view_mip,
+				            view_layer);
+			}
+			if (count % 100000 == 0) {
+				std::printf("image-memo verify: overlap hits=%" PRIu64 " missed=%" PRIu64 "\n", count,
+				            missed.load(std::memory_order_relaxed));
+				std::fflush(stdout);
+			}
+			// Go on with the lookup's own result, as without the memo.
+			overlap_hit = false;
+			if (!same) {
+				result = {};
+			}
+		}
 		if (remembered != nullptr) {
 			remembered->last_use = ++m_image_lookup_clock;
 			result               = remembered->id;
+			if (unique_generation != nullptr) {
+				*unique_generation = range_generation;
+			}
+		} else if (overlap_hit) {
+			result = overlap.id;
 			if (unique_generation != nullptr) {
 				*unique_generation = range_generation;
 			}
@@ -1929,6 +1988,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 				           .id              = result};
 				if (unique_generation != nullptr) {
 					*unique_generation = found_generation;
+				}
+			} else if (overlap_enabled && backing_matches == 0 && candidate_count == 1 &&
+			           result == first_candidate && view_mip < 0 && view_layer < 0 &&
+			           RangeGeneration(desc.info.data) == range_generation) {
+				// The only image over the range holds the request as a view, and resolving that
+				// neither registered nor freed an image (the generation would have advanced).
+				overlap = {.generation   = range_generation,
+				           .info         = desc.info,
+				           .binding      = desc.type,
+				           .exact_format = exact_format,
+				           .id           = result};
+				if (unique_generation != nullptr) {
+					*unique_generation = range_generation;
 				}
 			}
 		}
@@ -2009,17 +2081,47 @@ bool TextureCache::IsStorageCurrent(ImageId id, uint64_t generation) const noexc
 }
 
 bool TextureCache::IsDepthTargetCurrent(ImageId id, uint64_t generation, uint64_t meta_generation,
-                                        const ImageDesc& desc) const noexcept {
-	// A stencil request associates the stencil image, which IsTextureCurrent does not cover.
-	if (desc.info.HasStencil() || !IsTextureCurrent(id, generation) ||
-	    meta_generation != m_surface_meta_generation.load(std::memory_order_acquire)) {
+                                        const ImageDesc& desc, ImageId stencil,
+                                        uint64_t stencil_generation) const noexcept {
+	// KYTY_DEBUG_AB=stencilreuse acquires targets with stencil every draw in alternate windows.
+	static const bool stencil_ab = AbSelected("stencilreuse");
+	if (meta_generation != m_surface_meta_generation.load(std::memory_order_acquire) ||
+	    (desc.info.HasStencil() && stencil_ab && AbFeatureOff())) {
+		return false;
+	}
+	// As IsTextureCurrent, for an image that may have a stencil plane: it and its views still
+	// live, and it is tracked over its whole range and neither CPU nor buffer writes made it dirty.
+	const auto* owner = m_slot_images.try_get(id);
+	if (owner == nullptr || generation == 0 || generation != RangeGeneration(owner->info.data)) {
+		return false;
+	}
+	const auto& image = *owner;
+	if (!image.registered || image.depth_id || image.binding.needs_rebind ||
+	    image.info.data.Empty() || image.IsCpuDirty() || image.IsBufferModified() ||
+	    image.track_addr != image.info.data.address ||
+	    image.track_addr_end != image.info.data.End()) {
 		return false;
 	}
 	// FindDepthTarget's MarkGpuModified, CommitGpuWrite, usage flag and stencil and metadata
 	// assignments would change nothing, and the metadata entry it made is still there.
-	const auto& image = m_slot_images[id];
-	return image.IsGpuModified() && image.usage.depth_target && image.backing.image != nullptr &&
-	       image.info.stencil == desc.info.stencil && image.info.metadata == desc.info.metadata;
+	if (!image.IsGpuModified() || !image.usage.depth_target || image.backing.image == nullptr ||
+	    !(image.info.stencil == desc.info.stencil) || !(image.info.metadata == desc.info.metadata)) {
+		return false;
+	}
+	if (!desc.info.HasStencil()) {
+		return true;
+	}
+	// AssociateStencil would find this record again (the same images are over the plane), touch it
+	// to no effect (it is this GC tick's) and leave it this image's; RefreshImage would find it
+	// tracked and clean.
+	const auto* record = m_slot_images.try_get(stencil);
+	return record != nullptr && stencil_generation != 0 &&
+	       stencil_generation == RangeGeneration(desc.info.stencil) && record->registered &&
+	       record->depth_id == id && record->lru_tick == m_gc_tick &&
+	       record->info.data == desc.info.stencil && record->info.extent == image.info.extent &&
+	       !record->IsCpuDirty() && !record->IsBufferModified() &&
+	       record->track_addr == record->info.data.address &&
+	       record->track_addr_end == record->info.data.End();
 }
 
 // The part of FindImage after the lookup that runs without the lock.
@@ -2148,9 +2250,12 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	return image.FindView(desc.view_info);
 }
 
-vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, ImageId* stencil) {
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
+	}
+	if (stencil != nullptr) {
+		*stencil = {};
 	}
 	RefreshVia       via("depth-target");
 	std::scoped_lock lock {m_lock};
@@ -2161,6 +2266,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	MarkGpuModified(image);
 	image.usage.depth_target = true;
+	// The overlap rules read whether an image has a stencil plane and metadata (see OverlapLookup).
+	if (image.info.HasStencil() != desc.info.HasStencil() ||
+	    image.info.HasMetadata() != desc.info.HasMetadata()) {
+		AdvanceImageSetGeneration(image.info.data);
+	}
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
@@ -2175,7 +2285,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+		const auto association = AssociateStencil(id, desc.info.stencil);
+		RefreshImage(association);
+		if (stencil != nullptr) {
+			*stencil = association;
+		}
 	}
 	return image.FindView(desc.view_info);
 }

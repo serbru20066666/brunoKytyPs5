@@ -737,7 +737,7 @@ static bool VerifyDepthReuse() {
 }
 
 static void CheckDepthReuse(TextureCache& cache, const RenderDepthInfo& depth,
-                            vk::ImageView kept) {
+                            vk::ImageView kept, ImageId kept_stencil) {
 	const auto& image           = cache.GetImage(depth.image_id);
 	const bool  gpu_modified    = image.IsGpuModified();
 	const bool  depth_target    = image.usage.depth_target;
@@ -747,11 +747,21 @@ static void CheckDepthReuse(TextureCache& cache, const RenderDepthInfo& depth,
 	const auto  metadata        = image.info.metadata;
 	const auto  meta_generation = cache.SurfaceMetaGeneration();
 	const auto  set_generation  = cache.ImageGeneration(depth.image_id);
-	const auto  view            = cache.FindDepthTarget(depth.image_id, depth.desc);
-	const auto& after           = cache.GetImage(depth.image_id);
-	const char* field           = nullptr;
+	// A target with stencil: its plane's record, which the acquisition associates and refreshes.
+	const bool  has_stencil     = depth.desc.info.HasStencil();
+	const auto  stencil_set     = has_stencil ? cache.RangeGeneration(depth.desc.info.stencil) : 0;
+	const bool  stencil_dirty   = has_stencil && (cache.GetImage(kept_stencil).IsCpuDirty() ||
+	                                              cache.GetImage(kept_stencil).IsBufferModified());
+	ImageId     found_stencil {};
+	const auto  view  = cache.FindDepthTarget(depth.image_id, depth.desc, &found_stencil);
+	const auto& after = cache.GetImage(depth.image_id);
+	const char* field = nullptr;
 	if (view != kept) {
 		field = "view";
+	} else if (has_stencil &&
+	           (found_stencil != kept_stencil || stencil_dirty ||
+	            cache.RangeGeneration(depth.desc.info.stencil) != stencil_set)) {
+		field = "stencil record";
 	} else if (after.IsGpuModified() != gpu_modified || after.usage.depth_target != depth_target) {
 		field = "gpu-modified or usage";
 	} else if (after.IsBufferModified() != buffer_modified || after.IsCpuDirty() != cpu_dirty) {
@@ -846,22 +856,28 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (TargetReuseEnabled() && !(depth_ab && AbFeatureOff()) &&
 		    acquired.view_image == depth.image_id && acquired.view_info == depth.desc.view_info &&
 		    cache.IsDepthTargetCurrent(depth.image_id, acquired.view_generation,
-		                               acquired.view_meta_generation, depth.desc)) {
+		                               acquired.view_meta_generation, depth.desc,
+		                               acquired.view_stencil_image,
+		                               acquired.view_stencil_generation)) {
 			image_view = acquired.view;
 			if (VerifyDepthReuse()) [[unlikely]] {
-				CheckDepthReuse(cache, depth, image_view);
+				CheckDepthReuse(cache, depth, image_view, acquired.view_stencil_image);
 			}
 		} else {
-			// Both generations from before the acquisition: its own changes make the next draw
+			// The generations from before the acquisition: its own changes make the next draw
 			// acquire again rather than trust a state it did not check.
 			const auto generation      = cache.ImageGeneration(depth.image_id);
 			const auto meta_generation = cache.SurfaceMetaGeneration();
-			image_view                 = cache.FindDepthTarget(depth.image_id, depth.desc);
+			const auto stencil_generation =
+			    depth.desc.info.HasStencil() ? cache.RangeGeneration(depth.desc.info.stencil) : 0;
+			image_view = cache.FindDepthTarget(depth.image_id, depth.desc,
+			                                   &acquired.view_stencil_image);
 			acquired.view              = image_view;
 			acquired.view_image        = depth.image_id;
 			acquired.view_info         = depth.desc.view_info;
 			acquired.view_generation   = generation;
-			acquired.view_meta_generation = meta_generation;
+			acquired.view_meta_generation    = meta_generation;
+			acquired.view_stencil_generation = stencil_generation;
 		}
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&

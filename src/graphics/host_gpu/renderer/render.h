@@ -322,6 +322,10 @@ private:
 		ImageViewInfo           view_info;
 		uint64_t                view_generation      = 0;
 		uint64_t                view_meta_generation = 0;
+		// For a target with stencil: the plane's record that acquisition associated, and the
+		// plane's RangeGeneration before it.
+		ImageId                 view_stencil_image;
+		uint64_t                view_stencil_generation = 0;
 	};
 
 	RenderContext&                        m_context;
