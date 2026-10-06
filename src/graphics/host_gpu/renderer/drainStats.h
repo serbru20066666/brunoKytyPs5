@@ -109,6 +109,8 @@ void Stop();
 
 void Record(Kind kind, Reason reason, uint32_t pm4_op, uint64_t value) noexcept;
 void CountFrame(bool new_frame) noexcept;
+// New game frames presented since the start.
+[[nodiscard]] uint64_t GameFrames() noexcept;
 // A GPU-memory fault stalled the faulting thread for `ns`; keyed by the faulting instruction.
 void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noexcept;
 // A recorded GPU command writes [vaddr, vaddr+size). Read fault sites report the newest such

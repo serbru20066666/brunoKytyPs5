@@ -44,6 +44,8 @@ Cell                  g_cells[CellCount];
 // Everything recorded since the last new game frame, by kind, for the hitch report.
 Cell                  g_frame_cells[KindCount];
 std::atomic<uint64_t> g_frames {0};
+// New game frames since the start, counted whether or not the statistics are on.
+std::atomic<uint64_t> g_game_frames {0};
 std::atomic<uint64_t> g_presents {0};
 // Time between new game frames: one bucket per millisecond, the last collects the rest.
 std::array<std::atomic<uint64_t>, FrameBuckets> g_frame_ms {};
@@ -626,7 +628,14 @@ void ReportHitch(int64_t ms) noexcept {
 
 } // namespace
 
+uint64_t GameFrames() noexcept {
+	return g_game_frames.load(std::memory_order_relaxed);
+}
+
 void CountFrame(bool new_frame) noexcept {
+	if (new_frame) {
+		g_game_frames.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (!Enabled()) {
 		return;
 	}
