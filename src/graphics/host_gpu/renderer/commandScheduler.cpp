@@ -249,12 +249,23 @@ void CommandScheduler::PopPendingOperations(bool wait_for_priority) {
 		m_master.Refresh();
 		m_last_pending_refresh = now;
 	}
+	// An operation waits for the tick it was queued in, which the GPU has never completed yet,
+	// and the queue is in tick order: once its front is found waiting, nothing in it runs until
+	// the GPU completes another tick. A draw entry that sees the progress it saw then skips the
+	// queue and its lock. KYTY_DEBUG_AB=pendingtick looks every time in alternate windows.
+	static const bool tick_ab  = AbSelected("pendingtick");
+	const auto        progress = m_master.KnownGpuTick();
+	if (!wait_for_priority && !(tick_ab && AbFeatureOff()) &&
+	    progress == m_pending_waiting_tick.load(std::memory_order_relaxed)) {
+		return;
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
 			if (m_pending_operations.empty() ||
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
+				m_pending_waiting_tick.store(progress, std::memory_order_relaxed);
 				return;
 			}
 			const auto tick = m_pending_operations.front().tick;
@@ -262,6 +273,7 @@ void CommandScheduler::PopPendingOperations(bool wait_for_priority) {
 			    ((m_priority_active && m_priority_active_tick <= tick) ||
 			     (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick))) {
 				// The priority thread is still publishing this tick: a later call runs it.
+				m_pending_waiting_tick.store(UINT64_MAX, std::memory_order_relaxed);
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
