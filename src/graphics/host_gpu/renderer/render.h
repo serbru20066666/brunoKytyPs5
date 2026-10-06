@@ -36,6 +36,10 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
+
+// Changes with every command that can change what a draw's render targets resolve to: every
+// command but draws, shader register writes and index state (see CommandProcessor::ProcessPm4).
+extern uint64_t g_target_state_serial;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
@@ -169,6 +173,9 @@ public:
 		vk::ImageAspectFlags                        feedback;
 	};
 	[[nodiscard]] GraphicsState& GetGraphicsState() const noexcept { return m_graphics_state; }
+	// Whether a rendering instance is open, and a number that changes whenever one begins or ends.
+	[[nodiscard]] bool     IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] uint64_t RenderingSerial() const noexcept { return m_rendering_serial; }
 	void InvalidateGraphicsState() const noexcept { m_graphics_state = {}; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -201,6 +208,7 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable uint64_t    m_rendering_serial = 0;
 	mutable vk::PipelineStageFlags m_pending_shader_writes;
 	mutable GraphicsState          m_graphics_state;
 	HW::Context*        m_registers   = nullptr;
@@ -261,6 +269,12 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// The targets of the previous draw, for a draw that changes none of what they depend on (see
+	// TargetMemo in renderDraw.cpp).
+	[[nodiscard]] bool TakeTargetMemo(CommandBuffer& buffer, DrawRenderState& state);
+	[[nodiscard]] bool TargetMemoBound(const DrawRenderState& state) const;
+	void KeepTargetMemo(CommandBuffer& buffer, const DrawRenderState& state,
+	                    const RenderState& rendering, vk::ImageAspectFlags feedback_aspects);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,

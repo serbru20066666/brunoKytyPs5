@@ -1080,6 +1080,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		switch (opcode) {
+			// These leave the registers that render targets resolve from as they are.
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_INDEX_BUFFER_SIZE:
+			case Pm4::IT_INDEX_BASE:
+			case Pm4::IT_INDEX_TYPE:
+			case Pm4::IT_NUM_INSTANCES: break;
+			default: g_target_state_serial++; break;
+		}
 		if (GuestCopies::Pending() && !PassesGuestCopies(opcode, packet_header)) {
 			GuestCopies::Finish();
 		}

@@ -71,6 +71,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	m_rendering_serial++;
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -123,6 +124,7 @@ void CommandBuffer::EndRendering() const {
 		}
 		m_rendering    = false;
 		m_render_state = {};
+		m_rendering_serial++;
 	}
 	if (m_pending_shader_writes) {
 		ShaderWriteBarrier(Handle(), std::exchange(m_pending_shader_writes, {}));
