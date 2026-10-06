@@ -265,6 +265,30 @@ void DrawSpeculator::PrintStats() {
 	            sizeof(HW::Context), sizeof(HW::Shader));
 }
 
+// The walk's waits for the GPU thread, which is a few draws away while it draws: spins until `done`
+// or for about as long as the GPU thread takes for a few rings of draws, and returns whether
+// `done`. A walk that sleeps instead has the GPU thread wake it with a kernel call, which costs
+// that thread about as much as a third of a draw. KYTY_DEBUG_AB=specwait sleeps at once in every
+// other window.
+template <typename Done>
+static bool SpinUntil(Done&& done) {
+	static const bool ab = AbSelected("specwait");
+	if (ab && AbFeatureOff()) {
+		return false;
+	}
+	constexpr auto SpinTime = std::chrono::microseconds(300);
+	const auto     deadline = std::chrono::steady_clock::now() + SpinTime;
+	for (uint32_t i = 1;; i++) {
+		if (done()) {
+			return true;
+		}
+		_mm_pause();
+		if (i % 64 == 0 && std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+	}
+}
+
 DrawSpeculator::Slot* DrawSpeculator::AcquireSlot(uint64_t seq, uint64_t epoch) {
 	auto& slot = m_ring[seq % RingSize];
 	for (;;) {
@@ -284,7 +308,18 @@ DrawSpeculator::Slot* DrawSpeculator::AcquireSlot(uint64_t seq, uint64_t epoch) 
 			slot.state.compare_exchange_strong(state, Free, std::memory_order_acq_rel);
 			continue;
 		}
-		// The ring is a full lap ahead: wait until the GPU thread has freed half of it.
+		// The ring is a full lap ahead. While it draws, the GPU thread frees this slot within a few
+		// microseconds, and waking the walk from a sleep costs the GPU thread a kernel call (3% of
+		// its time in Astro's Playroom's hub, 8000 draws a frame): spin for the slot first.
+		if (SpinUntil([&] {
+			    const auto now = slot.state.load(std::memory_order_acquire);
+			    return now != state ||
+			           (now == Ready && slot.seq < m_gpu_next.load(std::memory_order_acquire)) ||
+			           Interrupted(epoch);
+		    })) {
+			continue;
+		}
+		// The GPU thread has stopped drawing: sleep until it has freed half of the ring.
 		const auto signal = m_signal.load(std::memory_order_acquire);
 		m_wake_at.store(seq >= RingSize / 2u ? seq - RingSize / 2u : 0u, std::memory_order_relaxed);
 		m_waiting.store(true, std::memory_order_seq_cst);
@@ -304,6 +339,12 @@ bool DrawSpeculator::WaitForGpu(uint64_t seq, uint64_t epoch) {
 		}
 		if (m_gpu_next.load(std::memory_order_acquire) > seq) {
 			return true;
+		}
+		// The draw is at most a ring away: spin for it first, as for a slot (see AcquireSlot).
+		if (SpinUntil([&] {
+			    return m_gpu_next.load(std::memory_order_acquire) > seq || Interrupted(epoch);
+		    })) {
+			continue;
 		}
 		const auto signal = m_signal.load(std::memory_order_acquire);
 		m_wake_at.store(seq + 1u, std::memory_order_relaxed);
