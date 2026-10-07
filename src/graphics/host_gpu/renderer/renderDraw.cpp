@@ -1050,7 +1050,7 @@ static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
 			break;
 		}
-		if (sh_regs.target_output_mode[index] != 0 \&\& (write_mask \& (1u << slot)) != 0) {
+		if (sh_regs.target_output_mode[index] != 0 && (write_mask & (1u << slot)) != 0) {
 			output_mask |= 1u << slot;
 		}
 	}
