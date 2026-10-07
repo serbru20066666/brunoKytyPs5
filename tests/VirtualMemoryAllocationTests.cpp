@@ -1524,6 +1524,109 @@ void TestWindowsBackingViewPermissions() {
 }
 #endif
 
+void TestDirectMappingNamesTypesAndValidation() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "DirectMappingNamesTypesAndValidation";
+	constexpr auto page = SceKernelPageSize;
+	int64_t physical = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page * 2, page,
+	                                         SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* named = nullptr;
+	const std::string long_name(KERNEL_MAXIMUM_NAME_LENGTH, 'x');
+	Check(test,
+	      KernelMapNamedDirectMemory(nullptr, 0, SceKernelProtCpuExec, 0, -1, 0, long_name.c_str()) ==
+	          Libs::LibKernel::KERNEL_ERROR_ENAMETOOLONG,
+	      "named-map validation no longer checks the name first");
+	Check(test, KernelMapNamedDirectMemory(&named, page, SceKernelProtCpuRw, 0, physical, page,
+	                                       nullptr) == Libs::LibKernel::KERNEL_ERROR_EFAULT && !named,
+	      "null-name failure changed the output");
+	CheckOk(test, KernelReserveVirtualRange(&named, page * 2, 0, page), "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(named);
+	const auto name = long_name.substr(1);
+	CheckOk(test, KernelMapNamedDirectMemory(&named, page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                         physical, page, name.c_str()),
+	        "KernelMapNamedDirectMemory");
+	void* second = reinterpret_cast<void*>(base + page);
+	CheckOk(test, KernelMapNamedDirectMemory(&second, page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                         physical + page, page, "second"),
+	        "KernelMapNamedDirectMemory(adjacent)");
+	ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw,
+	            0, 1, 0, 1, name.c_str(), physical);
+	ExpectRange(test, Query(test, base + page), base + page, base + page * 2, SceKernelProtCpuRw,
+	            0, 1, 0, 1, "second", physical + page);
+	void* typed = nullptr;
+	constexpr int type = 2;
+	CheckOk(test, KernelMapDirectMemory2(&typed, page, type, SceKernelProtCpuRw, 0, physical, page),
+	        "KernelMapDirectMemory2");
+	Check(test, Query(test, reinterpret_cast<uint64_t>(typed)).memory_type == type &&
+	                Query(test, base).memory_type == SceKernelMtypeC,
+	      "typed alias changed another mapping's type");
+	*static_cast<volatile uint64_t*>(typed) = 0x12345678;
+	Check(test, *static_cast<volatile uint64_t*>(named) == 0x12345678,
+	      "typed mapping stopped aliasing its backing");
+	void* unchanged_type = nullptr;
+	CheckOk(test, KernelMapDirectMemory2(&unchanged_type, page, -1, SceKernelProtCpuRw, 0,
+	                                     physical, page),
+	        "KernelMapDirectMemory2(unchanged type)");
+	Check(test, Query(test, reinterpret_cast<uint64_t>(unchanged_type)).memory_type == SceKernelMtypeC,
+	      "type -1 did not preserve the allocation's memory type");
+	void* plain = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&plain, page, SceKernelProtCpuRw, 0, physical, page),
+	        "KernelMapDirectMemory");
+	const auto plain_info = Query(test, reinterpret_cast<uint64_t>(plain));
+	Check(test, plain_info.memory_type == SceKernelMtypeC && plain_info.name[0] == '\0',
+	      "plain mapping inherited another alias's type or name");
+	CheckOk(test, KernelReleaseDirectMemory(physical, page * 2), "KernelReleaseDirectMemory");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, reinterpret_cast<uint64_t>(typed));
+	ExpectUnmapped(test, reinterpret_cast<uint64_t>(plain));
+	ExpectUnmapped(test, reinterpret_cast<uint64_t>(unchanged_type));
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestBatchMappingOperationsAndPartialFailure() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "BatchMappingOperationsAndPartialFailure";
+	constexpr auto page = SceKernelPageSize;
+	int64_t physical = -1;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page, page,
+	                                         SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* reservation = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reservation, page * 2, 0, page), "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reservation);
+	void* flexible = reinterpret_cast<void*>(base + page);
+	std::array<KernelBatchMapEntry, 4> entries {{
+	    {reservation, static_cast<uint64_t>(physical), page, SceKernelProtCpuRw, 0, 0, 0},
+	    {flexible, 0, page, SceKernelProtCpuRw, 0, 0, 3},
+	    {reservation, 0, page, SceKernelProtCpuRead, 0, 0, 2},
+	    {flexible, 0, page, SceKernelProtCpuRead, 2, 0, 4},
+	}};
+	int processed = -1;
+	CheckOk(test, KernelBatchMap(entries.data(), entries.size(), &processed), "KernelBatchMap");
+	Check(test, processed == entries.size(), "batch did not process every operation");
+	ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRead,
+	            0, 1, 0, 1, "anon", physical);
+	ExpectRange(test, Query(test, base + page), base + page, base + page * 2, SceKernelProtCpuRead,
+	            1, 0, 0, 1, "anon");
+	std::array<KernelBatchMapEntry, 3> partial {{
+	    {reservation, 0, page, 0, 0, 0, 1},
+	    {nullptr, static_cast<uint64_t>(physical), page, SceKernelProtCpuRw, 0, 0, 0},
+	    {flexible, 0, page, 0, 0, 0, 1},
+	}};
+	Check(test, KernelBatchMap(partial.data(), partial.size(), &processed) ==
+	                Libs::LibKernel::KERNEL_ERROR_EINVAL && processed == 1,
+	      "failed fixed mapping did not preserve the completed prefix count");
+	ExpectUnmapped(test, base);
+	Check(test, Query(test, base + page).is_flexible == 1, "batch processed an entry after failure");
+	CheckOk(test, KernelBatchMap2(&partial.back(), 1, &processed, 0), "KernelBatchMap2(unmap)");
+	Check(test, processed == 1, "batch unmap count is wrong");
+	ExpectUnmapped(test, base + page);
+	CheckOk(test, KernelReleaseDirectMemory(physical, page), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectMapValidationBeforeOwnerMutation() {
 	const char* test    = "DirectMapValidationBeforeOwnerMutation";
 	int64_t     invalid = -1;
@@ -4423,6 +4526,8 @@ int main(int argc, char** argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);
 #endif
+	RunTest(TestDirectMappingNamesTypesAndValidation);
+	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
