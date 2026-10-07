@@ -23045,6 +23045,65 @@ TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   return test;
 }
 
+TestCase Vop3Min3U16CapturedAndSelectors() {
+  using O = ShaderOpcode;
+  struct MinCase {
+    u32 lhs, rhs, third, expected;
+    u32 selectors = 0;
+    u32 dst = 17;
+    bool active = true;
+  };
+  constexpr u32 a = 0x0009ea60u, b = 0x0007c350u, c = 0x00059c40u;
+  const std::array<MinCase, 10> cases{{
+      {a, b, c, 0x0005beefu, 14}, // Captured: min(60000, 7, 5) into v17.hi.
+      {a, b, c, 0xa5a59c40u}, // Unsigned values above INT16_MAX.
+      {a, b, c, 0xa5a50009u, 1},
+      {a, b, c, 0xa5a50007u, 2},
+      {a, b, c, 0xa5a50005u, 4},
+      {a, b, c, 0x0005beefu, 15},
+      {a, b, c, 0x9c40ea60u, 8, 4}, // Destination aliases source 0.
+      {0xabcdffffu, 0xffff0000u, 0x98768000u, 0xa5a50000u},
+      {0x0000ffffu, 0x7fffffffu, 0x8000ffffu, 0xa5a5ffffu},
+      {a, b, c, 0xa5a5beefu, 14, 17, false},
+  }};
+  TestCase test;
+  test.name = "Vop3Min3U16CapturedAndSelectors";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.rhs, entry.third});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    u32 offset = i * 12u;
+    for (u32 reg : {4u, 0u, 7u}) {
+      AppendVMovU32(&code, 30, offset);
+      AppendBufferLoadDword(&code, reg, 30); // Runtime inputs prevent folding.
+      offset += 4u;
+    }
+    AppendVMovLiteral(&code, 17, 0xa5a5beefu);
+    if (!entry.active) {
+      code.push_back(EncodeSop1(0x04, 24, 126)); // Preserve the initial active lanes.
+      code.push_back(EncodeSop1(0x04, 126, 128));
+    }
+    if (i == 0u) {
+      code.insert(code.end(), {0xd7537011u, 0x041e0104u});
+    } else {
+      AppendVop3(&code, 0x353, entry.dst, Vgpr(4), Vgpr(0), Vgpr(7), 0,
+                  entry.selectors);
+    }
+    if (!entry.active) code.push_back(EncodeSop1(0x04, 126, 24));
+    AppendStoreVgpr(&code, entry.dst, static_cast<u32>(test.initial.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN3_U16,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MIN3_U16", cases.size()}};
+  test.required_spirv = {"OpULessThan"};
+  return test;
+}
+
 TestCase Vop3Med3I16Captured() {
   using O = ShaderOpcode;
 
@@ -36680,6 +36739,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
+  AddCase(Vop3Min3U16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -42889,6 +42949,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3Min3U16CapturedAndSelectors());
     RunCase(&vulkan, Vop3Med3I16Captured());
     return 0;
   }

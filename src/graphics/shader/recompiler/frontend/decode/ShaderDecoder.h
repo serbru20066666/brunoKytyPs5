@@ -269,6 +269,7 @@ enum class Opcode {
 	V_MIN3_I32,
 	V_MIN3_U32,
 	V_MIN3_F16,
+	V_MIN3_U16,
 	V_MAX3_F32,
 	V_MAX3_I32,
 	V_MAX3_U32,
