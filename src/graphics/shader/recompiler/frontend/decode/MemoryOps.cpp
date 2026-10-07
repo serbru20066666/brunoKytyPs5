@@ -63,6 +63,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
+    {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {

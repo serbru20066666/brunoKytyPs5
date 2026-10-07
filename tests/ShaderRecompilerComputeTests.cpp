@@ -761,7 +761,7 @@ constexpr u32 EncodeVopcSdwa(u32 src0, u32 sdst = 0, u32 sd = 0,
 
 constexpr u32 EncodeMubuf0(u32 opcode, u32 offset = 0, bool idxen = false,
                            bool offen = true, bool glc = false) {
-  return (0x38u << 26u) | ((opcode & 0x7fu) << 18u) |
+  return (0x38u << 26u) | ((opcode & 0xffu) << 18u) |
          (offen ? (1u << 12u) : 0u) | (idxen ? (1u << 13u) : 0u) |
          (glc ? (1u << 14u) : 0u) | (offset & 0xfffu);
 }
@@ -29816,6 +29816,44 @@ TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
   return test;
 }
 
+std::vector<TestCase> BufferStoreFormatD16XCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct StoreCase {
+    const char *name;
+    F format;
+    u32 input;
+    u32 expected;
+  };
+  constexpr StoreCase inputs[] = {
+      {"BufferStoreFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xffffc000u},
+      {"BufferStoreFormatD16XFloat32", F::k32Float, 0x7e633800u, 0x3f000000u},
+      {"BufferStoreFormatD16XUint32", F::k32UInt, 0x7e63fffeu, 0x0000fffeu},
+      {"BufferStoreFormatD16XSint32", F::k32SInt, 0x7e63fffeu, 0xfffffffeu},
+      {"BufferStoreFormatD16XUnorm8", F::k8UNorm, 0x7e633800u, 0xffffff80u},
+      {"BufferStoreFormatD16XSnorm16", F::k16SNorm, 0x7e63b800u, 0xffffc000u},
+      {"BufferStoreFormatD16XZeroFill", F::k16_16Float, 0x7e633800u, 0x00003800u},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 66, input.input);
+    AppendVMovU32(&test.code, 65, 1);
+    // Match the captured CS824586f35db5c80d instruction at pc 0x484.
+    test.code.push_back(EncodeMubuf0(0x84u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(66, 0, 65));
+    AppendEnd(&test.code);
+    test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+    test.expected = {0xdeadbeefu, input.expected, 0xcafef00du};
+    test.user_data = MakeStructuredStorageBufferData(4, 3, false, BufferFormat(input.format));
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
 std::vector<TestCase> FormattedStoreConversionCases() {
   using F = Prospero::BufferFormat;
   using O = ShaderOpcode;
@@ -36778,6 +36816,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
+  for (auto &test : BufferStoreFormatD16XCases()) {
+    cases.push_back(std::move(test));
+  }
   for (auto &test : FormattedStoreConversionCases()) {
     cases.push_back(std::move(test));
   }
@@ -42274,6 +42315,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
+    for (const auto &test : BufferStoreFormatD16XCases()) {
+      RunCase(&vulkan, test);
+    }
     for (const auto &test : FormattedStoreConversionCases()) {
       RunCase(&vulkan, test);
     }
