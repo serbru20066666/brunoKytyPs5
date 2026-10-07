@@ -41895,6 +41895,77 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
     }
   }
   renderer.GetCommandScheduler().Finish();
+  processor.BufferInit();
+  auto &shaders = processor.GetShCtx();
+  const auto &gs = shaders.GetVs().gs_user_sgpr.value;
+  const auto &hs = shaders.GetVs().hs_user_sgpr.value;
+  const auto check_offsets = [&](auto &commands, const auto &sgprs,
+                                 std::initializer_list<uint32_t> expected_offsets,
+                                 const char *label) {
+    Require("Pm4DrawIndirectMulti", label,
+            execute(commands.data(), commands.size()) &&
+                std::equal(expected_offsets.begin(), expected_offsets.end(), sgprs + 9),
+            "indirect draw did not write the expected user SGPR offsets");
+  };
+  // These locations match the captured NGG prolog: user SGPR9/10 become s17/s18.
+  shaders.SetGsUserSgpr(9, 17821, HW::UserSgprType::Unknown);
+  shaders.SetGsUserSgpr(10, 0x898f3f24u, HW::UserSgprType::Unknown);
+  arguments = {0, 1};
+  std::array<uint32_t, 5> indexed_packet{
+      KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0), 0,
+      Pm4::SPI_SHADER_USER_DATA_GS_0 + 9,
+      Pm4::SPI_SHADER_USER_DATA_GS_0 + 10, 0};
+  check_offsets(indexed_packet, gs, {0, 0}, "clear stale offsets");
+  arguments = {0, 1, 5, static_cast<uint32_t>(-17), 3};
+  indexed_packet[2] |= (Pm4::SPI_SHADER_USER_DATA_GS_0 + 11) << 16u;
+  // Native sceAgcDcbDrawIndexIndirect (0x5a00) emits first-index enable in word3 bit28.
+  indexed_packet[3] |= 1u << 28u;
+  check_offsets(indexed_packet, gs, {static_cast<uint32_t>(-17), 3, 5}, "indexed offsets");
+  indexed_packet[3] ^= (1u << 28u) | (1u << 27u);
+  arguments[2] = 6;
+  check_offsets(indexed_packet, gs, {static_cast<uint32_t>(-17), 3, 5},
+                "index destination disabled");
+
+  arguments = {0, 1, 31, 5};
+  std::array<uint32_t, 5> auto_packet{
+      KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0), 0,
+      Pm4::SPI_SHADER_USER_DATA_HS_0 + 9,
+      Pm4::SPI_SHADER_USER_DATA_HS_0 + 10, 2};
+  check_offsets(auto_packet, hs, {31, 5}, "non-indexed offsets");
+  Require("Pm4DrawIndirectMulti", "shader stage", gs[9] == static_cast<uint32_t>(-17),
+          "non-indexed draw patched the wrong shader stage");
+
+  arguments = {0, 1, 6, 41, 7, 0, 1, 8, 43, 9, 0, 1, 10, 45, 11};
+  uint32_t count = 2;
+  const auto multi_count_address = reinterpret_cast<uint64_t>(&count);
+  // Native sceAgcDcbDrawIndexIndirectMulti (0x5800) puts this enable in word4 bit28.
+  std::array<uint32_t, 10> multi_packet{
+      KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0), 0,
+      indexed_packet[2], Pm4::SPI_SHADER_USER_DATA_GS_0 + 10,
+      (1u << 30u) | (1u << 28u) | Pm4::SH_NOP, 3,
+      static_cast<uint32_t>(multi_count_address),
+      static_cast<uint32_t>(multi_count_address >> 32u), 20, 0};
+  check_offsets(multi_packet, gs, {43, 9, 8}, "counted multi-draw offsets");
+  count = 0;
+  check_offsets(multi_packet, gs, {43, 9, 8}, "empty multi-draw");
+  count = 3;
+  multi_packet[5] = 1;
+  multi_packet[3] |= 1u << 28u;
+  multi_packet[4] &= ~(1u << 28u);
+  check_offsets(multi_packet, gs, {41, 7, 8}, "multi-draw enable word and count clamp");
+
+  arguments = {0, 1, 51, 13, 0, 1, 53, 15};
+  std::array<uint32_t, 10> auto_multi_packet{
+      KYTY_PM4(10, Pm4::IT_DRAW_INDIRECT_MULTI, 0), 0,
+      auto_packet[2], auto_packet[3], Pm4::SH_NOP, 2, 0, 0, 16, 2};
+  check_offsets(auto_multi_packet, hs, {53, 15}, "non-indexed multi-draw offsets");
+  arguments = {0, 1, 99, 101};
+  auto_packet[2] = Pm4::SH_NOP;
+  check_offsets(auto_packet, hs, {53, 101}, "independent destinations");
+  auto_packet[3] = Pm4::SH_NOP;
+  arguments[3] = 103;
+  check_offsets(auto_packet, hs, {53, 101}, "disabled destinations");
+  processor.BufferFlush();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
 

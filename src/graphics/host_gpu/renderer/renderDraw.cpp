@@ -2591,8 +2591,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 
 	DrawEmitInfo emit {};
-	emit.vertex_offset  = vertex_offset + args.base_vertex;
-	emit.first_instance = instance_offset;
+	// Native mesh prologs consume the offsets written to the packet's user SGPRs.
+	const bool mesh_indirect = indirect && state.vertex_info[0].logical_stage == ShaderType::Mesh;
+	emit.vertex_offset  = mesh_indirect ? 0 : vertex_offset + args.base_vertex;
+	emit.first_instance = mesh_indirect ? 0 : instance_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -2696,8 +2698,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 	DrawEmitInfo emit {};
-	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
-	emit.first_instance = instance_offset;
+	const bool mesh_indirect = indirect && state.vertex_info[0].logical_stage == ShaderType::Mesh;
+	emit.first_vertex = mesh_indirect ? 0 :
+	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
+	emit.first_instance = mesh_indirect ? 0 : instance_offset;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
