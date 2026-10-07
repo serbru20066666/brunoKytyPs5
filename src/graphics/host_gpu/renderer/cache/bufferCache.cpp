@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <immintrin.h>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -694,36 +695,72 @@ StreamBuffer& BufferCache::ActiveStream() noexcept {
 namespace GuestCopies {
 namespace {
 
-// Handed over by the GPU thread (only it counts them) and made by the recording thread.
-uint64_t              g_handed = 0;
-std::atomic<uint64_t> g_made {0};
-
+// A copy handed over waits in the recording thread's stream behind everything recorded before
+// it. When the GPU thread reached something the guest can see, it waited for the stream to be
+// run up to the copy: a twelfth of its time in ASTRO's PLAYROOM's plaza, waiting for Vulkan calls
+// it had no need of. So the copies also stand in a ring of their own, and whichever thread gets to
+// one first makes it: the recording thread when its stream reaches it, the GPU thread when it has
+// to have them made (Finish). The destination is staging memory nothing reads before the
+// command buffer is submitted, so who copies does not matter, only that it is done once.
+// KYTY_DEBUG_AB=copysteal waits for the stream, as before, in every other window.
 struct Copy {
-	uint8_t* destination = nullptr;
-	uint64_t address     = 0;
-	uint64_t size        = 0;
+	uint8_t*              destination = nullptr;
+	uint64_t              address     = 0;
+	uint64_t              size        = 0;
+	std::atomic<uint32_t> state {Made};
+
+	enum : uint32_t { Waiting, Making, Made };
 };
 
-// On the recording thread. The backing has no page protection, so the copy cannot fault, and it
-// holds what the CPU wrote even where the GPU has written since.
-void Run(VkCommandBuffer /*buffer*/, const uint8_t* payload) {
-	const auto& copy = *reinterpret_cast<const Copy*>(payload);
+constexpr uint64_t RingSize = 1u << 14u;
+Copy               g_ring[RingSize];
+// Both counted by the GPU thread alone: copies handed over, and how many of them, from the
+// oldest on, are known to be made.
+uint64_t g_handed   = 0;
+uint64_t g_finished = 0;
+
+// Makes the copy unless another thread has or is; false while another thread is making it.
+bool Make(Copy& copy) {
+	uint32_t expected = Copy::Waiting;
+	if (!copy.state.compare_exchange_strong(expected, Copy::Making, std::memory_order_acq_rel)) {
+		return expected == Copy::Made;
+	}
+	// The backing has no page protection, so the copy cannot fault, and it holds what the CPU
+	// wrote even where the GPU has written since.
 	if (!LibKernel::Memory::TryReadBacking(copy.address, copy.destination, copy.size)) {
 		// The guest unmapped memory a draw still used.
 		std::memset(copy.destination, 0, copy.size);
 	}
-	g_made.fetch_add(1, std::memory_order_release);
+	copy.state.store(Copy::Made, std::memory_order_release);
+	return true;
+}
+
+// On the recording thread. The slot may by now hold a later copy, which is as good to make.
+void Run(VkCommandBuffer /*buffer*/, const uint8_t* payload) {
+	Copy* copy = nullptr;
+	std::memcpy(&copy, payload, sizeof(copy));
+	(void)Make(*copy);
 }
 
 } // namespace
 
 bool Pending() noexcept {
-	return g_handed != g_made.load(std::memory_order_acquire);
+	return g_handed != g_finished;
 }
 
 void Finish() {
-	if (Pending()) {
+	if (!Pending()) {
+		return;
+	}
+	static const bool ab = AbSelected("copysteal");
+	if (ab && AbFeatureOff()) {
 		DrainGpuThreadCommands();
+	}
+	for (; g_finished != g_handed; g_finished++) {
+		auto& copy = g_ring[g_finished % RingSize];
+		while (!Make(copy)) {
+			_mm_pause();
+		}
 	}
 }
 
@@ -731,11 +768,21 @@ void Finish() {
 // a backing, to `destination`; false when its recording is not deferred, and the caller copies.
 static bool HandOver(VkCommandBuffer buffer, uint8_t* destination, uint64_t address,
                      uint64_t size) {
-	auto* payload = ReserveRecordedCall(buffer, sizeof(Copy));
+	if (g_handed - g_finished == RingSize) {
+		Finish();
+	}
+	auto* payload = ReserveRecordedCall(buffer, sizeof(Copy*));
 	if (payload == nullptr) {
 		return false;
 	}
-	::new (payload) Copy {destination, address, size};
+	// The slot's last copy is made (it is older than g_finished), so no thread reads the slot
+	// until its state says it waits again.
+	auto* copy        = &g_ring[g_handed % RingSize];
+	copy->destination = destination;
+	copy->address     = address;
+	copy->size        = size;
+	copy->state.store(Copy::Waiting, std::memory_order_release);
+	std::memcpy(payload, &copy, sizeof(copy));
 	g_handed++;
 	CommitRecordedCall(Run);
 	return true;
