@@ -21,7 +21,9 @@ Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.3.0**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
+Versión **0.3.1**. Los fps son los de la 0.3.0, medidos en la RX 6800 XT leyendo los que el emulador escribe en el título.
+
+**Nuevo en 0.3.1 — L2 y R2 con presión.** Los juegos que distinguen entre apretar el gatillo suave y apretarlo a fondo no lo notaban: en la escalada de GPU Jungle de ASTRO's PLAYROOM los agarres frágiles (los rosas) nunca se rompían. El juego pregunta al mando en qué tramo de la resistencia del gatillo adaptativo está el dedo, y el emulador respondía siempre «en ninguno». Ahora responde según el efecto que el juego puso en cada gatillo y lo apretado que está.
 
 ![Cuadros por segundo antes y después](docs/screenshots/fps-antes-y-despues.png)
 
