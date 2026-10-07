@@ -17086,6 +17086,35 @@ public:
         }
       }
 
+      static const auto snorm_pixel = [] {
+        std::vector<u32> code;
+        AppendVMovLiteral(&code, 0, 0xc0008000u);
+        AppendVMovLiteral(&code, 1, 0x7fff4000u);
+        code.insert(code.end(), {EncodeExp0(0, 0xf, true, true), EncodeExp1(0, 1, 0, 0)});
+        AppendEnd(&code);
+        return code;
+      }();
+      const auto snorm_address = reinterpret_cast<uint64_t>(snorm_pixel.data());
+      ShaderMapUserData(snorm_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(snorm_pixel.size() * sizeof(u32))});
+      shaders.SetPsShaderBase(snorm_address);
+      registers.SetShaderMask(0xf000);
+      registers.SetTargetOutputMode(0, 6);
+      registers.SetTargetOutputMode(1, 0);
+      RenderExecutorTestAccess::DrawAuto(
+          executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      const auto snorm_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+      constexpr std::array<float, 4> snorm_expected{-1, -16384.0f / 32767,
+                                                    16384.0f / 32767, 1};
+      for (size_t component = 0; component < snorm_pixels.size(); component++) {
+        Require(name, "compressed SNORM16 color export",
+                std::abs(std::bit_cast<float>(snorm_pixels[component]) -
+                         snorm_expected[component % 4]) < 0.00001f,
+                "SNORM16 export lost its sign, normalization or negative endpoint clamp");
+      }
+      registers.SetTargetOutputMode(0, 4);
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
