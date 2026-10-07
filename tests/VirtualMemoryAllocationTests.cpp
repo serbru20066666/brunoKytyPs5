@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <semaphore>
 #include <string>
 #include <thread>
 #include <utility>
@@ -583,6 +584,107 @@ void TestSparseReadDuringDirectCommit() {
 	Check(test, reads.load(std::memory_order_relaxed) != 0 &&
 	                !read_failed.load(std::memory_order_relaxed),
 	      "sparse read observed a gap while direct backing was committed");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+std::counting_semaphore<2>* g_backing_reads_entered  = nullptr;
+std::counting_semaphore<2>* g_continue_backing_reads = nullptr;
+
+void ParkBackingRead(uintptr_t, size_t) {
+	g_backing_reads_entered->release();
+	g_continue_backing_reads->acquire();
+}
+
+void TestConcurrentBackingReads() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "ConcurrentBackingReads";
+	constexpr uint64_t original = 0x123456789abcdef0ull;
+	for (const auto& readers: {std::pair {TryReadBacking, TryReadBacking},
+	                           std::pair {TryReadBacking, TryReadSparseBacking},
+	                           std::pair {TryReadSparseBacking, TryReadSparseBacking}}) {
+		const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
+		                                   "concurrent_backing_reads");
+		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
+		std::counting_semaphore<2> entered {0};
+		std::counting_semaphore<2> resume {0};
+		g_backing_reads_entered  = &entered;
+		g_continue_backing_reads = &resume;
+		TestSetBackingReadCallback(ParkBackingRead);
+		std::array<uint64_t, 2> values {};
+		std::array<bool, 2>     results {};
+		std::thread first([&] { results[0] = readers.first(base, &values[0], sizeof(values[0])); });
+		std::thread second(
+		    [&] { results[1] = readers.second(base, &values[1], sizeof(values[1])); });
+		const bool concurrent = entered.try_acquire_for(std::chrono::seconds(5)) &&
+		                        entered.try_acquire_for(std::chrono::seconds(5));
+		// Release both threads even if an exclusive read lock prevents the second
+		// entry.
+		resume.release(2);
+		first.join();
+		second.join();
+		TestSetBackingReadCallback(nullptr);
+		CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+		Check(test, concurrent, "backing reads could not hold their locks concurrently");
+		Check(test, results[0] && results[1] && values[0] == original && values[1] == original,
+		      "concurrent backing reads returned different contents");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestBackingReadExcludesWritesAndUnmap() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test        = "BackingReadExcludesWritesAndUnmap";
+	constexpr uint64_t original    = 0x123456789abcdef0ull;
+	constexpr uint64_t replacement = 0xfedcba9876543210ull;
+	for (const auto read: {TryReadBacking, TryReadSparseBacking}) {
+		for (const bool unmap: {false, true}) {
+			const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
+			                                   "backing_read_exclusion");
+			std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
+			std::counting_semaphore<2> entered {0};
+			std::counting_semaphore<2> resume {0};
+			g_backing_reads_entered  = &entered;
+			g_continue_backing_reads = &resume;
+			TestSetBackingReadCallback(ParkBackingRead);
+			uint64_t    snapshot = 0;
+			bool        read_ok  = false;
+			std::thread reader([&] { read_ok = read(base, &snapshot, sizeof(snapshot)); });
+			const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
+			std::binary_semaphore started {0};
+			std::binary_semaphore finished {0};
+			bool                  write_ok     = false;
+			int                   unmap_result = OK;
+			std::thread           mutation([&] {
+				started.release();
+				if (unmap) {
+					unmap_result = KernelMunmap(base, SceKernelPageSize);
+				} else {
+					write_ok = TryWriteBacking(base, &replacement, sizeof(replacement));
+				}
+				finished.release();
+			});
+			started.acquire();
+			const bool excluded = !finished.try_acquire_for(std::chrono::milliseconds(100));
+			resume.release();
+			reader.join();
+			mutation.join();
+			TestSetBackingReadCallback(nullptr);
+			uint64_t   after        = 0;
+			const bool still_backed = TryReadBacking(base, &after, sizeof(after));
+			if (!unmap) {
+				CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+			}
+			Check(test, reader_parked && excluded,
+			      "backing write or unmap completed while a backing read held its "
+			      "lock");
+			Check(test, read_ok && snapshot == original,
+			      "backing mutation changed an in-progress read");
+			Check(test,
+			      unmap ? unmap_result == OK && !still_backed
+			            : write_ok && still_backed && after == replacement,
+			      "backing mutation failed after the reader released its lock");
+		}
+	}
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4450,6 +4552,16 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
+		RunTest(TestConcurrentBackingReads);
+		RunTest(TestBackingReadExcludesWritesAndUnmap);
+		RunTest(TestSparseBackingReadPreservesResidency);
+		RunTest(TestSparseReadDuringDirectCommit);
+		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+		RunTest(TestFlexibleMemoryUsesSharedBacking);
+		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #if defined(__linux__)
 	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
 		RunTest(TestFixedDirectReplacementPreservesAccess);
@@ -4498,6 +4610,8 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestSparseReadDuringDirectCommit);
+	RunTest(TestConcurrentBackingReads);
+	RunTest(TestBackingReadExcludesWritesAndUnmap);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
