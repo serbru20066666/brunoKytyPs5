@@ -265,28 +265,18 @@ public:
 			g_test_backing_read(vaddr, size);
 		}
 #endif
-		const auto      end   = vaddr + size;
-		auto            first = m_maps.lower_bound(vaddr);
-		if (first != m_maps.begin()) {
-			auto previous = std::prev(first);
+		const auto end     = vaddr + size;
+		auto       mapping = m_maps.lower_bound(vaddr);
+		if (mapping != m_maps.begin()) {
+			auto previous = std::prev(mapping);
 			if (previous->second.vaddr + previous->second.size > vaddr) {
-				first = previous;
-			}
-		}
-		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
-		     ++mapping) {
-			const auto& entry = mapping->second;
-			const auto  start = std::max(vaddr, entry.vaddr);
-			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
-			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) {
-				return false;
+				mapping = previous;
 			}
 		}
 
 		auto* destination = static_cast<uint8_t*>(data);
 		auto  cursor      = vaddr;
-		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
-		     ++mapping) {
+		for (; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
 			const auto& entry  = mapping->second;
 			const auto  start  = std::max(vaddr, entry.vaddr);
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;

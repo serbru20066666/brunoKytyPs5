@@ -465,6 +465,24 @@ void TestSparseBackingReadPreservesResidency() {
 	          std::all_of(bytes.begin() + commit_size * 2, bytes.end(),
 	                      [](uint8_t value) { return value == 0xa7; }),
 	      "sparse backing read did not copy resident pages and zero nonresident pages");
+	constexpr size_t prefix = 37, suffix = 53;
+	constexpr size_t clipped_size = prefix + commit_size + suffix;
+	std::fill(bytes.begin(), bytes.end(), 0x5a);
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadSparseBacking(
+	          base + commit_size - prefix, bytes.data() + 1, clipped_size),
+	      "sparse backing read rejected unaligned resident edges around a hole");
+	Check(test, bytes.front() == 0x5a && bytes[clipped_size + 1] == 0x5a,
+	      "clipped sparse backing read overwrote destination canaries");
+	Check(test,
+	      std::all_of(bytes.begin() + 1, bytes.begin() + 1 + prefix,
+	                  [](uint8_t value) { return value == 0x3c; }) &&
+	          std::all_of(bytes.begin() + 1 + prefix, bytes.begin() + 1 + prefix + commit_size,
+	                      [](uint8_t value) { return value == 0; }) &&
+	          std::all_of(bytes.begin() + 1 + prefix + commit_size,
+	                      bytes.begin() + 1 + clipped_size,
+	                      [](uint8_t value) { return value == 0xa7; }),
+	      "clipped sparse backing read misplaced resident bytes or the intervening hole");
 	std::fill(bytes.begin(), bytes.end(), 0x5a);
 	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base + commit_size, bytes.data(),
 	                                                        bytes.size()),
