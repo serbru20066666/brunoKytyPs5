@@ -712,6 +712,10 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   using Offset = uint64_t (KYTY_SYSV_ABI *)(void *);
   using WaitAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
                                           uint8_t, uint8_t);
+  using WaitCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
+                                          uint8_t, uint8_t, uint64_t, uint8_t);
+  using WriteCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
+                                           uint8_t, uint32_t);
   using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
   using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
                                        void *, uint64_t, uint64_t);
@@ -728,6 +732,8 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
   const auto offset = reinterpret_cast<Offset>(find("GnxKOHEawhk"));
   const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
+  const auto wait_counter = reinterpret_cast<WaitCounter>(find("cQb8Zr8Q0Y0"));
+  const auto write_counter = reinterpret_cast<WriteCounter>(find("jK+yuYCI7MA"));
   const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
   const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
   const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
@@ -800,6 +806,59 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
       Check(result.result == OK,
             "submission wait observes the completed result");
     }
+  }
+  constexpr std::array counter_comparisons {
+      Comparison{1, 0, 0, 1}, Comparison{1, 0, 0, 1},
+      Comparison{4, 0x7ffffffe, 0x7fffffff, 0x80000000},
+      Comparison{5, 0xffffffff, 0, 1}};
+  for (const auto &comparison : counter_comparisons) {
+    reset(1);
+    auto *producer = buffers[0].header.data();
+    auto *consumer = buffers[1].header.data();
+    auto *lower = buffers[2].header.data();
+    constexpr uint8_t Counter = 127;
+    constexpr auto Invalid = Libs::LibKernel::KERNEL_ERROR_EINVAL;
+    Check(write_counter(producer, 128, 1, 1, 0, 0) == Invalid &&
+              write_counter(producer, Counter, 8, 1, 0, 0) == Invalid &&
+              write_counter(producer, Counter, 1, 1, 5, 0) == Invalid &&
+              write_counter(producer, Counter, 1, 1, 0, 2) == Invalid &&
+              wait_counter(consumer, Counter, 8, 0, 1, 0, 0, 0) == Invalid &&
+              wait_counter(consumer, Counter, 1, 0, 7, 0, 0, 0) == Invalid &&
+              wait_counter(consumer, Counter, 1, 0, 1, 2, 0, 0) == Invalid &&
+              wait_counter(consumer, Counter, 1, 0, 1, 0, 0, 2) == Invalid &&
+              offset(producer) == 0 && offset(consumer) == 0,
+          "invalid counter operations fail without appending a command");
+    uint64_t retired = 0, lower_done = 0;
+    std::array<char, 3> output {};
+    Result result {1234, 5678};
+    std::array<uint32_t, 4> ids {};
+    if (comparison.blocked != 0) {
+      auto *initializer = buffers[3].header.data();
+      Check(write_counter(initializer, Counter, 1, comparison.blocked, 0, 0) == OK &&
+                submit_amm(buffers[3].data.data(), static_cast<uint32_t>(offset(initializer)),
+                           0, &ids[3]) == OK && wait_amm(ids[3]) == OK,
+            "initialize shared counter before dependent submissions");
+    }
+    Check(read_file(producer, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
+                    reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
+                    output.data(), output.size(), 0) == OK &&
+              write_counter(producer, Counter, 1, comparison.released, 0, 0) == OK &&
+              wait_counter(consumer, Counter, 1, comparison.reference, comparison.compare,
+                           0, 0, 0) == OK &&
+              write_counter(consumer, Counter, 1, 0, 0, 0) == OK &&
+              write_address(consumer, &retired, 1) == OK &&
+              write_address(lower, &lower_done, 1) == OK,
+          "build APR completion and dependent AMM counter reset");
+    Check(submit_amm(buffers[1].data.data(), static_cast<uint32_t>(offset(consumer)),
+                     0, &ids[1]) == OK &&
+              submit_amm(buffers[2].data.data(), static_cast<uint32_t>(offset(lower)),
+                         1, &ids[2]) == OK && wait_amm(ids[2]) == OK &&
+              lower_done == 1 && retired == 0,
+          "counter wait blocks AMM retirement while its lower priority progresses");
+    Check(submit_apr(producer, 3, &result, &ids[0]) == OK && wait_amm(ids[1]) == OK &&
+              wait_apr(ids[0]) == OK && result.result == OK && retired == 1 &&
+              std::memcmp(output.data(), "APR", 3) == 0,
+          "shared counter completion releases AMM only after APR read and resets for reuse");
   }
   reset(1);
   namespace EventQueue = Libs::LibKernel::EventQueue;
