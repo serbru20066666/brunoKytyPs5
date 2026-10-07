@@ -780,11 +780,14 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto& sh     = context.GetShaderRegisters();
 	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
+	// GS_EN controls amplification, not whether an NGG shader uses a workgroup.
+	const bool native_ngg = !merged && data.type == Prospero::ShaderBinaryType::kGs &&
+	                        regs.gs_regs.rsrc2.lds_size != 0;
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
-	    merged ? 8u : 0u);
-	if (!merged) {
+	    merged || native_ngg ? 8u : 0u);
+	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
@@ -829,7 +832,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                     group.primitive_group_size != 1u || group.vertex_group_size != 1u ||
 		                     user_vgpr.vgpr1 || user_vgpr.vgpr2 || user_vgpr.vgpr3 ||
 		                     mesh.max_vertices != sh.m_vgtGsMaxVertOut);
-	} else {
+	} else if (merged) {
 		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
 		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
@@ -838,7 +841,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || sh.m_vgtGsMaxVertOut < 3u ||
+	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
 	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
 	    mesh.max_vertices == 0u) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
@@ -846,14 +849,16 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
 	mesh.max_primitives = mesh.fast_launch ? mesh.max_vertices :
+	                      native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices) :
 	                      group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
-	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	                                      native_ngg ? mesh.max_primitives :
+	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	mesh.threads_num[0] =
-	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
+	const auto threads = native_ngg && !mesh.fast_launch ? mesh.vertices_per_group : mesh.max_vertices;
+	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
 }
