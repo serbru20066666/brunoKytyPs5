@@ -897,7 +897,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
-	// PPSA04264
+	// PPSA04264, PPSA04288
+	// A partial view retains the entire matching array layout. HTile belongs to
+	// the depth source, independently of the data slices copied into color storage.
 	const bool retain_cached_layout =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
 	    requested.bytes_per_block == cached.info.bytes_per_block &&
@@ -916,7 +918,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.data.size / requested.resources.layers ==
 	        cached.info.data.size / cached.info.resources.layers &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
+	    (cached.info.metadata.kind == ImageMetadataKind::None ||
+	     cached.info.metadata.kind == ImageMetadataKind::Htile);
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
@@ -941,8 +944,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.data       = cached.info.data;
 		info.resources  = cached.info.resources;
 		info.mip_layout = cached.info.mip_layout;
-	} else {
-		info.resources = std::max(requested.resources, cached.info.resources);
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);

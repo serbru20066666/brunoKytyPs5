@@ -5586,7 +5586,7 @@ public:
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x2800000;
+    constexpr uint64_t allocation_size = 0x2c00000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -6517,6 +6517,74 @@ public:
           "the partial depth view lost a layer or failed to restore raw UINT "
           "sampling");
       DestroyBuffer(&layered_raw_d16_readback);
+
+      // RE2 converts a prefix of a 32-layer HTile depth array to R32F storage.
+      constexpr uint32_t htile_layers = 32;
+      constexpr uint64_t htile_slice_size = 0x10000;
+      auto htile_depth = MakeLinearDesc(
+          base + 0x2800000, htile_layers * htile_slice_size,
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {128, 128, 1}, htile_layers, 4, 1);
+      htile_depth.type = BindingType::DepthTarget;
+      htile_depth.info.tile_mode = Prospero::TileMode::kDepth;
+      htile_depth.info.metadata.kind = ImageMetadataKind::Htile;
+      htile_depth.info.metadata.range = {base + 0x2a00000, htile_layers * 0x8000};
+      htile_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      htile_depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto htile_depth_image = texture_cache.FindImage(htile_depth);
+      vk::ClearValue htile_clear{};
+      htile_clear.depthStencil.depth = 0.25f;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), htile_depth_image,
+          {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, htile_layers}, htile_clear);
+
+      auto htile_storage = htile_depth;
+      htile_storage.type = BindingType::Storage;
+      htile_storage.info.pixel_format = vk::Format::eR32Sfloat;
+      htile_storage.info.metadata = {};
+      htile_storage.view_info.format = vk::Format::eR32Sfloat;
+      htile_storage.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      htile_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      ImageId htile_storage_image{};
+      for (uint32_t layers : {1u, 2u}) {
+        htile_storage.info.data.size = layers * htile_slice_size;
+        htile_storage.info.resources.layers = layers;
+        htile_storage.info.mip_layout[0].size = htile_storage.info.data.size;
+        htile_storage.view_info.layer_count = layers;
+        const auto id = texture_cache.FindImage(htile_storage);
+        const auto &owner = texture_cache.GetImage(id);
+        Require(name, "HTile depth storage prefix layout",
+                id != htile_depth_image &&
+                    (!htile_storage_image || id == htile_storage_image) &&
+                    owner.info.data == htile_depth.info.data &&
+                    owner.info.resources == htile_depth.info.resources &&
+                    owner.info.mip_layout == htile_depth.info.mip_layout &&
+                    owner.backing.layers == htile_layers &&
+                    !owner.info.HasMetadata(),
+                "partial storage conversion separated array layers from their guest layout");
+        Require(name, "HTile depth storage prefix view",
+                texture_cache.FindTexture(id, htile_storage) != nullptr,
+                "converted depth prefix has no storage view");
+        htile_storage_image = id;
+      }
+      auto htile_readback = CreateHostBuffer(
+          name, htile_layers * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(htile_layers));
+      vk::BufferImageCopy htile_copy{};
+      htile_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, htile_layers};
+      htile_copy.imageExtent = {1, 1, 1};
+      texture_cache.GetImage(htile_storage_image).Download(
+          std::span<const vk::BufferImageCopy>(&htile_copy, 1), htile_readback.buffer,
+          0, htile_readback.size);
+      HostReadBarrier(htile_readback.buffer, htile_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "HTile depth storage array contents",
+              ReadBuffer(name, htile_readback, htile_layers) ==
+                  std::vector<u32>(htile_layers, std::bit_cast<u32>(0.25f)),
+              "partial storage conversion lost native depth data outside its view");
+      DestroyBuffer(&htile_readback);
 
       auto layered_stencil_desc = MakeLinearDesc(
           base + 0x27d4000, 6 * 4 * sizeof(float),
@@ -7726,7 +7794,10 @@ public:
       auto layered_depth = layered_color;
       layered_depth.type = BindingType::DepthTarget;
       layered_depth.info.resources = {1, 4};
+      layered_depth.info.mip_layout = {};
+      layered_depth.info.mip_layout[0] = {0, layered_guest_size, 2, 2};
       layered_depth.view_info.level_count = 1;
+      layered_depth.view_info.layer_count = 4;
       layered_depth.info.pixel_format = vk::Format::eD32Sfloat;
       layered_depth.view_info.format = vk::Format::eD32Sfloat;
       layered_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
@@ -7736,13 +7807,13 @@ public:
       const auto &layered_native = texture_cache.GetImage(layered_depth_image);
       Require(name, "layered mipped depth alias",
               layered_depth_image != layered_color_image &&
-                  layered_native.backing.layers == 2 &&
-                  layered_native.backing.mip_levels == 2 &&
+                  layered_native.backing.layers == 4 &&
+                  layered_native.backing.mip_levels == 1 &&
                   layered_native.info.resources ==
-                      layered_color.info.resources &&
+                      layered_depth.info.resources &&
+                  layered_native.info.mip_layout == layered_depth.info.mip_layout &&
                   layered_native.IsGpuModified(),
-              "depth/color conversion did not use the lexicographic "
-              "resource maximum");
+              "depth/color conversion mixed the source mip count with the requested layout");
       const volatile auto layered_guest_byte =
           *reinterpret_cast<const volatile uint8_t *>(memory + layered_offset);
       (void)layered_guest_byte;
@@ -8033,29 +8104,19 @@ public:
                       vk::AccessFlagBits::eTransferWrite);
 
       auto layered_readback = CreateHostBuffer(
-          name, sizeof(layered_values), vk::BufferUsageFlagBits::eTransferDst,
-          std::vector<u32>(sizeof(layered_values) / sizeof(u32), 0));
+          name, 8 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(8, 0));
       auto &layered_depth_native = texture_cache.GetImage(layered_depth_image);
       layered_depth_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
                                    vk::AccessFlagBits2::eTransferRead, {},
                                    command.Handle());
-      std::array<vk::BufferImageCopy, 2> layered_copies{};
-      layered_copies[0].bufferOffset = 0;
-      layered_copies[0].imageSubresource.aspectMask =
-          vk::ImageAspectFlagBits::eDepth;
-      layered_copies[0].imageSubresource.mipLevel = 0;
-      layered_copies[0].imageSubresource.layerCount = 2;
-      layered_copies[0].imageExtent = {2, 2, 1};
-      layered_copies[1].bufferOffset = 32;
-      layered_copies[1].imageSubresource.aspectMask =
-          vk::ImageAspectFlagBits::eDepth;
-      layered_copies[1].imageSubresource.mipLevel = 1;
-      layered_copies[1].imageSubresource.layerCount = 2;
-      layered_copies[1].imageExtent = {1, 1, 1};
+      vk::BufferImageCopy layered_copy{};
+      layered_copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 2};
+      layered_copy.imageExtent = {2, 2, 1};
       command.Handle().copyImageToBuffer(
           layered_depth_native.backing.image,
           vk::ImageLayout::eTransferSrcOptimal, layered_readback.buffer,
-          static_cast<uint32_t>(layered_copies.size()), layered_copies.data());
+          1, &layered_copy);
       HostReadBarrier(layered_readback.buffer, layered_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
@@ -8268,21 +8329,19 @@ public:
                   std::vector<u32>{0x40004200u, 0x44003c00u},
               "GPU BGRA16 swap did not publish RGBA half-word order");
       scheduler.Finish();
-      const auto layered_words =
-          ReadBuffer(name, layered_readback, layered_values.size());
-      const std::array<float, 10> layered_expected{
+      const auto layered_words = ReadBuffer(name, layered_readback, 8);
+      const std::array<float, 8> layered_expected{
           layered_values[0], layered_values[1], layered_values[2],
           layered_values[3], layered_values[4], layered_values[5],
-          layered_values[6], layered_values[7], layered_values[8],
-          layered_values[9]};
+          layered_values[6], layered_values[7]};
       bool layered_content = layered_words.size() == layered_expected.size();
       for (uint32_t index = 0;
            layered_content && index < layered_expected.size(); index++) {
         layered_content &=
             layered_words[index] == std::bit_cast<u32>(layered_expected[index]);
       }
-      Require(name, "layered mipped depth content", layered_content,
-              "depth/color conversion changed a mip or array-layer value");
+      Require(name, "layered depth common-mip content", layered_content,
+              "depth/color conversion changed a shared array-layer value");
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},
