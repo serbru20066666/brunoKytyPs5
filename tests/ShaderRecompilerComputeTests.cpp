@@ -405,6 +405,11 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+                        const DrawIndexArgs &args) {
+    executor.DrawIndex(0, command, args);
+  }
+
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
@@ -16358,6 +16363,7 @@ public:
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
+    constexpr uint64_t index_address = rect_address + 0x1000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -16401,6 +16407,8 @@ public:
           -0.75f,  0.75f, 0, 0, 0, 1, 0, 0};
       std::memcpy(reinterpret_cast<void *>(rect_address), rect_vertices.data(),
                   sizeof(rect_vertices));
+      constexpr std::array<uint32_t, 3> indices{0, 1, 2};
+      std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -17267,6 +17275,56 @@ public:
                 "SNORM16 export lost its sign, normalization or negative endpoint clamp");
       }
       registers.SetTargetOutputMode(0, 4);
+
+      // Indirect arguments also reach s8/s9. Native VS prologs must add them
+      // exactly once, for both indexed and automatically generated indices.
+      static const auto indirect_vertex = [&] {
+        auto code = native_vertex;
+        for (auto &word : code) {
+          if (word == EncodeVopc(0xc2, InlineU32(1), 5))
+            word = EncodeVopc(0xc2, InlineU32(8), 5);
+          else if (word == EncodeVopc(0xc2, InlineU32(2), 5))
+            word = EncodeVopc(0xc2, InlineU32(9), 5);
+        }
+        code.insert(code.begin(), {EncodeVop2(0x25, 5, 8, 5),
+                                   EncodeVop2(0x25, 8, 9, 8)});
+        const auto position = std::ranges::find(code, EncodeExp0(0x0c, 0xf));
+        code.insert(position, {EncodeVopc(0xc2, InlineU32(5), 8),
+                               EncodeVop2(0x01, 3, Vgpr(1), 3),
+                               EncodeVop2(0x01, 4, Vgpr(1), 4)});
+        return code;
+      }();
+      const auto indirect_vs = reinterpret_cast<uint64_t>(indirect_vertex.data());
+      ShaderMapUserData(indirect_vs,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<uint32_t>(indirect_vertex.size() * sizeof(u32))});
+      shaders.SetEsShaderBase(indirect_vs);
+      shaders.SetPsShaderBase(pixel_address);
+      shaders.SetGsShaderResource2({.user_sgpr = 2});
+      shaders.SetGsUserSgpr(0, 7, HW::UserSgprType::Unknown);
+      shaders.SetGsUserSgpr(1, 5, HW::UserSgprType::Unknown);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      for (const bool indexed : {false, true}) {
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        if (indexed) {
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+               .instance_count = 1, .index_type_and_size = 1, .base_vertex = 7, .first_instance = 5,
+               .offset_source = DrawOffsetSource::IndirectArgs});
+        } else {
+          RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+              {.vertex_count = 3, .instance_count = 1, .first_vertex = 7, .first_instance = 5,
+               .offset_source = DrawOffsetSource::IndirectArgs});
+        }
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          Require("NativeIndirectDrawOffsets", indexed ? "indexed" : "auto",
+                  pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                  "native vertex or instance offset was applied twice");
+        }
+      }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
