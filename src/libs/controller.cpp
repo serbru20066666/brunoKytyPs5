@@ -117,6 +117,7 @@ public:
 	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	void GetTriggerEffectState(uint8_t* left, uint8_t* right);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -139,9 +140,48 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	// The game's last effect for L2 and R2.
+	PadTriggerEffectCommand m_trigger_command[2] {};
 };
 
 static GameController* g_controller = nullptr;
+
+// What scePadGetTriggerEffectState reports for one trigger: where the trigger is relative to the
+// zone its current effect starts at. A game reads this to know that the player pushed through
+// the resistance, which the analog value alone does not tell it.
+static uint8_t trigger_effect_state(const PadTriggerEffectCommand& command, int analog) {
+	enum : uint8_t {
+		Off              = 0,
+		FeedbackStandby  = 1,
+		FeedbackActive   = 2,
+		WeaponStandby    = 3,
+		WeaponPulling    = 4,
+		WeaponFired      = 5,
+		VibrationStandby = 6,
+		VibrationActive  = 7,
+	};
+	// The effects divide the trigger's travel into ten zones.
+	const int zone       = std::clamp(analog, 0, 255) * 10 / 256;
+	auto      first_zone = [](const uint8_t* strengths) {
+		int i = 0;
+		while (i < 10 && strengths[i] == 0) {
+			i++;
+		}
+		return i;
+	};
+	switch (command.mode) {
+		case 1: return zone >= command.data[0] ? FeedbackActive : FeedbackStandby;
+		case 2:
+			return zone < command.data[0]    ? WeaponStandby
+			       : zone <= command.data[1] ? WeaponPulling
+			                                 : WeaponFired;
+		case 3: return zone >= command.data[0] ? VibrationActive : VibrationStandby;
+		case 4: return zone >= first_zone(command.data) ? FeedbackActive : FeedbackStandby;
+		case 5: return zone >= command.data[0] ? FeedbackActive : FeedbackStandby;
+		case 6: return zone >= first_zone(command.data + 1) ? VibrationActive : VibrationStandby;
+		default: return Off;
+	}
+}
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
@@ -610,11 +650,24 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 
 	Common::LockGuard lock(m_mutex);
+	for (int i = 0; i < 2; i++) {
+		if ((param.trigger_mask & (1u << i)) != 0) {
+			m_trigger_command[i] = param.command[i];
+		}
+	}
 	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
 	return true;
+}
+
+void GameController::GetTriggerEffectState(uint8_t* left, uint8_t* right) {
+	Common::LockGuard lock(m_mutex);
+	*left  = trigger_effect_state(m_trigger_command[0],
+	                              m_state.axes[static_cast<int>(Controller::Axis::TriggerLeft)]);
+	*right = trigger_effect_state(m_trigger_command[1],
+	                              m_state.axes[static_cast<int>(Controller::Axis::TriggerRight)]);
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -937,6 +990,10 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;
+}
+
+void GetTriggerEffectState(uint8_t* left, uint8_t* right) {
+	g_controller->GetTriggerEffectState(left, right);
 }
 
 int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {

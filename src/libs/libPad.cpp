@@ -22,6 +22,7 @@ static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	return 0;
 }
 
+// One state per trigger, L2 then R2.
 struct PadTriggerEffectStateInformation {
 	int32_t state[2];
 };
@@ -36,8 +37,10 @@ static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                           
 		return -2137653243; /* 0x80960005 */
 	}
 
-	info->state[0] = 0;
-	info->state[1] = 0;
+	uint8_t state[2] = {};
+	Controller::GetTriggerEffectState(&state[0], &state[1]);
+	info->state[0] = state[0];
+	info->state[1] = state[1];
 
 	return 0;
 }

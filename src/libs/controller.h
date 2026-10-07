@@ -87,6 +87,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
 int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param);
+void              GetTriggerEffectState(uint8_t* left, uint8_t* right);
 int KYTY_SYSV_ABI PadResetLightBar(int handle);
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
 
