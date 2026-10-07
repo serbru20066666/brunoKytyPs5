@@ -38523,7 +38523,6 @@ int main(int argc, char **argv) {
   vulkan.CheckCubeFaceStorageExpansion();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
@@ -38537,7 +38536,6 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, true);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
-#endif
   } else {
     skipped_device_checks = true;
   }
