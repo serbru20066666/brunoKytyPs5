@@ -744,10 +744,21 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 			return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, 0u), resource);
 		}
 		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
-		return EmitValueOrDefaultIfCondition(
+		const auto value = EmitValueOrDefaultIfCondition(
 		    ctx.state, plan.in_bounds, TypeU32(ctx.state),
 		    FormattedOutOfBoundsValue(ctx, mem, plan, 1u),
 		    [&]() { return LoadFormattedInBounds(ctx, mem, plan, 0u); });
+		if (mem.data_bits != 16u) {
+			return value;
+		}
+		if (info.type == Format::ComponentType::Uint) {
+			return EmitUMin32(ctx.state, value, ConstantU32(ctx.state, 0xffffu));
+		}
+		if (info.type == Format::ComponentType::Sint) {
+			const auto lower = EmitSMax32(ctx.state, value, ConstantU32(ctx.state, 0xffff8000u));
+			return EmitSMin32(ctx.state, lower, ConstantU32(ctx.state, 0x7fffu));
+		}
+		return EmitConvertF16F32(ctx.state, EmitBitCastF32U32(ctx.state, value));
 	});
 }
 
