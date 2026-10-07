@@ -374,11 +374,17 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		line_width = 1.0f;
 	}
 	dynamic_state.SetLineWidth(line_width);
-	const auto&      blend = ctx.GetBlendColor();
-	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	dynamic_state.SetBlendConstants(blend_constants);
+#if defined(__APPLE__)
+	// Without a depth attachment the test is a no-op per the Vulkan spec, but MoltenVK/Metal
+	// rejects every fragment when a depth test is enabled with no depth target bound.
+	const bool has_depth_target = static_cast<bool>(depth.image_id);
+	dynamic_state.SetDepthTestEnabled(has_depth_target && depth.depth_test_enable);
+	dynamic_state.SetDepthWriteEnabled(has_depth_target && depth.depth_write_enable);
+#else
 	dynamic_state.SetDepthTestEnabled(depth.depth_test_enable);
 	dynamic_state.SetDepthWriteEnabled(depth.depth_write_enable);
+#endif
 	dynamic_state.SetDepthCompareOp(depth.depth_compare_op);
 #if !defined(__APPLE__)
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
