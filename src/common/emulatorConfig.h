@@ -97,6 +97,7 @@ struct ConfigOptions {
 	bool                   speculative_draws_enabled   = true;
 	bool                   record_thread_enabled       = true;
 	bool                   hardware_buffer_bounds      = true;
+	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -200,6 +201,7 @@ bool RecordThreadEnabled();
 // Storage buffer range checks are left to the device where it defines out-of-range dword
 // accesses (robustBufferAccess2), instead of being compiled into every shader. Read at start.
 bool HardwareBufferBoundsEnabled();
+bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

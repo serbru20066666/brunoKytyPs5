@@ -124,6 +124,7 @@ public:
 	bool                   frame_generation_enabled    = false;
 	bool                   fsr_upscaling_enabled       = false;
 	bool                   trophy_enabled              = true;
+	bool                   skip_notice_screen          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -160,6 +161,7 @@ public:
 		frame_generation_enabled    = other.frame_generation_enabled;
 		fsr_upscaling_enabled       = other.fsr_upscaling_enabled;
 		trophy_enabled              = other.trophy_enabled;
+		skip_notice_screen          = other.skip_notice_screen;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;

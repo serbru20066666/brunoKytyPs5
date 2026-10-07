@@ -251,6 +251,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--frame-generation" << BoolArg(info.frame_generation_enabled);
 	args << "--fsr-upscaling" << BoolArg(info.fsr_upscaling_enabled);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}

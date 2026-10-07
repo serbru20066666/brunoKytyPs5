@@ -276,6 +276,9 @@ void SetRelaxedReadbackEnabled(bool enabled) {
 	g_relaxed_readback_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+bool SkipNoticeScreen() {
+	return g_config->skip_notice_screen;
+}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
