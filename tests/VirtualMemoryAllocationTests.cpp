@@ -60,6 +60,12 @@
 #endif
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+namespace Libs::LibKernel::Memory {
+bool TestWindowsBackingViewModes();
+}
+#endif
+
 namespace Libs::Fiber {
 struct FiberObject;
 struct FiberOptParam;
@@ -1492,6 +1498,15 @@ void TestPartialUnmapPreservesHostPermissions() {
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
 	        "KernelMunmap(right cleanup)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestWindowsBackingViewPermissions() {
+	const char* test = "WindowsBackingViewPermissions";
+	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
+	      "backing view permissions differ from the requested mode");
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -4269,6 +4284,9 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestWindowsBackingViewPermissions);
 #endif
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
