@@ -170,6 +170,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
@@ -310,6 +311,7 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 // Changes whenever a shader is registered: stage inputs prepared while it held still hold for the
 // shader map (read it before preparing).
 [[nodiscard]] uint64_t ShaderMapVersion();
