@@ -14550,8 +14550,8 @@ public:
               "backing");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      {
-        constexpr uint32_t before = 0x13579bdfu;
+      for (const bool formatted : {false, true}) {
+        const uint32_t before = formatted ? 0x13579bdfu : 0x89abcdefu;
         constexpr uint32_t guard = 0x2468ace0u;
         constexpr uint32_t after = 0xa1b2c3d4u;
         vk::ClearValue clear{};
@@ -14565,7 +14565,7 @@ public:
             {vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1}, clear);
 
         const auto buffer_program = make_buffer_program(
-            ShaderType::Vertex, {.read = true, .formatted = true});
+            ShaderType::Vertex, {.read = true, .formatted = formatted});
 
         constexpr uint64_t buffer_size = 2 * target_mip_size;
         static_assert(buffer_size > BufferCache::CACHING_PAGESIZE);
@@ -14588,13 +14588,13 @@ public:
         RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, stages, std::span{&target, 1u});
         const auto &buffer = buffer_bindings.buffers[0];
-        Require(name, "rediscovered target formatted-buffer read",
+        Require(name, "rediscovered target buffer read",
                 target.image_id == expanded_array_id &&
                     buffer.range == buffer_size &&
                     buffer_bindings.images.empty() &&
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
                         vk::ImageLayout::eTransferSrcOptimal,
-                "target discovery did not precede the formatted image-to-buffer copy");
+                "target discovery did not precede the image-to-buffer copy");
         auto readback = CreateHostBuffer(name, 2 * sizeof(uint32_t),
                                         vk::BufferUsageFlagBits::eTransferDst, {0, 0});
         const std::array copies{
@@ -14616,12 +14616,12 @@ public:
 
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &target, 1, no_array_depth);
-        Require(name, "attachment layout after formatted-buffer read",
+        Require(name, "attachment layout after buffer read",
                 rendering.color_attachments[0].image_layout ==
                     vk::ImageLayout::eColorAttachmentOptimal &&
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
                         vk::ImageLayout::eColorAttachmentOptimal,
-                "the formatted buffer copy left the render attachment in its transfer layout");
+                "the buffer copy left the render attachment in its transfer layout");
         vk::ClearAttachment clear_attachment{};
         clear_attachment.aspectMask = vk::ImageAspectFlagBits::eColor;
         clear_attachment.colorAttachment = 0;
@@ -14631,11 +14631,11 @@ public:
         scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
-        Require(name, "formatted alias observes prior GPU contents",
+        Require(name, "buffer alias observes prior GPU contents",
                 ReadBuffer(name, readback, 2) == std::vector<u32>{before, guard},
-                "formatted buffer acquisition copied stale guest bytes instead of the image");
+                "buffer acquisition copied stale guest bytes instead of the image");
         DestroyBuffer(&readback);
-        Require(name, "rendering after formatted-buffer acquisition",
+        Require(name, "rendering after buffer acquisition",
                 ReadCachedTexel(name, context, target.image_id) == std::vector<u32>{after} &&
                     ReadCachedTexel(name, context, target.image_id, {}, {1, 1, 1}, 1) ==
                         std::vector<u32>{guard},
