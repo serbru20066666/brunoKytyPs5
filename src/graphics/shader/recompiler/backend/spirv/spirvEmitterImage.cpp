@@ -752,14 +752,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto EmitGather = [&](uint32_t mip) {
 				const auto sampled = MakeSampledImage(state, mem.resource, sampler_id, mip);
 				const auto sample = state.builder.AllocateId();
-				std::vector<uint32_t> words {
-				    static_cast<uint32_t>(dref ? spv::OpImageDrefGather : spv::OpImageGather), result_type,
-				    sample, sampled, coord, component_or_dref};
-				if (operand_mask != 0u) {
-					words.push_back(operand_mask);
-					words.push_back(offset);
-				}
-				state.builder.AddFunction(words);
+				const std::array operands {operand_mask, offset};
+				state.builder.AddFunction(
+				    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
+				    sample, sampled, coord, component_or_dref,
+				    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
 				return sample;
 			};
 			const auto sample = image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
@@ -791,24 +788,25 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		uint32_t              operand_mask = 0;
-		std::vector<uint32_t> operands;
+		std::array<uint32_t, 3> operands {};
+		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
-			operand_mask |= spv::ImageOperandsGradMask;
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components));
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components));
+			operands[0] = spv::ImageOperandsGradMask;
+			operands[1] = CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components);
+			operands[2] = CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components);
+			operand_count = 3;
 		} else if (explicit_lod) {
-			operand_mask |= spv::ImageOperandsLodMask;
 			auto lod = ZeroF32(state);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
 			}
-			operands.push_back(lod);
+			operands[0] = spv::ImageOperandsLodMask;
+			operands[1] = lod;
+			operand_count = 2;
 		} else if (layout.bias != NoImageComponent) {
-			operand_mask |= spv::ImageOperandsBiasMask;
-			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
+			operands[0] = spv::ImageOperandsBiasMask;
+			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
+			operand_count = 2;
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
@@ -818,16 +816,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
-			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
-			if (dref) {
-				sample_operands.push_back(dref_value);
-			}
-			if (operand_mask != 0u) {
-				sample_operands.push_back(operand_mask);
-				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
-			}
-			state.builder.AddFunction(opcode, sample_operands);
+			const auto sample = state.builder.AllocateId();
+			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
+			                          std::span(&dref_value, dref ? 1u : 0u),
+			                          std::span<const uint32_t>(operands).first(operand_count));
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {

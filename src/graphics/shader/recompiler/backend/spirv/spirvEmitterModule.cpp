@@ -393,11 +393,11 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value) {
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {
 	EXIT_IF(components < 1u || components > 4u);
-	const auto            zero = ConstantU32(state, 0);
+	const auto zero = ConstantU32(state, 0);
 	if (components == 1u) return zero;
-	std::vector<uint32_t> values(components, zero);
+	const std::array values {zero, zero, zero, zero};
 	return state.builder.Constant(spv::OpConstantComposite, TypeU32Composite(state, components),
-	                              values);
+	                              std::span(values).first(components));
 }
 
 uint32_t GlslStd450(EmitterState& state) {

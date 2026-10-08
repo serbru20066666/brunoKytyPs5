@@ -79,10 +79,8 @@ uint32_t EmitFMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, b
 
 uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
                  std::initializer_list<uint32_t> args) {
-	const auto            result = state.builder.AllocateId();
-	std::vector<uint32_t> words {spv::OpExtInst, type, result, GlslStd450(state), opcode};
-	words.insert(words.end(), args.begin(), args.end());
-	state.builder.AddFunction(words);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, type, result, GlslStd450(state), opcode, args);
 	return result;
 }
 
