@@ -3718,7 +3718,7 @@ bool TestWindowsBackingViewModes() {
 	         std::pair {VirtualMemory::Mode::Read, DWORD {PAGE_READONLY}},
 	         std::pair {VirtualMemory::Mode::ReadWrite, DWORD {PAGE_READWRITE}},
 	         std::pair {VirtualMemory::Mode::ExecuteReadWrite, DWORD {PAGE_EXECUTE_READWRITE}}}) {
-		if (!backing.MapFixed(address, size, 0, mode)) {
+		if (!backing.MapExistingPlaceholderFixed(address, size, 0, mode)) {
 			valid = false;
 			break;
 		}
