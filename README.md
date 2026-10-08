@@ -21,9 +21,17 @@ Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.4.0**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
+Versión **0.4.1**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
-**Nuevo en 0.4.0 — menos trabajo del procesador por dibujo.** La entrada de GPU Jungle pasa de
+**Nuevo en 0.4.1 — el launcher.** Su lista muestra solo títulos de PS5 (antes aparecían como
+juegos los volcados de PS4, con sus parches y contenidos adicionales) y ya no recorre el disco
+entero para buscarlos: con una carpeta de juegos que era un disco completo abre en 1,3 s en vez
+de 8,3. «Apply recommended settings» fija también la resolución de la ventana y la generación de
+cuadros, que antes se quedaban como estuvieran. Y un doble clic sobre `kyty_emulator.exe` abre el
+launcher en lugar de cerrarse. El emulador no cambia: la caché de shaders de la 0.4.0 sigue
+sirviendo.
+
+**De la 0.4.0 — menos trabajo del procesador por dibujo.** La entrada de GPU Jungle pasa de
 46,9 a 57,0 fps, CPU Plaza se queda clavada en 60 con margen y jugando hay muy pocos tirones.
 Lo más cargado de la selva sigue lejos de 60 (38,7 fps en la escalera del acantilado): para eso
 hace falta que el juego emita menos dibujos, no más recortes. La primera vez que se abre un juego
