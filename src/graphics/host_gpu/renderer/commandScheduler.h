@@ -175,6 +175,7 @@ private:
 	std::vector<ZoneMark> m_zone_marks;
 	std::chrono::steady_clock::time_point m_last_submit {};
 	std::chrono::steady_clock::time_point m_last_pending_refresh {}; // See PopPendingOperations.
+	uint32_t                              m_pending_calls = 0;      // See PopPendingOperations.
 	// The GPU's progress when PopPendingOperations last found nothing ready to run.
 	std::atomic<uint64_t> m_pending_waiting_tick {UINT64_MAX};
 };

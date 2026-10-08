@@ -53,7 +53,7 @@ private:
 
 	GraphicContext&                                             m_graphics;
 	const uint64_t                                              m_id = NextId();
-	Common::Mutex                                               m_mutex;
+	Common::SpinMutex                                           m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };
 

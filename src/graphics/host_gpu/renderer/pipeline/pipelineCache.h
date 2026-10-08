@@ -299,7 +299,7 @@ private:
 	// Asynchronous pipelines: draws skipped so far for each pipeline whose parts are compiling.
 	std::unordered_map<GraphicsPipelineKey, uint32_t, GraphicsPipelineKeyHash> m_deferred_draws;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	Common::SpinMutex m_mutex;
 	std::jthread                                            m_precompile_thread;
 	std::mutex                                              m_precompile_join_mutex;
 	std::atomic_bool                                        m_precompile_done {true};

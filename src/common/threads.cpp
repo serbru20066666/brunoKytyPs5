@@ -22,6 +22,10 @@
 #include <string>
 #include <thread>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -132,7 +136,10 @@ namespace Common {
 
 using thread_id_t = std::thread::id;
 
-struct MutexPrivate {
+// On a cache line of its own: a lock taken for every draw shared its line with whatever the heap
+// put beside it, and each write there from another thread made the next lock or unlock wait for
+// the line.
+struct alignas(64) MutexPrivate {
 #ifdef KYTY_WIN_CS
 	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, KYTY_CS_SPIN_COUNT); }
 	~MutexPrivate() { DeleteCriticalSection(&m_cs); }
@@ -259,6 +266,17 @@ Mutex::Mutex(): m_mutex(std::make_unique<MutexPrivate>()) {}
 
 Mutex::~Mutex() {
 	m_mutex.reset();
+}
+
+void SpinMutex::Relax(uint32_t spins) noexcept {
+	// The holder is mostly a draw away from releasing; past that, let it run.
+	if (spins < 4000) {
+#if defined(_M_X64) || defined(__x86_64__)
+		_mm_pause();
+#endif
+	} else {
+		std::this_thread::yield();
+	}
 }
 
 void Mutex::Lock() {

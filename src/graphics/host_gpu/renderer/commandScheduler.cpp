@@ -244,10 +244,17 @@ void CommandScheduler::PopPendingOperations(bool wait_for_priority) {
 	// GPU's progress at most once per interval. IsFree and the command pool query on demand.
 	static constexpr auto RefreshInterval = std::chrono::microseconds(200);
 	static const bool     ab              = AbSelected("pending");
-	const auto            now             = std::chrono::steady_clock::now();
-	if ((ab && AbFeatureOff()) || now - m_last_pending_refresh >= RefreshInterval) {
-		m_master.Refresh();
-		m_last_pending_refresh = now;
+	// Reading the clock for every draw was itself 1% of the GPU thread in GPU Jungle: a draw
+	// entry reads it every sixteenth call. KYTY_DEBUG_AB=pendingclock reads it every time in
+	// alternate windows.
+	static const bool clock_ab = AbSelected("pendingclock");
+	if (wait_for_priority || (++m_pending_calls & 15u) == 0 || (clock_ab && AbFeatureOff()) ||
+	    (ab && AbFeatureOff())) {
+		const auto now = std::chrono::steady_clock::now();
+		if ((ab && AbFeatureOff()) || now - m_last_pending_refresh >= RefreshInterval) {
+			m_master.Refresh();
+			m_last_pending_refresh = now;
+		}
 	}
 	// An operation waits for the tick it was queued in, which the GPU has never completed yet,
 	// and the queue is in tick order: once its front is found waiting, nothing in it runs until
