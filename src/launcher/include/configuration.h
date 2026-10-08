@@ -171,6 +171,10 @@ public:
 			// FSR scales that to the whole screen.
 			fsr_upscaling_enabled = true;
 			fullscreen_enabled    = true;
+			// The window when it is not full screen. Named here, like frame generation, so that
+			// neither is left over from the settings these replace.
+			screen_resolution        = Resolution::R1920X1080;
+			frame_generation_enabled = false;
 #if defined(_WIN32)
 			red_zone_protection_enabled = true;
 #endif
