@@ -37,6 +37,8 @@ public:
 	[[nodiscard]] const InstructionList&  Instructions() const;
 	[[nodiscard]] std::span<Block* const> ImmPredecessors() const;
 	[[nodiscard]] std::span<Block* const> ImmSuccessors() const;
+	[[nodiscard]] uint32_t Definition() const { return definition; }
+	void SetDefinition(uint32_t value) const { definition = value; }
 
 	void               SsaSeal();
 	[[nodiscard]] bool IsSsaSealed() const;
@@ -57,6 +59,7 @@ private:
 	std::vector<Block*> predecessors;
 	std::vector<Block*> successors;
 	bool                ssa_sealed = false;
+	mutable uint32_t    definition = 0;
 };
 
 using BlockList = std::vector<Block*>;

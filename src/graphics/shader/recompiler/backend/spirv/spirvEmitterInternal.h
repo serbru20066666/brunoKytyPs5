@@ -167,7 +167,6 @@ struct EmitterState {
 	std::vector<InputBinding>                        inputs;
 	std::vector<OutputBinding>                       outputs;
 	std::vector<uint32_t>                            interface_variables;
-	std::unordered_map<const IR::Block*, uint32_t>   labels;
 	// Long select(index == constant, ...) chains (V_MOVRELS reads) become one OpSwitch at their
 	// outermost select; their inner selects emit nothing (see EmitIndexedSelect).
 	bool                                             indexed_selects_found = false;
@@ -267,12 +266,10 @@ struct ValueEmitContext {
 	const IR::Inst*       ImageAddress(IR::Value value);
 	const IR::MemoryInfo& Memory(const IR::Inst& inst) const;
 	const IR::ExportInfo& Export(const IR::Inst& inst) const;
-	uint32_t              Label(const IR::Block* block) const;
 	[[noreturn]] void     Fail(const char* reason) const;
 	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
-	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	uint32_t                                                           scratch_u32_variable = 0;

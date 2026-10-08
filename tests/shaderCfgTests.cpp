@@ -14719,14 +14719,39 @@ void TestCompilerStageInputOwnership() {
 void TestSpirvEmissionOwnsRequirements() {
   using namespace ShaderRecompiler;
   const uint32_t shader[] = {EncodeSopp(0x01)};
-  const auto options = MakeCompileOptions(ShaderType::Compute);
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64;
+  options.input_info.compute = &compute;
   auto compiled = RecompileForTest(shader, options);
   IR::IREmitter emitter(compiled.program.blocks.front());
-  emitter.Emit(IR::ValueOpcode::LaneId, {});
+  const auto lane = emitter.Emit(IR::ValueOpcode::LaneId, {});
+  const auto value = emitter.Emit(IR::ValueOpcode::IAdd32, {lane, IR::Value(1u)});
+  const auto first = emitter.Emit(IR::ValueOpcode::ReadFirstLane,
+                                  {value, IR::Value(true)});
+  emitter.Emit(IR::ValueOpcode::IAdd32, {first, lane});
   const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
   CheckSpirvBinaryValidates(binary);
   Check((DisassembleSpirvBinary(binary).find("BuiltIn SubgroupLocalInvocationId") != std::string::npos),
         "emission reused requirements from an earlier IR version");
+  Check(Spirv::EmitProgram(compiled.program, options.input_info) == binary,
+        "repeated emission reused IDs from the previous module");
+
+  compute.host_subgroup_size = 32;
+  const auto split = Spirv::EmitProgram(compiled.program, options.input_info);
+  CheckSpirvBinaryValidates(split);
+  Check(split != binary &&
+            Spirv::EmitProgram(compiled.program, options.input_info) == split,
+        "split-wave emission did not reset both halves' definitions");
+
+  compute.host_subgroup_size = 64;
+  Check(Spirv::EmitProgram(compiled.program, options.input_info) == binary,
+        "native-wave re-emission retained split-wave definitions");
+  compute.host_subgroup_size = 32;
+  Check(Spirv::EmitProgram(compiled.program, options.input_info) == split,
+        "split-wave re-emission retained native-wave definitions");
 }
 
 void TestRepeatedExportsHaveOneInterface() {

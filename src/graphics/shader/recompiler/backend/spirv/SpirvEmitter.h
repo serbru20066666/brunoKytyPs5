@@ -9,6 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
+// Resets and writes IR backend IDs; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info);
 

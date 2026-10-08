@@ -105,13 +105,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
-				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont),
-				                              spv::LoopControlMaskNone);
+				ctx.state.builder.AddFunction(spv::OpLoopMerge, merge->Definition(),
+				                              cont->Definition(), spv::LoopControlMaskNone);
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
 		           term.merge_block != UINT32_MAX) {
 			if (const auto* merge = TargetBlock(program, term.merge_block); merge != nullptr) {
-				ctx.state.builder.AddFunction(spv::OpSelectionMerge, ctx.Label(merge),
+				ctx.state.builder.AddFunction(spv::OpSelectionMerge, merge->Definition(),
 				                              spv::SelectionControlMaskNone);
 			}
 		}
@@ -125,7 +125,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				return;
 			}
 			emit_merge();
-			ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(target));
+			ctx.state.builder.AddFunction(spv::OpBranch, target->Definition());
 			return;
 		}
 		case CFG::TerminatorKind::ConditionalBranch: {
@@ -138,7 +138,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			const auto condition = ctx.Def(info.condition);
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
-			                              ctx.Label(true_block), ctx.Label(false_block));
+			                              true_block->Definition(), false_block->Definition());
 			return;
 		}
 		default: EmitReturn(ctx); return;
@@ -446,7 +446,7 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		}
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			const auto* predecessor = inst.PhiBlock(index);
-			if (predecessor == nullptr || !ctx.state.labels.contains(predecessor)) {
+			if (predecessor == nullptr || predecessor->Definition() == 0) {
 				ctx.Fail(inst, "has a predecessor outside the structured function");
 			}
 		}
@@ -480,7 +480,7 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
-	EmitLabel(ctx.state, ctx.Label(block));
+	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -521,7 +521,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
-	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
+	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
@@ -536,7 +536,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
 	auto&       state = ctx.state;
 	const auto* entry = state.program.blocks.front();
-	state.builder.AddFunction(spv::OpBranch, ctx.Label(entry));
+	state.builder.AddFunction(spv::OpBranch, entry->Definition());
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
@@ -564,7 +564,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	std::vector<uint32_t> words {spv::OpSwitch, pc, dispatcher.after_switch_label};
 	for (size_t index = 1; index < state.program.blocks.size(); index++) {
 		words.push_back(state.program.block_info[index].id);
-		words.push_back(ctx.Label(state.program.blocks[index]));
+		words.push_back(state.program.blocks[index]->Definition());
 	}
 	state.builder.AddFunction(words);
 	std::vector<uint32_t> next_pc_words {spv::OpPhi, TypeU32(state), next_pc,
@@ -749,23 +749,23 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
-	if (const auto found = definitions.find(&inst); found != definitions.end()) {
-		return found->second;
+	if (const auto id = inst.Definition(half); id != 0) {
+		return id;
 	}
 	const auto id = state.builder.AllocateId();
-	definitions.emplace(&inst, id);
+	inst.SetDefinition(half, id);
 	return id;
 }
 
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
-	if (const auto found = definitions.find(&inst); found != definitions.end()) {
-		if (found->second != value) {
+	if (const auto id = inst.Definition(half); id != 0) {
+		if (id != value) {
 			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()),
-			                          found->second, value);
+			                          id, value);
 		}
-		return found->second;
+		return id;
 	}
-	definitions.emplace(&inst, value);
+	inst.SetDefinition(half, value);
 	return value;
 }
 
@@ -791,10 +791,6 @@ const IR::MemoryInfo& ValueEmitContext::Memory(const IR::Inst& inst) const {
 
 const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 	return state.program.export_info.at(inst.Flags<IR::ExportFlags>().index);
-}
-
-uint32_t ValueEmitContext::Label(const IR::Block* block) const {
-	return state.labels.at(block);
 }
 
 [[noreturn]] void ValueEmitContext::Fail(const char* reason) const {
@@ -825,8 +821,11 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
 	for (const auto* block: program.blocks) {
-		const auto label = state.builder.AllocateId();
-		state.labels.emplace(block, label);
+		// Re-emission may use a different host subgroup width and ID allocation order.
+		for (const auto& inst: *block) {
+			inst.ResetDefinitions();
+		}
+		block->SetDefinition(state.builder.AllocateId());
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
