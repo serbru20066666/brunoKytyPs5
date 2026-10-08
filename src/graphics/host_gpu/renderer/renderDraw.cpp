@@ -53,6 +53,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -1095,32 +1096,39 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 	return size;
 }
 
+// These tables have a slot for each of a shader's 32 possible vertex buffers and a draw uses one
+// to four: nothing here has an initializer, so that declaring a table writes nothing, and only
+// the slots a draw uses are written (clearing them all for every draw was 3.6 KB of zeroes, and
+// the result was then copied to its caller).
 struct VertexBufferRange {
-	uint64_t                     base_address  = 0;
-	uint64_t                     requested_end = 0;
-	uint64_t                     acquired_end  = 0;
-	std::pair<Buffer*, uint64_t> binding;
+	uint64_t base_address;
+	uint64_t requested_end;
+	uint64_t acquired_end;
+	Buffer*  buffer;
+	uint64_t offset;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
+static_assert(std::is_trivially_default_constructible_v<VertexBufferRange>);
 
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	std::array<vk::Buffer, MaxBuffers>     buffers {};
-	std::array<vk::DeviceSize, MaxBuffers> offsets {};
-	std::array<vk::DeviceSize, MaxBuffers> sizes {};
+	// Only the first `count` of each are set.
+	std::array<VkBuffer, MaxBuffers>       buffers;
+	std::array<vk::DeviceSize, MaxBuffers> offsets;
+	std::array<vk::DeviceSize, MaxBuffers> sizes;
 	uint32_t                               count = 0;
 };
 
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
+static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
+                                 PreparedVertexBuffers& prepared) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	// Collect the non-empty guest vertex ranges.
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges;
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
@@ -1133,7 +1141,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     vertex.addr, size);
 		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size};
+		ranges[range_count++] = {vertex.addr, vertex.addr + size, 0, nullptr, 0};
 	}
 
 	std::sort(ranges.begin(), ranges.begin() + range_count,
@@ -1142,7 +1150,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	          });
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges;
 	uint32_t                                                      merged_count = 0;
 	for (uint32_t i = 0; i < range_count; i++) {
 		const auto& range = ranges[i];
@@ -1152,7 +1160,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
 			continue;
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
+		merged_ranges[merged_count++] = {range.base_address, range.requested_end, 0, nullptr, 0};
 	}
 
 	auto& cache = buffer.GetContext().GetBufferCache();
@@ -1162,11 +1170,11 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+		std::tie(range.buffer, range.offset) =
+		    cache.ObtainBuffer(range.base_address, size, false);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
-	PreparedVertexBuffers prepared;
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
@@ -1176,8 +1184,9 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 			}
-			prepared.buffers[i] = null_buffer;
+			prepared.buffers[i] = static_cast<VkBuffer>(null_buffer);
 			prepared.offsets[i] = 0;
+			prepared.sizes[i]   = 0;
 			continue;
 		}
 
@@ -1191,12 +1200,10 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			     vertex.addr);
 		}
 
-		prepared.buffers[i] = range->binding.first->Handle();
-		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
+		prepared.buffers[i] = static_cast<VkBuffer>(range->buffer->Handle());
+		prepared.offsets[i] = range->offset + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
 	}
-
-	return prepared;
 }
 
 static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
@@ -1611,11 +1618,13 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
-		EXIT_IF(prepared.buffers[i] == nullptr);
+		EXIT_IF(prepared.buffers[i] == VK_NULL_HANDLE);
 	}
 	if (prepared.count != 0) {
 		// Guest descriptor bounds must survive allocation merging in the cache.
-		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
+		static_assert(sizeof(vk::Buffer) == sizeof(VkBuffer));
+		vk_buffer.bindVertexBuffers2(0, prepared.count,
+		                             reinterpret_cast<const vk::Buffer*>(prepared.buffers.data()),
 		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
 	}
 }
@@ -2045,7 +2054,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+		AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_bindings);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::GraphicsBindings);
