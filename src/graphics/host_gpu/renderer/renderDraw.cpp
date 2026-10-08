@@ -701,6 +701,20 @@ static bool SameDynamicState(const CommandBuffer::GraphicsState& a,
 	       a.color_write_count == b.color_write_count && a.color_write == b.color_write;
 }
 
+// hw_check validates context registers, which no command changes between most draws: a draw
+// whose registers no command since the last check could have changed (g_target_state_serial)
+// skips it. Run for every draw it was 2% of the GPU thread in GPU Jungle.
+// KYTY_DEBUG_AB=hwcheck checks every draw in every other window.
+static void CheckRegistersOnce(const CommandBuffer& buffer) {
+	static uint64_t   checked_serial = UINT64_MAX;
+	static const bool ab             = AbSelected("hwcheck");
+	if (checked_serial == g_target_state_serial && !(ab && AbFeatureOff())) {
+		return;
+	}
+	hw_check(buffer);
+	checked_serial = g_target_state_serial;
+}
+
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
@@ -2037,11 +2051,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	g_draw_phases.Mark(DrawPhaseTimer::GraphicsBindings);
 	vk::ImageAspectFlags feedback_aspects;
 	const bool memo_taken = state.target_memo && !TargetMemoBound(state);
-	auto       rendering  = memo_taken ? g_target_memo.rendering : RenderState {};
+	// A draw that takes the memo reads its rendering state in place: nothing writes it before
+	// the next draw keeps one (copying it, and clearing the copy's place first, was a kilobyte
+	// of traffic for every draw).
+	std::optional<RenderState> acquired;
 	if (!memo_taken) {
-		rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
-		                                 state.depth_info, feedback_aspects, stages);
-	} else if (VerifyTargetMemo()) [[unlikely]] {
+		acquired.emplace(AcquireRenderTargets(buffer, state.color_info, state.color_count,
+		                                      state.depth_info, feedback_aspects, stages));
+	}
+	const RenderState& rendering = memo_taken ? g_target_memo.rendering : *acquired;
+	if (memo_taken && VerifyTargetMemo()) [[unlikely]] {
 		vk::ImageAspectFlags check_aspects;
 		const auto check = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 		                                        state.depth_info, check_aspects, stages);
@@ -2289,7 +2308,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
+	// The memo's rendering instance, when still open, is this state's: beginning it again would
+	// compare nine attachments to find that out. Anything recorded since that ended it (a
+	// barrier, an upload) changed the serial, and the draw begins it again.
+	if (!(memo_taken && buffer.IsRendering() &&
+	      buffer.RenderingSerial() == g_target_memo.rendering_serial)) {
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+	}
 	if (!memo_taken) {
 		KeepTargetMemo(buffer, state, rendering, feedback_aspects);
 	}
@@ -2467,7 +2492,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	uc_check(ucfg);
 
-	hw_check(buffer);
+	CheckRegistersOnce(buffer);
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
@@ -2593,7 +2618,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	uc_check(ucfg);
 
-	hw_check(buffer);
+	CheckRegistersOnce(buffer);
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
