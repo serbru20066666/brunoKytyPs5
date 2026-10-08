@@ -58,6 +58,21 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+struct BufferDefinition {
+	uint32_t variable             = 0;
+	uint32_t type                 = 0;
+	uint32_t element_type         = 0;
+	uint32_t pointer_type         = 0;
+	uint32_t element_pointer_type = 0;
+};
+
+struct ImageDefinition {
+	uint32_t variable     = 0;
+	uint32_t type         = 0;
+	uint32_t pointer_type = 0;
+	uint32_t sampled_type = 0;
+};
+
 struct EmitterState {
 	// Pack two floats into halves with the host's conversion instead of exact truncation.
 	bool native_half_pack = true;
@@ -96,10 +111,7 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
-	uint32_t                                         storage_buffer_u8_variable = 0;
-	uint32_t                                         storage_buffer_u16_variable = 0;
-	uint32_t                                         storage_buffer_u64_variable = 0;
+	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable       = 0;
 	uint32_t                                         fault_buffer_variable        = 0;
@@ -115,37 +127,39 @@ struct EmitterState {
 	uint32_t                                         lds_variable                 = 0;
 	uint32_t                                         lds_u64_variable             = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
-	uint32_t                                         sampler_variable          = 0;
-	uint32_t                                         main_func                 = 0;
-	uint32_t                                         mesh_guest_func           = 0;
-	uint32_t                                         mesh_allocation           = 0;
-	uint32_t                                         mesh_primitive_data       = 0;
-	uint32_t                                         mesh_primitives           = 0;
-	uint32_t                                         mesh_cull                 = 0;
-	uint32_t                                         entry_label               = 0;
-	uint32_t                                         current_label             = 0;
-	const IR::Block*                                 current_block             = nullptr;
-	uint32_t                                         pixel_valid_mask_variable = 0;
-	uint32_t                                         subgroup_local_invocation_id_variable = 0;
-	uint32_t                                         helper_invocation_variable            = 0;
-	uint32_t                                         per_vertex_variable                   = 0;
-	uint32_t                                         point_size_variable                   = 0;
-	uint32_t                                         clip_distance_variable                = 0;
-	uint32_t                                         invalid_position_clip_distance = UINT32_MAX;
-	uint32_t                                         cull_distance_variable         = 0;
-	uint32_t                                         layer_variable                 = 0;
-	uint32_t                                         viewport_index_variable        = 0;
-	uint32_t                                         depth_variable                 = 0;
-	uint32_t                                         sample_mask_variable           = 0;
-	std::vector<InputBinding>                        inputs;
-	std::vector<OutputBinding>                       outputs;
-	std::vector<uint32_t>                            interface_variables;
+	std::array<ImageDefinition, IR::ImageBindingCount> images {};
+	uint32_t                   sampler_variable                      = 0;
+	uint32_t                   sampler_type                          = 0;
+	uint32_t                   sampler_pointer_type                  = 0;
+	uint32_t                   main_func                             = 0;
+	uint32_t                   mesh_guest_func                       = 0;
+	uint32_t                   mesh_allocation                       = 0;
+	uint32_t                   mesh_primitive_data                   = 0;
+	uint32_t                   mesh_primitives                       = 0;
+	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   entry_label                           = 0;
+	uint32_t                   current_label                         = 0;
+	const IR::Block*           current_block                         = nullptr;
+	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   per_vertex_variable                   = 0;
+	uint32_t                   point_size_variable                   = 0;
+	uint32_t                   clip_distance_variable                = 0;
+	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
+	uint32_t                   cull_distance_variable                = 0;
+	uint32_t                   layer_variable                        = 0;
+	uint32_t                   viewport_index_variable               = 0;
+	uint32_t                   depth_variable                        = 0;
+	uint32_t                   sample_mask_variable                  = 0;
+	std::vector<InputBinding>  inputs;
+	std::vector<OutputBinding> outputs;
+	std::vector<uint32_t>      interface_variables;
+	uint32_t                   helper_invocation_variable            = 0;
 	// Long select(index == constant, ...) chains (V_MOVRELS reads) become one OpSwitch at their
 	// outermost select; their inner selects emit nothing (see EmitIndexedSelect).
-	bool                                             indexed_selects_found = false;
-	std::unordered_set<const IR::Inst*>              indexed_select_heads;
-	std::unordered_set<const IR::Inst*>              indexed_select_members;
+	bool                                indexed_selects_found = false;
+	std::unordered_set<const IR::Inst*> indexed_select_heads;
+	std::unordered_set<const IR::Inst*> indexed_select_members;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -165,8 +179,6 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
-uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
-uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -429,7 +441,7 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        uint32_t variable, uint32_t pointer_type);
+                                                        BufferDefinition& buffer);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);

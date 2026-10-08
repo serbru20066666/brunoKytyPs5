@@ -120,32 +120,39 @@ uint32_t TypeFunction(EmitterState& state) {
 	return state.function_type;
 }
 
-uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits) {
-	return bits == 32u   ? TypeU32(state)
-	       : bits == 64u ? TypeU64(state)
-	                     : state.builder.Type(spv::OpTypeInt, bits, 0);
-}
-
-uint32_t StorageRuntimeArrayType(EmitterState& state, uint32_t bits) {
-	return state.builder.DecoratedType(
-	    spv::OpTypeRuntimeArray,
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}},
-	    TypeStorageBufferElement(state, bits));
-}
-
-uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32) {
-	return state.builder.DecoratedType(spv::OpTypeStruct,
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
-	                                   StorageRuntimeArrayType(state, bits));
-}
-
-uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, bits));
+uint32_t StorageBufferType(EmitterState& state, BufferDefinition& buffer, uint32_t bits = 32) {
+	if (buffer.type == 0) {
+		if (bits == 32u) {
+			buffer.element_type = TypeU32(state);
+		} else if (bits == 64u) {
+			buffer.element_type = TypeU64(state);
+		} else {
+			buffer.element_type = state.builder.Type(spv::OpTypeInt, bits, 0);
+		}
+		const auto array = state.builder.DecoratedType(
+		    spv::OpTypeRuntimeArray,
+		    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}}, buffer.element_type);
+		buffer.type = state.builder.DecoratedType(
+		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+	}
+	return buffer.type;
 }
 
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, TypeStorageBufferElement(state, bits));
+	auto* buffer = &state.storage_buffers[2];
+	if (bits == 8u) {
+		buffer = &state.storage_buffers[0];
+	} else if (bits == 16u) {
+		buffer = &state.storage_buffers[1];
+	} else if (bits == 64u) {
+		buffer = &state.storage_buffers[3];
+	}
+	if (buffer->element_pointer_type == 0) {
+		buffer->element_pointer_type =
+		    TypePointer(state, spv::StorageClassStorageBuffer, buffer->element_type);
+	}
+	return buffer->element_pointer_type;
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -265,70 +272,67 @@ void DefineDescriptors(EmitterState& state) {
 			    ConstantU32(state, counts[index]));
 		};
 		switch (kind) {
-			case IR::DescriptorBindingKind::Buffers:
-				state.storage_buffer_variable =
-				    Define(ArrayType(StorageBufferType(state)), "buffers");
-				if (state.program.info.buffer_u8) {
-					state.storage_buffer_u8_variable =
-					    Define(ArrayType(StorageBufferType(state, 8)), "buffers_u8");
-				}
-				if (state.program.info.buffer_u16) {
-					state.storage_buffer_u16_variable =
-					    Define(ArrayType(StorageBufferType(state, 16)), "buffers_u16");
-				}
-				if (state.program.info.buffer_int64_atomics) {
-					state.storage_buffer_u64_variable =
-					    Define(ArrayType(StorageBufferType(state, 64)), "buffers_u64");
-				}
-				if (!state.program.info.buffer_writes) {
-					// A program that only reads its buffers says so. The AMD driver then loads
-					// with a uniform address once per wave, into scalar registers
-					// (s_buffer_load), as the guest's S_BUFFER_LOAD does. Without the decoration
-					// it issues every such load once per lane (buffer_load), with the address
-					// copied to a vector register: ASTRO's PLAYROOM's lighting shader
-					// 6b517f3b5e6b7160 had 166 of those, and none with it.
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationNonWritable);
-				}
-				for (const auto variable: {state.storage_buffer_variable, state.storage_buffer_u8_variable,
-				                           state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
-					if (variable == 0) continue;
-					if (state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
-					    state.storage_buffer_u64_variable != 0) {
-						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+			case IR::DescriptorBindingKind::Buffers: {
+				const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
+				constexpr std::array names {"buffers_u8", "buffers_u16", "buffers", "buffers_u64"};
+				for (uint32_t alias = 0; alias < used.size(); ++alias) {
+					if (!used[alias]) continue;
+					auto& buffer = state.storage_buffers[alias];
+					const auto type = StorageBufferType(state, buffer, 8u << alias);
+					buffer.variable = Define(ArrayType(type), names[alias]);
+					if (!info.buffer_writes) {
+						// A program that only reads its buffers says so. The AMD driver then loads
+						// with a uniform address once per wave, into scalar registers
+						// (s_buffer_load), as the guest's S_BUFFER_LOAD does. Without the
+						// decoration it issues every such load once per lane (buffer_load), with
+						// the address copied to a vector register: ASTRO's PLAYROOM's lighting
+						// shader 6b517f3b5e6b7160 had 166 of those, and none with it.
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable,
+						                            spv::DecorationNonWritable);
+					}
+					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (state.program.info.coherent_buffers) {
-						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
+					if (info.coherent_buffers) {
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
 					}
 				}
 				break;
+			}
 			case IR::DescriptorBindingKind::BdaPagetable:
-				state.bda_pagetable_variable = Define(StorageBufferType(state, 64), "bda_pagetable");
+				state.bda_pagetable_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
-				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
+				state.fault_buffer_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
-				    Define(StorageBufferType(state), "shader_data");
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
-				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				state.flattened_srt_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
 				break;
 			case IR::DescriptorBindingKind::Samplers:
-				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),
-				                                "samplers", spv::StorageClassUniformConstant);
+				state.sampler_type = state.builder.Type(spv::OpTypeSampler);
+				state.sampler_pointer_type = TypePointer(
+				    state, spv::StorageClassUniformConstant, state.sampler_type);
+				state.sampler_variable = Define(ArrayType(state.sampler_type), "samplers",
+				                                spv::StorageClassUniformConstant);
 				break;
 			case IR::DescriptorBindingKind::Gds:
-				state.gds_variable = Define(StorageBufferType(state), "gds");
+				state.gds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "gds");
 				break;
 			case IR::DescriptorBindingKind::SharedMemory:
-				state.lds_variable = Define(StorageBufferType(state), "lds_dwords");
+				state.lds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "lds_dwords");
 				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
 				if (state.program.info.shared_int64_atomics) {
-					state.lds_u64_variable = Define(StorageBufferType(state, 64), "lds_qwords");
+					state.lds_u64_variable =
+					    Define(StorageBufferType(state, state.storage_buffers[3], 64), "lds_qwords");
 					state.builder.AddAnnotation(spv::OpDecorate, state.lds_u64_variable, spv::DecorationCoherent);
 					for (const auto variable: {state.lds_variable, state.lds_u64_variable}) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
@@ -340,9 +344,12 @@ void DefineDescriptors(EmitterState& state) {
 				        IR::ImageResourceClass::None);
 				const auto& image = *image_types[IR::ImageBindingIndex(kind)];
 				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(kind));
-				state.image_variables[IR::ImageBindingIndex(kind)] =
-				    Define(ArrayType(ImageType(state, image)), name.c_str(),
-				           spv::StorageClassUniformConstant);
+				auto& definition = state.images[IR::ImageBindingIndex(kind)];
+				definition.type = ImageType(state, image);
+				definition.variable = Define(ArrayType(definition.type), name.c_str(),
+				                             spv::StorageClassUniformConstant);
+				definition.pointer_type = TypePointer(
+				    state, spv::StorageClassUniformConstant, definition.type);
 				if (image.dimension == ImageDimension::Dim1D ||
 				    image.dimension == ImageDimension::Dim1DArray) {
 					state.builder.RequireCapability(image.resource_class ==

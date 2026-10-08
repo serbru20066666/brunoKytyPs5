@@ -154,11 +154,13 @@ void EnsureLdsStorage(EmitterState& state) {
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
-                                                         uint32_t variable,
-                                                         uint32_t pointer_type) {
-	if (variable == 0) {
+                                                         BufferDefinition& buffer) {
+	if (buffer.variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
+	}
+	if (buffer.pointer_type == 0) {
+		buffer.pointer_type = TypePointer(state, spv::StorageClassStorageBuffer, buffer.type);
 	}
 	const auto array_index =
 	    state.program.info.buffers.at(mem.resource).descriptor_index;
@@ -166,8 +168,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	    .kind = mem.kind,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
+	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
+	                          buffer.variable, ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
@@ -209,11 +211,13 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			const auto bits = mem.kind == IR::ResourceKind::Buffer
 			                      ? IR::StorageBufferElementBits(state.program, mem) : 32u;
-			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
-			                      : bits == 16u ? state.storage_buffer_u16_variable
-			                                    : state.storage_buffer_variable;
-			access = PrepareStorageBufferResourceAccess(
-			    state, mem, variable, TypeStorageBufferPointer(state, bits));
+			auto* buffer = &state.storage_buffers[2];
+			if (bits == 8u) {
+				buffer = &state.storage_buffers[0];
+			} else if (bits == 16u) {
+				buffer = &state.storage_buffers[1];
+			}
+			access = PrepareStorageBufferResourceAccess(state, mem, *buffer);
 			access.element_bits = bits;
 			return access;
 		}
