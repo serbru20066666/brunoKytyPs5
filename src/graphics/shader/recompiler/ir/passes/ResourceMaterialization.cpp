@@ -712,30 +712,29 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 template <typename Predicate>
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, const Predicate& predicate) {
 	// The renderer checks captured scalar reads against final buffer and image write ranges.
-	if (program.blocks.size() != program.block_info.size() || program.has_address_writes) {
+	if (program.has_address_writes) {
 		return {};
 	}
-	std::unordered_map<uint32_t, uint32_t> indices;
-	for (uint32_t i = 0; i < program.block_info.size(); i++) {
-		if (!indices.emplace(program.block_info[i].id, i).second) {
+	std::unordered_map<const Block*, uint32_t> indices;
+	for (uint32_t i = 0; i < program.blocks.size(); i++) {
+		if (!indices.emplace(program.blocks[i], i).second) {
 			return {};
 		}
 	}
 	std::vector<ResourceBlock> blocks(program.blocks.size());
 	for (uint32_t i = 0; i < blocks.size(); i++) {
 		auto&                 block      = blocks[i];
-		const auto&           info       = program.block_info[i];
+		const auto&             info       = *program.blocks[i];
 		const auto&           terminator = info.terminator;
-		std::vector<uint32_t> successors;
+		const std::array        targets {terminator.true_block, terminator.false_block};
+		std::span<Block* const> successors;
 		switch (terminator.kind) {
-			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
+			case CFG::TerminatorKind::Branch: successors = std::span(targets).first(1); break;
 			case CFG::TerminatorKind::ConditionalBranch:
-				successors = {terminator.true_block, terminator.false_block};
+				successors      = targets;
 				block.condition = info.condition;
 				break;
-			case CFG::TerminatorKind::IndirectBranch:
-				successors = terminator.indirect_targets;
-				break;
+			case CFG::TerminatorKind::IndirectBranch: successors = info.ImmSuccessors(); break;
 			case CFG::TerminatorKind::Return: break;
 			default: return {};
 		}
@@ -856,17 +855,16 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 }
 
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
-	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}
-	std::unordered_set<uint32_t> visited;
-	uint32_t                     index = 0;
-	const Inst*                  store = nullptr;
+	std::unordered_set<const Block*> visited;
+	const auto*                      block = program.blocks.front();
+	const Inst*                      store = nullptr;
 	for (;;) {
-		if (!visited.insert(index).second) return {};
-		for (const auto& inst: *program.blocks[index]) {
+		if (block == nullptr || !visited.insert(block).second) return {};
+		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
 			if (!inst.MayHaveSideEffects()) continue;
 			if (store != nullptr || (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write &&
@@ -874,12 +872,10 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 				return {};
 			store = &inst;
 		}
-		const auto& term = program.block_info[index].terminator;
+		const auto& term = block->terminator;
 		if (term.kind == CFG::TerminatorKind::Return) break;
 		if (term.kind != CFG::TerminatorKind::Branch) return {};
-		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
-		if (next == program.block_info.end()) return {};
-		index = static_cast<uint32_t>(next - program.block_info.begin());
+		block = term.true_block;
 	}
 	if (store == nullptr || visited.size() != program.blocks.size()) return {};
 	for (const auto& buffer: program.info.buffers) {

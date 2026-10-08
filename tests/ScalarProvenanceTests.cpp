@@ -46,7 +46,7 @@ struct Fixture {
       program.block_storage.push_back(std::make_unique<Block>());
       auto *block = program.block_storage.back().get();
       program.blocks.push_back(block);
-      program.block_info.push_back({.id = index});
+      program.blocks.back()->id = index;
     }
   }
 
@@ -865,14 +865,14 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   entry->AddBranch(taken);
   entry->AddBranch(other);
 
-  auto &entry_info = fixture.program.block_info[0];
+  auto &entry_info = *fixture.program.blocks[0];
   entry_info.terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  entry_info.terminator.true_block = 1;
-  entry_info.terminator.false_block = 2;
-  fixture.program.block_info[1].terminator.kind =
+  entry_info.terminator.true_block = taken;
+  entry_info.terminator.false_block = other;
+  fixture.program.blocks[1]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
-  fixture.program.block_info[2].terminator.kind =
+  fixture.program.blocks[2]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
 
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);

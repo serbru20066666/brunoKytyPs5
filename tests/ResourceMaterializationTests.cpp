@@ -28,7 +28,7 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   auto block = std::make_unique<Block>();
   auto *result = block.get();
   program.blocks.push_back(result);
-  program.block_info.push_back({.id = 0});
+  result->id = static_cast<uint32_t>(program.blocks.size() - 1u);
   program.block_storage.push_back(std::move(block));
   return *result;
 }
@@ -463,16 +463,16 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
                                         {Value(&offset), Value(4u)});
   auto &store_block = AddValueBlock(program);
   AddValueBlock(program);
-  program.block_info[0].condition = Value(&condition);
-  program.block_info[0].terminator.kind =
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  program.block_info[0].terminator.true_block = 1;
-  program.block_info[0].terminator.false_block = 2;
-  program.block_info[1].id = 1;
-  program.block_info[1].terminator.kind =
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+  program.blocks[1]->id = 1;
+  program.blocks[1]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
-  program.block_info[2].id = 2;
-  program.block_info[2].terminator.kind =
+  program.blocks[2]->id = 2;
+  program.blocks[2]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
   program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
   auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,

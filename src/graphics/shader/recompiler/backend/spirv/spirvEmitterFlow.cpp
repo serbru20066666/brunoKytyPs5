@@ -746,9 +746,11 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	// Argument 1 is the branch's emitted condition; argument 0 is only for analysis.
-	// Scalar branches include lanes disabled by EXEC, which the branch body may restore.
-	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	// Argument 1 is the branch's emitted condition; argument 0 is only for analysis. The emitted
+	// condition already tests the whole guest-wave mask (see Translator::AddBranchCondition),
+	// lanes disabled by EXEC included, so a native wave uses it as it is.
+	if (ctx.other_half == nullptr) return ctx.Arg(inst, 1);
+	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 1);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||

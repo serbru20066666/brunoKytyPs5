@@ -58,7 +58,8 @@ public:
 	void CopyPsTap();
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+	                        IR::Block& info);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

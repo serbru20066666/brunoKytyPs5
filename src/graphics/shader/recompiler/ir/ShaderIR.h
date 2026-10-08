@@ -506,15 +506,6 @@ struct ShaderInfo {
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
-struct BlockInfo {
-	uint32_t        id       = 0;
-	uint32_t        start_pc = 0;
-	uint32_t        end_pc   = 0;
-	CFG::Terminator terminator;
-	Value           condition;
-	Value           indirect_target;
-};
-
 struct DescriptorSource {
 	struct IndirectDescriptor {
 		struct SelectorRead {
@@ -797,7 +788,6 @@ struct Program: ResourcePlan {
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
-	std::vector<BlockInfo>        block_info;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.

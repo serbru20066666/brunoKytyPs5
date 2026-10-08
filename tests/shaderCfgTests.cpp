@@ -1933,13 +1933,14 @@ void TestSopkCompareImmediateExtension() {
     };
     auto translated =
         TranslateProgram(shader, MakeCompileOptions(ShaderType::Vertex));
-    const auto branch = std::ranges::find_if(
-        translated.program.block_info, [](const auto &block) {
-          return block.terminator.kind == CFG::TerminatorKind::ConditionalBranch;
+    const auto branch =
+        std::ranges::find_if(translated.program.blocks, [](const auto *block) {
+          return block->terminator.kind ==
+                 CFG::TerminatorKind::ConditionalBranch;
         });
-    Check(branch != translated.program.block_info.end(),
+    Check(branch != translated.program.blocks.end(),
           "captured LUT parameter export branch was lost");
-    const auto condition = branch->condition.Resolve();
+    const auto condition = (*branch)->condition.Resolve();
     Check(condition.IsImmediate() && condition.U1() == (counts != 6u),
           "captured LUT unsigned compare suppressed a live parameter export");
   }
@@ -11110,14 +11111,12 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
         "S_SETPC_B64 jump table did not select dispatcher fallback");
   const auto jump = std::find_if(
-      result.program.block_info.begin(),
-      result.program.block_info.end(), [](const auto &block) {
-        return !block.terminator.indirect_targets.empty();
-      });
-  Check(jump != result.program.block_info.end() &&
-            jump->terminator.indirect_targets.size() == 2,
+      result.program.blocks.begin(), result.program.blocks.end(),
+      [](const auto *block) { return !block->terminator.cases.empty(); });
+  Check(jump != result.program.blocks.end() &&
+            (*jump)->ImmSuccessors().size() == 2,
         "S_SETPC_B64 jump table did not retain both targets");
-  Check(jump->terminator.indirect_selector_values.size() == 2,
+  Check((*jump)->terminator.cases.size() == 2,
         "S_SETPC_B64 jump table did not retain selector mapping");
   Check(
       (result.ir_dump.find("SLoadDword") == std::string::npos),
@@ -11214,31 +11213,21 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
         "subtractive S_SETPC_B64 table did not select dispatcher fallback");
   const auto jump = std::find_if(
-      result.program.block_info.begin(),
-      result.program.block_info.end(), [](const auto &block) {
-        return !block.terminator.indirect_targets.empty();
-      });
-  const auto block_pc = [&](uint32_t id) {
-    const auto block =
-        std::find_if(result.program.block_info.begin(),
-                     result.program.block_info.end(),
-                     [=](const auto &info) { return info.id == id; });
-    return block != result.program.block_info.end() ? block->start_pc
-                                                            : UINT32_MAX;
-  };
-  Check(jump != result.program.block_info.end() &&
-            jump->terminator.indirect_targets.size() == 2 &&
-            jump->terminator.indirect_target_pcs ==
-                std::vector<uint32_t>({0x38u, 0x40u}) &&
-            jump->terminator.indirect_selector_values ==
-                std::vector<uint32_t>({0u, 4u, 8u}) &&
-            jump->terminator.indirect_selector_targets.size() == 3 &&
-            block_pc(jump->terminator.indirect_selector_targets[0]) == 0x38u &&
-            block_pc(jump->terminator.indirect_selector_targets[1]) == 0x40u &&
-            block_pc(jump->terminator.indirect_selector_targets[2]) == 0x38u &&
+      result.program.blocks.begin(), result.program.blocks.end(),
+      [](const auto *block) { return !block->terminator.cases.empty(); });
+  Check(jump != result.program.blocks.end() &&
+            (*jump)->ImmSuccessors().size() == 2 &&
+            (*jump)->terminator.indexed &&
+            (*jump)->terminator.cases.size() == 3 &&
+            (*jump)->terminator.cases[0].value == 0u &&
+            (*jump)->terminator.cases[0].target->start_pc == 0x38u &&
+            (*jump)->terminator.cases[1].value == 4u &&
+            (*jump)->terminator.cases[1].target->start_pc == 0x40u &&
+            (*jump)->terminator.cases[2].value == 8u &&
+            (*jump)->terminator.cases[2].target->start_pc == 0x38u &&
             std::ranges::none_of(
-                result.program.block_info,
-                [](const auto &info) { return info.start_pc == 0x04u; }),
+                result.program.blocks,
+                [](const auto *block) { return block->start_pc == 0x04u; }),
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
   Check((result.ir_dump.find("SLoadDword") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
@@ -11829,7 +11818,6 @@ void TestFinalSsaRejectsRegisterStatePseudos() {
     Program program;
     program.block_storage.push_back(std::make_unique<Block>());
     program.blocks.push_back(program.block_storage.back().get());
-    program.block_info.emplace_back();
     IREmitter ir(program.blocks.front());
     if (setter) {
       ir.SetScalarReg(ScalarReg{0}, U32(Value(1u)));
@@ -11869,7 +11857,7 @@ void TestValuePhiValidation() {
       program.block_storage.push_back(std::make_unique<Block>());
       auto *block = program.block_storage.back().get();
       program.blocks.push_back(block);
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
       return block;
     };
 
@@ -11877,17 +11865,17 @@ void TestValuePhiValidation() {
     auto *left = add_block(1);
     auto *right = add_block(2);
     auto *join = add_block(3);
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-    program.block_info[0].terminator.true_block = 1;
-    program.block_info[0].terminator.false_block = 2;
-    program.block_info[0].condition = Value(true);
-    program.block_info[1].terminator.kind =
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[0]->terminator.false_block = program.blocks[2];
+    program.blocks[0]->condition = Value(true);
+    program.blocks[1]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[1].terminator.true_block = 3;
-    program.block_info[2].terminator.kind =
+    program.blocks[1]->terminator.true_block = program.blocks[3];
+    program.blocks[2]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[2].terminator.true_block = 3;
+    program.blocks[2]->terminator.true_block = program.blocks[3];
     entry->AddBranch(left);
     entry->AddBranch(right);
     left->AddBranch(join);
@@ -11937,12 +11925,12 @@ void TestValuePhiValidation() {
       program.block_storage.push_back(std::make_unique<Block>());
       auto *block = program.block_storage.back().get();
       program.blocks.push_back(block);
-      program.block_info.push_back({.id = duplicate_id ? 0u : id});
+      program.blocks.back()->id = duplicate_id ? 0u : id;
     }
     if (!duplicate_id) {
-      program.block_info[0].terminator.kind =
+      program.blocks[0]->terminator.kind =
           ShaderRecompiler::CFG::TerminatorKind::Branch;
-      program.block_info[0].terminator.true_block = 1;
+      program.blocks[0]->terminator.true_block = program.blocks[1];
     }
     expect_invalid(program,
                    "malformed Value CFG did not terminate IR validation");
@@ -11955,14 +11943,14 @@ void TestValuePhiValidation() {
     for (uint32_t id = 0; id < 2; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[0].terminator.true_block = 1;
-    program.block_info[1].terminator.kind =
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[1]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[1].terminator.true_block = 0;
+    program.blocks[1]->terminator.true_block = program.blocks[0];
     program.blocks[0]->AddBranch(program.blocks[1]);
     program.blocks[1]->AddBranch(program.blocks[0]);
     expect_invalid(program,
@@ -11973,17 +11961,15 @@ void TestValuePhiValidation() {
     for (uint32_t id = 0; id < 3; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[0].terminator.true_block = 1;
-    auto &indirect = program.block_info[1];
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    auto &indirect = *program.blocks[1];
     indirect.terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::IndirectBranch;
-    indirect.terminator.indirect_targets = {1};
-    indirect.terminator.indirect_selector_values = {0};
-    indirect.terminator.indirect_selector_targets = {2};
+    indirect.terminator.cases = {{0, program.blocks[2]}};
     indirect.indirect_target = Value(0u);
     program.blocks[0]->AddBranch(program.blocks[1]);
     program.blocks[1]->AddBranch(program.blocks[1]);
@@ -11995,7 +11981,7 @@ void TestValuePhiValidation() {
     Program program;
     program.block_storage.push_back(std::make_unique<Block>());
     program.blocks.push_back(program.block_storage.back().get());
-    program.block_info.push_back({.id = UINT32_MAX});
+    program.blocks.back()->id = UINT32_MAX;
     expect_invalid(program,
                    "reserved exit block id did not terminate IR validation");
   }
@@ -12004,27 +11990,29 @@ void TestValuePhiValidation() {
     for (uint32_t id = 0; id < 2; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[0].terminator.true_block = 1;
-    auto &indirect = program.block_info[1];
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    auto &indirect = *program.blocks[1];
     indirect.terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::IndirectBranch;
-    indirect.terminator.indirect_targets = {1, 1};
+    indirect.terminator.cases = {{0, program.blocks[1]},
+                                 {0, program.blocks[1]}};
     indirect.indirect_target = Value(0u);
     program.blocks[0]->AddBranch(program.blocks[1]);
     program.blocks[1]->AddBranch(program.blocks[1]);
-    expect_invalid(program,
-                   "duplicate indirect targets did not terminate IR validation");
+    expect_invalid(
+        program,
+        "duplicate indirect selector values did not terminate IR validation");
   }
   {
     Program program;
     for (uint32_t id = 0; id < 2; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
     expect_invalid(program,
                    "unreachable block did not terminate IR validation");
@@ -12034,7 +12022,6 @@ void TestValuePhiValidation() {
     program.block_storage.push_back(std::make_unique<Block>());
     auto *block = program.block_storage.back().get();
     program.blocks.push_back(block);
-    program.block_info.push_back({.id = 0});
     auto &use =
         block->AppendNewInst(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
     auto &definition =
@@ -12048,17 +12035,17 @@ void TestValuePhiValidation() {
     for (uint32_t id = 0; id < 4; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-    program.block_info[0].terminator.true_block = 1;
-    program.block_info[0].terminator.false_block = 2;
-    program.block_info[0].condition = Value(true);
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[0]->terminator.false_block = program.blocks[2];
+    program.blocks[0]->condition = Value(true);
     for (uint32_t id : {1u, 2u}) {
-      program.block_info[id].terminator.kind =
+      program.blocks[id]->terminator.kind =
           ShaderRecompiler::CFG::TerminatorKind::Branch;
-      program.block_info[id].terminator.true_block = 3;
+      program.blocks[id]->terminator.true_block = program.blocks[3];
     }
     program.blocks[0]->AddBranch(program.blocks[1]);
     program.blocks[0]->AddBranch(program.blocks[2]);
@@ -12076,17 +12063,17 @@ void TestValuePhiValidation() {
     for (uint32_t id = 0; id < 4; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-    program.block_info[0].terminator.true_block = 1;
-    program.block_info[0].terminator.false_block = 2;
-    program.block_info[0].condition = Value(true);
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[0]->terminator.false_block = program.blocks[2];
+    program.blocks[0]->condition = Value(true);
     for (uint32_t id : {1u, 2u}) {
-      program.block_info[id].terminator.kind =
+      program.blocks[id]->terminator.kind =
           ShaderRecompiler::CFG::TerminatorKind::Branch;
-      program.block_info[id].terminator.true_block = 3;
+      program.blocks[id]->terminator.true_block = program.blocks[3];
     }
     program.blocks[0]->AddBranch(program.blocks[1]);
     program.blocks[0]->AddBranch(program.blocks[2]);
@@ -12107,23 +12094,23 @@ void TestValuePhiValidation() {
     for (uint32_t id = 0; id < 5; id++) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
-    program.block_info[0].terminator.kind =
+    program.blocks[0]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-    program.block_info[0].terminator.true_block = 1;
-    program.block_info[0].terminator.false_block = 2;
-    program.block_info[0].condition = Value(true);
-    program.block_info[1].terminator.kind =
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[0]->terminator.false_block = program.blocks[2];
+    program.blocks[0]->condition = Value(true);
+    program.blocks[1]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[1].terminator.true_block = 3;
-    program.block_info[2].terminator.kind =
+    program.blocks[1]->terminator.true_block = program.blocks[3];
+    program.blocks[2]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-    program.block_info[2].terminator.true_block = 3;
-    program.block_info[2].terminator.false_block = 4;
-    program.block_info[3].terminator.kind =
+    program.blocks[2]->terminator.true_block = program.blocks[3];
+    program.blocks[2]->terminator.false_block = program.blocks[4];
+    program.blocks[3]->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[3].terminator.true_block = 4;
+    program.blocks[3]->terminator.true_block = program.blocks[4];
     program.blocks[0]->AddBranch(program.blocks[1]);
     program.blocks[0]->AddBranch(program.blocks[2]);
     program.blocks[1]->AddBranch(program.blocks[3]);
@@ -12132,7 +12119,7 @@ void TestValuePhiValidation() {
     program.blocks[3]->AddBranch(program.blocks[4]);
     auto &condition = program.blocks[1]->AppendNewInst(ValueOpcode::IEqual32,
                                                        {Value(1u), Value(2u)});
-    program.block_info[2].condition = Value(&condition);
+    program.blocks[2]->condition = Value(&condition);
     expect_invalid(program,
                    "non-dominating branch condition did not terminate IR "
                    "validation");
@@ -12149,19 +12136,22 @@ void TestWave32MaskProjection() {
     for (uint32_t id = 0; id < 3; ++id) {
       program.block_storage.push_back(std::make_unique<Block>());
       program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.push_back({.id = id});
+      program.blocks.back()->id = id;
     }
     auto *entry = program.blocks[0];
     auto *loop = program.blocks[1];
     entry->AddBranch(loop);
     loop->AddBranch(loop);
     loop->AddBranch(program.blocks[2]);
-    program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
-    program.block_info[0].terminator.true_block = 1;
-    program.block_info[1].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-    program.block_info[1].terminator.true_block = 1;
-    program.block_info[1].terminator.false_block = 2;
-    program.block_info[2].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    program.blocks[0]->terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.blocks[0]->terminator.true_block = program.blocks[1];
+    program.blocks[1]->terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.blocks[1]->terminator.true_block = program.blocks[1];
+    program.blocks[1]->terminator.false_block = program.blocks[2];
+    program.blocks[2]->terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Return;
     IREmitter e(entry);
     const auto zero = U32(Value(0u));
     const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
@@ -12215,7 +12205,7 @@ void TestWave32MaskProjection() {
     mask.AddPhiOperand(loop, remaining);
     predicate.AddPhiOperand(entry, initial_predicate);
     predicate.AddPhiOperand(loop, remaining_predicate);
-    program.block_info[1].condition = remaining_predicate;
+    program.blocks[1]->condition = remaining_predicate;
 
     ConstantPropagationPass(program.blocks, wave_size);
     if (wave_size == 32u) {
@@ -12264,7 +12254,6 @@ void TestU64ShiftConstantPropagation() {
   Program shifts;
   shifts.block_storage.push_back(std::make_unique<Block>());
   shifts.blocks.push_back(shifts.block_storage.back().get());
-  shifts.block_info.emplace_back();
   IREmitter shift_ir(shifts.blocks.front());
   struct ShiftCase {
     Value value;
@@ -12336,9 +12325,7 @@ void TestNativeWideValueValidation() {
     Program program;
     program.block_storage.push_back(std::make_unique<Block>());
     program.blocks.push_back(program.block_storage.back().get());
-    program.block_info.emplace_back();
-    program.block_info.front().id = 0;
-    program.block_info.front().terminator.kind =
+    program.blocks.front()->terminator.kind =
         ShaderRecompiler::CFG::TerminatorKind::Return;
     return program;
   };

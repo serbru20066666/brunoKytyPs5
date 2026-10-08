@@ -1,5 +1,6 @@
 #pragma once
 
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/Value.h"
 
@@ -48,6 +49,27 @@ public:
 	iterator       end();
 	const_iterator end() const;
 	bool           empty() const;
+
+	struct SwitchCase {
+		uint32_t value;
+		Block*   target;
+	};
+	struct Terminator {
+		CFG::TerminatorKind     kind           = CFG::TerminatorKind::Return;
+		Block*                  true_block     = nullptr;
+		Block*                  false_block    = nullptr;
+		Block*                  merge_block    = nullptr;
+		Block*                  continue_block = nullptr;
+		std::vector<SwitchCase> cases;
+		bool                    indexed     = false;
+		bool                    loop_header = false;
+	};
+	uint32_t   id       = 0;
+	uint32_t   start_pc = 0;
+	uint32_t   end_pc   = 0;
+	Terminator terminator;
+	Value      condition;
+	Value      indirect_target;
 
 	std::array<Value, NumScalarRegs> ssa_sreg_values {};
 	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};

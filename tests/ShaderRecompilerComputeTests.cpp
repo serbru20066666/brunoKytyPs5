@@ -35665,7 +35665,6 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
-  program.block_info.push_back({.id = 0});
 
   auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
   auto &selector = block->AppendNewInst(ValueOpcode::BitwiseAnd32,
@@ -35770,7 +35769,6 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
-  program.block_info.push_back({.id = 0});
 
   auto &key = block->AppendNewInst(ValueOpcode::LaneId);
   auto &image =

@@ -82,44 +82,32 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 	}
 }
 
-const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
-	const auto found = std::ranges::find_if(
-	    program.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
-	if (found == program.block_info.end()) {
-		return nullptr;
-	}
-	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
-}
-
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
-                              const IR::BlockInfo& info) {
+void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& program    = ctx.state.program;
-	const auto& term       = info.terminator;
+	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
-			const auto* merge = TargetBlock(program, term.merge_block);
-			const auto* cont  = TargetBlock(program, term.continue_block);
+			const auto* merge = term.merge_block;
+			const auto* cont  = term.continue_block;
 			if (merge != nullptr && cont != nullptr) {
 				ctx.state.builder.AddFunction(spv::OpLoopMerge, merge->Definition(),
 				                              cont->Definition(), spv::LoopControlMaskNone);
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
-		           term.merge_block != UINT32_MAX) {
-			if (const auto* merge = TargetBlock(program, term.merge_block); merge != nullptr) {
-				ctx.state.builder.AddFunction(spv::OpSelectionMerge, merge->Definition(),
-				                              spv::SelectionControlMaskNone);
-			}
+		           term.merge_block != nullptr) {
+			ctx.state.builder.AddFunction(spv::OpSelectionMerge, term.merge_block->Definition(),
+			                              spv::SelectionControlMaskNone);
 		}
 	};
 
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch: {
-			const auto* target = TargetBlock(program, term.true_block);
+			const auto* target = term.true_block;
 			if (target == nullptr) {
 				EmitReturn(ctx);
 				return;
@@ -129,13 +117,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			return;
 		}
 		case CFG::TerminatorKind::ConditionalBranch: {
-			const auto* true_block  = TargetBlock(program, term.true_block);
-			const auto* false_block = TargetBlock(program, term.false_block);
-			if (true_block == nullptr || false_block == nullptr || info.condition.IsEmpty()) {
+			const auto* true_block  = term.true_block;
+			const auto* false_block = term.false_block;
+			if (true_block == nullptr || false_block == nullptr || block->condition.IsEmpty()) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			const auto condition = ctx.Def(block->condition);
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -146,8 +134,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 }
 
 void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                          const IR::Block* from, uint32_t target) {
-	const auto* block = TargetBlock(ctx.state.program, target);
+                          const IR::Block* from, const IR::Block* block) {
 	if (block != nullptr) {
 		StoreDispatcherPhiEdge(ctx, dispatcher, from, block);
 		if (ctx.other_half != nullptr) {
@@ -157,41 +144,37 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 }
 
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                              const IR::Block* block, const IR::BlockInfo& info) {
-	const auto& term = info.terminator;
+                              const IR::Block* block) {
+	const auto& term = block->terminator;
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
-			return ConstantU32(ctx.state, term.true_block);
+			return ConstantU32(ctx.state, term.true_block->id);
 		case CFG::TerminatorKind::ConditionalBranch: {
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
-			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
+			ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), selected,
+			                              ctx.Def(block->condition),
+			                              ConstantU32(ctx.state, term.true_block->id),
+			                              ConstantU32(ctx.state, term.false_block->id));
 			return selected;
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
-			for (const auto target: term.indirect_targets) {
+			for (const auto* target: block->ImmSuccessors()) {
 				EmitDispatcherTarget(ctx, dispatcher, block, target);
 			}
 			uint32_t selected = ConstantU32(ctx.state, UINT32_MAX);
-			if (!info.indirect_target.IsEmpty()) {
-				const auto  selector = ctx.Def(info.indirect_target);
-				const auto& values   = term.indirect_selector_code != UINT32_MAX
-				                           ? term.indirect_selector_values
-				                           : term.indirect_target_pcs;
-				const auto& targets  = term.indirect_selector_code != UINT32_MAX
-				                           ? term.indirect_selector_targets
-				                           : term.indirect_targets;
-				for (size_t index = 0; index < std::min(values.size(), targets.size()); index++) {
+			if (!block->indirect_target.IsEmpty()) {
+				const auto selector = ctx.Def(block->indirect_target);
+				for (const auto& branch: term.cases) {
 					const auto match = ctx.state.builder.AllocateId();
 					const auto next  = ctx.state.builder.AllocateId();
 					ctx.state.builder.AddFunction(spv::OpIEqual, TypeBool(ctx.state), match,
-					                              selector, ConstantU32(ctx.state, values[index]));
+					                              selector, ConstantU32(ctx.state, branch.value));
 					ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), next, match,
-					                              ConstantU32(ctx.state, targets[index]), selected);
+					                              ConstantU32(ctx.state, branch.target->id),
+					                              selected);
 					selected = next;
 				}
 			}
@@ -528,7 +511,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block, program.block_info[index]);
+		EmitStructuredTerminator(ctx, block);
 	}
 	PatchStructuredPhis(ctx, structured);
 }
@@ -540,8 +523,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
-	const auto initial_pc =
-	    EmitDispatcherNextPc(ctx, dispatcher, entry, state.program.block_info.front());
+	const auto initial_pc     = EmitDispatcherNextPc(ctx, dispatcher, entry);
 	const auto initial_parent = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 
@@ -563,7 +545,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	                          spv::SelectionControlMaskNone);
 	std::vector<uint32_t> words {spv::OpSwitch, pc, dispatcher.after_switch_label};
 	for (size_t index = 1; index < state.program.blocks.size(); index++) {
-		words.push_back(state.program.block_info[index].id);
+		words.push_back(state.program.blocks[index]->id);
 		words.push_back(state.program.blocks[index]->Definition());
 	}
 	state.builder.AddFunction(words);
@@ -575,8 +557,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			          EmitDispatcherInstruction(lane, dispatcher, inst);
 		          });
-		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
-		                                           state.program.block_info[index]);
+		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index]);
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
@@ -866,8 +847,8 @@ void EmitProgram(EmitterState& state) {
 			}
 		}
 		for (size_t index = 0; index < program.blocks.size(); index++) {
-			mark_cross_block(program.block_info[index].condition, program.blocks[index]);
-			mark_cross_block(program.block_info[index].indirect_target, program.blocks[index]);
+			mark_cross_block(program.blocks[index]->condition, program.blocks[index]);
+			mark_cross_block(program.blocks[index]->indirect_target, program.blocks[index]);
 		}
 		dispatch.header_label       = state.builder.AllocateId();
 		dispatch.select_label       = state.builder.AllocateId();
