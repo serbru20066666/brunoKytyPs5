@@ -1659,7 +1659,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = buffer.Handle();
-	size_t descriptor_count = 0;
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1678,7 +1677,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
 			const auto count = program.bindings.descriptor_counts[index];
-			descriptor_count += count;
 			if (index >= ShaderRecompiler::IR::FirstImageBinding &&
 			    index <= static_cast<size_t>(BindingKind::Samplers)) {
 				image_descriptor_count += count;
@@ -1725,13 +1723,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
-	m_descriptor_buffers.clear();
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
-	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
 	size_t pixel_write_start = write_count;
 	size_t image_cursor = 0;
+	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -1809,7 +1806,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			write.dstBinding = ShaderRecompiler::IR::NativeBinding(program.stage, kind);
 			write.descriptorType = NativeDescriptorType(kind);
 			write.descriptorCount = program.bindings.descriptor_counts[index];
-			const auto buffer_start = m_descriptor_buffers.size();
 			const auto image_start = image_cursor;
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
@@ -1824,8 +1820,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							// descriptor (see NativeStorageBuffer).
 							EXIT_IF(view.buffer == nullptr &&
 							        !m_context.GetGraphics().hardware_storage_buffer_bounds);
-							m_descriptor_buffers.push_back(view);
 						}
+						write.pBufferInfo = descriptors.buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
@@ -1833,7 +1829,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						const auto* bda_buffer = kind == BindingKind::BdaPagetable
 						                             ? cache.GetBdaPageTableBuffer()
 						                             : cache.GetFaultBuffer();
-						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0, bda_buffer->Size());
+						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
+						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
+						write.pBufferInfo = &view;
 						break;
 					}
 					case BindingKind::FlattenedSrt:
@@ -1849,7 +1847,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							view = &descriptors.shared_memory;
 						}
 						EXIT_IF(view->buffer == nullptr);
-						m_descriptor_buffers.push_back(*view);
+						write.pBufferInfo = view;
 						break;
 					}
 					case BindingKind::Samplers:
@@ -1860,9 +1858,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					case BindingKind::Count: EXIT("invalid descriptor binding kind");
 				}
-			}
-			if (m_descriptor_buffers.size() != buffer_start) {
-				write.pBufferInfo = m_descriptor_buffers.data() + buffer_start;
 			}
 			if (image_cursor != image_start) {
 				write.pImageInfo = m_descriptor_images.data() + image_start;
