@@ -188,10 +188,26 @@ void DrawSpeculator::PrefetchNext() {
 	}
 	const auto& draw = next.draw;
 	Prefetch(&next, 128);
+	// The descriptors each stage's bindings are prepared from are in the snapshot's vectors, on
+	// the heap, where the worker wrote them: the first lines of each (a draw has a handful of
+	// buffers, images and samplers). KYTY_DEBUG_AB=fetchsnap leaves them out in every other
+	// window.
+	static const bool snap_ab = AbSelected("fetchsnap");
+	const bool        snap    = !(snap_ab && AbFeatureOff());
+	const auto        heap    = [](const auto& values, size_t most) {
+		if (!values.empty()) {
+			Prefetch(values.data(), std::min(values.size() * sizeof(values[0]), most));
+		}
+	};
 	for (const auto& stage: draw.stages) {
 		Prefetch(&stage, sizeof(stage));
 		if (!stage.user_data.empty()) {
 			Prefetch(stage.user_data.data(), 64);
+		}
+		if (snap && stage.source != nullptr) {
+			heap(stage.snapshot.buffers, 256);
+			heap(stage.snapshot.images, 256);
+			heap(stage.snapshot.samplers, 128);
 		}
 	}
 	const auto& prepared = draw.prepared;
