@@ -177,6 +177,13 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 		return value;
 	};
 	if (input->per_vertex) {
+		if (PixelParameterIsFlat(state, attr)) {
+			const auto value = load_per_vertex(
+			    state.input_info.pixel->parameter_mode == ShaderPixelParameterMode::LastVertex ? 2u : 0u);
+			const auto bits  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+			return bits;
+		}
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
@@ -231,8 +238,12 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 		return value;
 	};
 
-	const auto selected_vertex = (mode + 1u) % 3u;
-	uint32_t   value           = load_vertex(selected_vertex);
+	uint32_t selected_vertex = (mode + 1u) % 3u;
+	if (mode == 2u && PixelParameterIsFlat(state, attr)) {
+		selected_vertex =
+		    state.input_info.pixel->parameter_mode == ShaderPixelParameterMode::LastVertex ? 2u : 0u;
+	}
+	uint32_t value = load_vertex(selected_vertex);
 	if (!PixelParameterIsCustom(state, attr) && mode < 2u) {
 		const auto delta = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpFSub, TypeF32(state), delta, value, load_vertex(0));

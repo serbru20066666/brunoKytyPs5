@@ -1662,6 +1662,13 @@ static std::array<ShaderParams, 3> PrepareGraphicsStages(
 	g_draw_phases.Mark(DrawPhaseTimer::VertexParams);
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+		} else if (context.GetModeControl().provoking_vtx_last) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+		} else {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
