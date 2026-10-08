@@ -1,6 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -2009,12 +2008,8 @@ void TestFmaskLoadSpecialization() {
         "inactive FMASK load did not preserve the execution mask");
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
-  const auto kind = DescriptorBindingForImage(fixture.program.info.images[0]);
-  Check(kind.has_value() &&
-            FindBinding(fixture.program.bindings, *kind)->resources ==
-                std::vector<uint32_t>{0},
-        "FMASK allocated an ordinary image descriptor");
+  Check(DescriptorBindingForImage(fixture.program.info.images[0]).has_value(),
+        "FMASK removal lost the ordinary image class");
   user_data[8] = 0;
   user_data[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u;
   ResourceSpecialization rebound;
@@ -2152,14 +2147,9 @@ void TestDynamicStorageMipTracking() {
         "base-1 through last-3 dynamic storage range was not specialized");
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
-  const auto storage_kind = DescriptorBindingForImage(images[0]);
-  Check(storage_kind.has_value(), "storage image has no descriptor binding");
-  const auto *storage_binding =
-      FindBinding(fixture.program.bindings, *storage_kind);
-  Check(storage_binding != nullptr &&
-            storage_binding->resources == std::vector<uint32_t>({0, 1, 1, 1}),
-        "dynamic storage mip descriptors were not expanded consecutively");
+  Check(DescriptorBindingForImage(images[0]) == DescriptorBindingForImage(images[1]) &&
+            images[0].mip_count == 1 && images[1].mip_mode == ImageMipMode::Dynamic,
+        "dynamic storage mip metadata did not retain one homogeneous image class");
 
   Fixture null_fixture;
   const auto null_handle = null_fixture.Image(
@@ -2284,10 +2274,8 @@ void TestSrtFlatteningAndRuntimeMemoization() {
 
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
-  Check(FindBinding(fixture.program.bindings,
-                    DescriptorBindingKind::FlattenedSrt) != nullptr,
-        "flattened typed SRT reads did not receive a binding");
+  Check(fixture.program.info.uses_flattened_srt,
+        "flattened typed SRT reads were not collected");
 }
 
 void TestDynamicSrtReadRemainsExplicit() {
@@ -2327,20 +2315,9 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
-  Check(FindBinding(fixture.program.bindings,
-                    DescriptorBindingKind::FlattenedSrt) == nullptr &&
-            FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::BdaPagetable) != nullptr &&
-            FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::FaultBuffer) != nullptr,
-        "dynamic scalar read received the wrong resource bindings");
-  Check(fixture.program.bindings.memory_offset_dword ==
-                fixture.program.bindings.user_data_registers.size() &&
-            fixture.program.bindings.memory_offset_count == 1u &&
-            fixture.program.bindings.ShaderDataDwords() ==
-                fixture.program.bindings.memory_offset_dword + 1u,
-        "unified memory-offset layout is inconsistent");
+  Check(!fixture.program.info.uses_flattened_srt && fixture.program.info.uses_dma &&
+            fixture.program.info.live_buffers == 1u,
+        "dynamic scalar read received the wrong resource usage");
 }
 
 void TestWritableDescriptorPhi() {
@@ -3240,7 +3217,7 @@ void TestConditionalIndirectImageMaterialization() {
         "taken indirect image branch did not require its descriptor table");
 }
 
-void TestShaderInfoAndBindingLayout() {
+void TestShaderInfoCollection() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
       {fixture.UserData(3), fixture.UserData(4), Value(64u), Value(0u)}, 4);
@@ -3270,15 +3247,9 @@ void TestShaderInfoAndBindingLayout() {
                 StageInputKind::GlobalInvocationId,
         "typed shader values were not reflected in shader info");
 
-  AllocateBindings(fixture.program);
-  Check(FindBinding(fixture.program.bindings, DescriptorBindingKind::Buffers) !=
-                nullptr &&
-            FindBinding(fixture.program.bindings, DescriptorBindingKind::Gds) !=
-                nullptr &&
-            FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::ShaderData) == nullptr &&
-	        fixture.program.bindings.UsesPushData(),
-        "typed resources were not assigned native bindings");
+  Check(fixture.program.info.live_buffers == 1u &&
+            fixture.program.info.uses_gds && !fixture.program.info.uses_lds,
+        "typed resources were not collected in shader info");
   Check(NativeBinding(ShaderType::Compute, DescriptorBindingKind::Buffers) ==
                 static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
             NativeBinding(ShaderType::Vertex, DescriptorBindingKind::Buffers) ==
@@ -3287,9 +3258,8 @@ void TestShaderInfoAndBindingLayout() {
                 static_cast<uint32_t>(DescriptorBindingKind::Count) +
                     static_cast<uint32_t>(DescriptorBindingKind::Buffers),
         "fixed stage binding ranges are inconsistent");
-  Check(fixture.program.bindings.user_data_registers ==
-            std::vector<uint32_t>({3u, 4u}),
-        "binding layout did not collect live typed user-data values");
+  Check(fixture.program.info.user_data_registers == std::vector<uint32_t>({3u, 4u}),
+        "shader info did not collect live typed user-data values");
 }
 
 void TestImageBindingAbi() {
@@ -3414,60 +3384,27 @@ void TestImageBindingAbi() {
   Check(Invalid(image), "float atomic image received a descriptor binding");
 }
 
-void TestGraphicsPushConstantLayout() {
-  const auto AddUserData = [](Fixture &fixture, uint32_t count) {
-    for (uint32_t index = 0; index < count; index++) {
-      fixture.Emit(ValueOpcode::ReferenceU32, {fixture.UserData(index)});
-    }
-    fixture.program.shader_info_complete = true;
-  };
-  uint32_t cursor = 0;
-  Fixture pixel(ShaderType::Pixel);
-  AddUserData(pixel, 4);
-  AllocateBindings(pixel.program, cursor);
-  Check(
-      pixel.program.bindings.UsesPushData() &&
-          pixel.program.bindings.push_data_start_dword == 0 &&
-          FindBinding(pixel.program.bindings,
-                      DescriptorBindingKind::ShaderData) == nullptr,
-      "pixel shader did not start the shared push-data block");
-  pixel.program.bindings.AdvancePushData(cursor);
+void TestLiveShaderDataCollection() {
+  Fixture fixture;
+  fixture.UserData(7);
+  fixture.Emit(ValueOpcode::ReferenceU32, {fixture.UserData(5)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {fixture.UserData(2)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {fixture.UserData(5)});
+  fixture.Emit(ValueOpcode::GetDispatchThreadExtent, {Value(1u)});
+  fixture.PlanAndTrack();
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  Check(fixture.program.info.user_data_registers == std::vector<uint32_t>({2u, 5u}) &&
+            !fixture.program.info.uses_dispatch_threads,
+        "shader data collection retained unused values or duplicated registers");
 
-  Fixture vertex(ShaderType::Vertex);
-  AddUserData(vertex, 9);
-  AllocateBindings(vertex.program, cursor);
-  Check(vertex.program.bindings.UsesPushData() &&
-            vertex.program.bindings.push_data_start_dword == 4,
-        "vertex shader did not follow pixel data in the shared push-data block");
-  vertex.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 13, "graphics push-data cursor advanced incorrectly");
-
-  Fixture edge(ShaderType::Pixel);
-  AddUserData(edge, NativePushConstantSize / sizeof(uint32_t));
-  AllocateBindings(edge.program);
-  Check(edge.program.bindings.UsesPushData() &&
-            FindBinding(edge.program.bindings,
-                        DescriptorBindingKind::ShaderData) == nullptr,
-        "the full shared push-data block did not fit");
-
-  Fixture spill(ShaderType::Pixel);
-  AddUserData(spill, 20);
-  AllocateBindings(spill.program, cursor);
-  Check(
-      !spill.program.bindings.UsesPushData() &&
-          spill.program.bindings.push_data_start_dword == PushData::NoStart &&
-          FindBinding(spill.program.bindings,
-                      DescriptorBindingKind::ShaderData) != nullptr,
-      "a stage that exceeded the remaining shared push data did not spill to storage");
-  const auto spill_layout = spill.program.bindings;
-  spill.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 13, "a spilled stage consumed shared push-data space");
-
-  Fixture repeated_spill(ShaderType::Pixel);
-  AddUserData(repeated_spill, 20);
-  AllocateBindings(repeated_spill.program, 20);
-  Check(repeated_spill.program.bindings == spill_layout,
-        "storage fallback retained an irrelevant attempted push-data position");
+  const auto extent = fixture.Emit(ValueOpcode::GetDispatchThreadExtent, {Value(0u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {extent});
+  fixture.program.shader_info_complete = false;
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  Check(fixture.program.info.uses_dispatch_threads &&
+            fixture.program.info.user_data_registers == std::vector<uint32_t>({2u, 5u}),
+        "shader data recollection lost a live dispatch extent or retained stale registers");
 }
 
 void TestResourceLimitIsTransactional() {
@@ -3489,12 +3426,8 @@ void TestResourceLimitIsTransactional() {
         "compute shader did not retain all 64 distinct buffers");
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(accepted.program, {.compute = &compute});
-  AllocateBindings(accepted.program);
-  const auto *binding = FindBinding(accepted.program.bindings,
-                                    DescriptorBindingKind::Buffers);
-  Check(binding != nullptr && binding->resources.size() == 64u &&
-            accepted.program.bindings.memory_offset_count == 64u,
-        "compute shader binding layout truncated the 64 buffers");
+  Check(accepted.program.info.live_buffers == UINT64_MAX,
+        "shader info truncated the 64 live buffers");
 
   Fixture fixture;
   MemoryInfo memory;
@@ -3596,9 +3529,9 @@ int main() {
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
-    Run("shader info and bindings", TestShaderInfoAndBindingLayout);
+    Run("shader info collection", TestShaderInfoCollection);
     Run("image binding ABI", TestImageBindingAbi);
-    Run("graphics push constants", TestGraphicsPushConstantLayout);
+    Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {

@@ -277,8 +277,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		const auto resource = ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers,
-		                                            mem.resource);
+		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
 		const auto prefix = ctx.state.memory_byte_offsets[resource];
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);

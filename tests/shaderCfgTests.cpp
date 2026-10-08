@@ -1294,10 +1294,14 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
-void TestSpirvRequirementsAnalysis() {
+void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
+  ShaderPixelInputInfo pixel_info{};
+  ShaderComputeInputInfo compute_info{};
+  ShaderVertexInputInfo vertex_info{};
   Program program;
+  program.resource_tracking_complete = true;
   program.stage = ShaderType::Pixel;
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
@@ -1318,8 +1322,8 @@ void TestSpirvRequirementsAnalysis() {
       block->AppendNewInst(ValueOpcode::SetAttribute, {Value(0u), Value(true)});
   export_value.SetFlags(ExportFlags{.index = 0});
 
-  const auto requirements =
-      ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
+  CollectShaderInfo(program, {.pixel = &pixel_info});
+  const auto& requirements = program.info;
   Check(requirements.subgroup_ballot && requirements.subgroup_shuffle &&
             requirements.subgroup_local_invocation_id &&
             requirements.compute_derivatives &&
@@ -1328,8 +1332,9 @@ void TestSpirvRequirementsAnalysis() {
         "consolidated SPIR-V requirements missed an IR dependency");
 
   program.stage = ShaderType::Compute;
-  const auto compute_requirements =
-      ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute_info});
+  const auto& compute_requirements = program.info;
   Check(!compute_requirements.function_lds &&
             !compute_requirements.pixel_valid_mask,
         "stage-specific SPIR-V requirements leaked into compute");
@@ -1339,19 +1344,22 @@ void TestSpirvRequirementsAnalysis() {
       [&] {
         program.stage = ShaderType::Pixel;
         shared.SetFlags(MemoryFlags{.index = 1});
-        ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
+        program.shader_info_complete = false;
+        CollectShaderInfo(program, {.pixel = &pixel_info});
       },
       "invalid shared-memory requirement metadata did not terminate analysis");
   ExpectFatal(
       [&] {
         program.stage = ShaderType::Pixel;
         export_value.SetFlags(ExportFlags{.index = 1});
-        ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
+        program.shader_info_complete = false;
+        CollectShaderInfo(program, {.pixel = &pixel_info});
       },
       "invalid export requirement metadata did not terminate analysis");
 #endif
 
   Program add_tid;
+  add_tid.resource_tracking_complete = true;
   add_tid.stage = ShaderType::Compute;
   add_tid.info.buffers.resize(1);
   add_tid.info.buffers[0].packed_stride = 1u << 20u;
@@ -1367,8 +1375,8 @@ void TestSpirvRequirementsAnalysis() {
       ValueOpcode::LoadBufferU32,
       {Value(&buffer), Value(0u), Value(0u), Value(0u), Value(true)});
   load.SetFlags(MemoryFlags{.index = 0});
-  const auto add_tid_requirements =
-      ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
+  CollectShaderInfo(add_tid, {.compute = &compute_info});
+  const auto& add_tid_requirements = add_tid.info;
   Check(add_tid_requirements.subgroup_local_invocation_id &&
             !add_tid_requirements.subgroup_ballot &&
             !add_tid_requirements.subgroup_shuffle,
@@ -1378,20 +1386,24 @@ void TestSpirvRequirementsAnalysis() {
   ExpectFatal(
       [&] {
         add_tid.memory_info[0].resource = 1;
-        ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
+        add_tid.shader_info_complete = false;
+        CollectShaderInfo(add_tid, {.compute = &compute_info});
       },
       "invalid buffer requirement metadata did not terminate analysis");
   ExpectFatal(
       [&] {
         add_tid.stage = ShaderType::Vertex;
-        ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(add_tid);
+        add_tid.shader_info_complete = false;
+        CollectShaderInfo(add_tid, {.vertex = &vertex_info});
       },
       "graphics buffer ADD_TID did not terminate requirements analysis");
 #endif
 
   Program empty;
-  const auto empty_requirements =
-      ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(empty);
+  empty.stage = ShaderType::Compute;
+  empty.resource_tracking_complete = true;
+  CollectShaderInfo(empty, {.compute = &compute_info});
+  const auto& empty_requirements = empty.info;
   Check(!empty_requirements.subgroup_ballot &&
             !empty_requirements.subgroup_shuffle &&
             !empty_requirements.subgroup_local_invocation_id &&
@@ -5213,25 +5225,13 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   raw_options.user_data = raw_user_data;
 
   auto raw = RecompileForTest(raw_shader, raw_options);
-  const auto *address_binding = ShaderRecompiler::IR::FindBinding(
-      raw.program.bindings,
-      ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable);
-  const auto *fault_binding = ShaderRecompiler::IR::FindBinding(
-      raw.program.bindings,
-      ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer);
+  const auto& raw_counts = raw.program.bindings.descriptor_counts;
+  using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
   Check(raw.program.info.uses_dma && raw.program.info.buffers.empty() &&
-            address_binding != nullptr && fault_binding != nullptr &&
-            address_binding->resources.empty() &&
-            fault_binding->resources.empty() &&
-            ShaderRecompiler::IR::FindBinding(
-                raw.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::Buffers) ==
-                nullptr &&
-            ShaderRecompiler::IR::FindBinding(
-                raw.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
-                nullptr &&
-            raw.program.bindings.memory_offset_count == 0u,
+            raw_counts[static_cast<size_t>(BindingKind::BdaPagetable)] == 1 &&
+            raw_counts[static_cast<size_t>(BindingKind::FaultBuffer)] == 1 &&
+            raw_counts[static_cast<size_t>(BindingKind::Buffers)] == 0 &&
+            raw_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] == 0,
         "raw scalar load did not use only the DMA domain");
   Check(count_live_memory_ops(
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
@@ -5259,23 +5259,14 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   buffer_options.user_data = buffer_user_data;
 
   auto buffer = RecompileForTest(buffer_shader, buffer_options);
-  const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
-      buffer.program.bindings,
-      ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+  const auto& buffer_counts = buffer.program.bindings.descriptor_counts;
   Check(buffer.program.info.buffers.size() == 1u &&
             buffer.program.info.buffers[0].scalar &&
+            buffer.program.info.buffers[0].descriptor_index == 0 &&
             !buffer.program.info.uses_dma &&
-            buffer_binding != nullptr &&
-            buffer_binding->resources == std::vector<uint32_t>{0u} &&
-            ShaderRecompiler::IR::FindBinding(
-                buffer.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) ==
-                nullptr &&
-            ShaderRecompiler::IR::FindBinding(
-                buffer.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
-                nullptr &&
-            buffer.program.bindings.memory_offset_count == 1u,
+            buffer_counts[static_cast<size_t>(BindingKind::Buffers)] == 1 &&
+            buffer_counts[static_cast<size_t>(BindingKind::BdaPagetable)] == 0 &&
+            buffer_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] == 0,
         "descriptor scalar load did not use only the buffer domain");
   Check(count_live_memory_ops(
             buffer.program, ShaderRecompiler::IR::ValueOpcode::ReadConstBuffer,
@@ -6070,8 +6061,7 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
   const auto binding_kind = ShaderRecompiler::IR::DescriptorBindingForImage(
       result.program.info.images[0]);
   Check(binding_kind.has_value() &&
-            ShaderRecompiler::IR::FindBinding(result.program.bindings,
-                                              *binding_kind) != nullptr,
+            result.program.bindings.descriptor_counts[static_cast<size_t>(*binding_kind)] != 0,
         "2D-MSAA image did not receive a multisampled descriptor binding");
   Check(SpirvContainsTypeImage(result.spirv, 1, 0, 1, 1),
         "SPIR-V binary does not contain a multisampled 2D image type");
@@ -7236,14 +7226,8 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
 
   auto result = RecompileForTest(shader, options);
   Check(result.program.info.uses_dma &&
-            ShaderRecompiler::IR::FindBinding(
-                result.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) !=
-                nullptr &&
-            ShaderRecompiler::IR::FindBinding(
-                result.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer) !=
-                nullptr,
+            result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable)] != 0 &&
+            result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer)] != 0,
         "unbased FLAT did not compile through BDA");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -7982,6 +7966,8 @@ void TestNewShaderRecompilerStructuredU64Phi() {
   use.Emit(IR::ValueOpcode::CompositeExtractU64,
            {IR::Value(&phi), IR::Value(1u)});
 
+  program.shader_info_complete = false;
+  ShaderRecompiler::IR::CollectShaderInfo(program, options.input_info);
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, options.input_info);
   CheckSpirvBinaryValidates(spirv);
   const auto before = MeasureSpirv(result.spirv);
@@ -9845,6 +9831,8 @@ void TestNewShaderRecompilerDispatcherSpillsU32x3() {
     IR::IREmitter use(prologue_program.blocks[1]);
     use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(2u)});
 
+    prologue_program.shader_info_complete = false;
+    IR::CollectShaderInfo(prologue_program, options.input_info);
     auto spirv = ShaderRecompiler::Spirv::EmitProgram(prologue_program,
                                                       options.input_info);
     CheckSpirvBinaryValidates(spirv);
@@ -9870,6 +9858,8 @@ void TestNewShaderRecompilerDispatcherSpillsU32x3() {
   const auto sum = use.Emit(IR::ValueOpcode::IAdd32, {high, IR::Value(7u)});
   use.Emit(IR::ValueOpcode::IAdd32, {sum, middle});
 
+  program.shader_info_complete = false;
+  IR::CollectShaderInfo(program, options.input_info);
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     options.input_info);
   CheckSpirvBinaryValidates(spirv);
@@ -9906,6 +9896,8 @@ void TestNewShaderRecompilerPlanningOnlyLoads() {
   read.Instruction()->SetFlags(IR::MemoryFlags{.index = 1});
   ir.Emit(IR::ValueOpcode::ReferenceU32, {load});
   ir.Emit(IR::ValueOpcode::ReferenceU32, {read});
+  program.shader_info_complete = false;
+  IR::CollectShaderInfo(program, options.input_info);
   const auto spirv = Spirv::EmitProgram(program, options.input_info);
   CheckSpirvBinaryValidates(spirv);
   Check(spirv == result.spirv,
@@ -10039,6 +10031,8 @@ void TestNewShaderRecompilerNativeU64Translation() {
     ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {base, IR::Value(count)});
   }
 
+  program.shader_info_complete = false;
+  ShaderRecompiler::IR::CollectShaderInfo(program, options.input_info);
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, options.input_info);
   CheckSpirvBinaryValidates(spirv);
   const auto source = DisassembleSpirvBinary(spirv);
@@ -10076,6 +10070,8 @@ void TestNewShaderRecompilerNativeU64Translation() {
   use.Emit(IR::ValueOpcode::CompositeExtractU64, {vector, IR::Value(1u)});
 
   spirv.clear();
+  program.shader_info_complete = false;
+  ShaderRecompiler::IR::CollectShaderInfo(program, options.input_info);
   spirv = ShaderRecompiler::Spirv::EmitProgram(program, options.input_info);
   CheckSpirvBinaryValidates(spirv);
   const auto before = MeasureSpirv(result.spirv);
@@ -10448,13 +10444,13 @@ void TestMeshExportStorage() {
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
     Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
-              layout.memory_offset_count == 1,
+              layout.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
           "mesh shader did not retain its user-data placement and buffer offset");
-    const auto reg = std::ranges::find(layout.user_data_registers, 13u);
-    Check(reg != layout.user_data_registers.end(), "mesh shader lost user s13");
+    const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
+    Check(reg != result.program.info.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
     for (const auto dword :
-         {static_cast<uint32_t>(reg - layout.user_data_registers.begin()),
+         {static_cast<uint32_t>(reg - result.program.info.user_data_registers.begin()),
           layout.memory_offset_dword}) {
       const auto operand =
           std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
@@ -13344,72 +13340,55 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  const auto *buffers = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::Buffers);
-  const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
-  const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
-  const ShaderRecompiler::IR::DescriptorBinding *atomic_storage = nullptr;
+  const auto& counts = result.program.bindings.descriptor_counts;
+  std::optional<BindingKind> sampled;
+  std::optional<BindingKind> storage;
+  std::optional<BindingKind> atomic_storage;
   for (const auto &image : result.program.info.images) {
     const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(image);
-    if (!kind.has_value()) {
-      continue;
-    }
-    const auto *binding =
-        ShaderRecompiler::IR::FindBinding(result.program.bindings, *kind);
-    if (image.resource_class ==
-        ShaderRecompiler::IR::ImageResourceClass::Sampled) {
-      sampled = binding;
+    Check(kind.has_value() && image.descriptor_index == 0,
+          "native image did not receive its descriptor slot");
+    if (image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      sampled = kind;
     } else if (image.atomic) {
-      atomic_storage = binding;
+      atomic_storage = kind;
     } else {
-      storage = binding;
+      storage = kind;
     }
   }
-  const auto *samplers = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::Samplers);
-  Check(buffers != nullptr && buffers->resources.size() == 2,
-        "native binding plan did not allocate scalar/vector buffers");
-  Check(sampled != nullptr && sampled->resources.size() == 1,
-        "native binding plan did not allocate the sampled image");
-  Check(storage != nullptr && storage->resources.size() == 1,
-        "native binding plan did not allocate the float storage image");
-  Check(atomic_storage != nullptr && atomic_storage->resources.size() == 1,
-        "native binding plan did not allocate the atomic storage image");
-  Check(samplers != nullptr && samplers->resources.size() == 1,
-        "native binding plan did not allocate the sampler");
+  Check(counts[static_cast<size_t>(BindingKind::Buffers)] == 2 &&
+            result.program.info.buffers[0].descriptor_index == 0 &&
+            result.program.info.buffers[1].descriptor_index == 1,
+        "native emission did not allocate scalar/vector buffer slots");
+  Check(sampled && counts[static_cast<size_t>(*sampled)] == 1,
+        "native emission did not allocate the sampled image");
+  Check(storage && counts[static_cast<size_t>(*storage)] == 1,
+        "native emission did not allocate the float storage image");
+  Check(atomic_storage && counts[static_cast<size_t>(*atomic_storage)] == 1,
+        "native emission did not allocate the atomic storage image");
+  Check(counts[static_cast<size_t>(BindingKind::Samplers)] == 1,
+        "native emission did not allocate the sampler");
   Check(SpirvContainsOpcode(result.spirv, 86),
         "SPIR-V binary does not combine separate image/sampler descriptors");
-  Check(SpirvHasDecorationValue(result.spirv, 33u,
-                                ShaderRecompiler::IR::NativeBinding(
-                                    result.program.stage, buffers->kind)),
-        "SPIR-V lacks storage-buffer Binding decoration");
-  Check(SpirvHasDecorationValue(result.spirv, 33u,
-                                ShaderRecompiler::IR::NativeBinding(
-                                    result.program.stage, sampled->kind)),
-        "SPIR-V lacks sampled-image Binding decoration");
-  Check(SpirvHasDecorationValue(result.spirv, 33u,
-                                ShaderRecompiler::IR::NativeBinding(
-                                    result.program.stage, samplers->kind)),
-        "SPIR-V lacks sampler Binding decoration");
+  for (const auto kind : {BindingKind::Buffers, *sampled, BindingKind::Samplers}) {
+    Check(SpirvHasDecorationValue(result.spirv, 33u,
+              ShaderRecompiler::IR::NativeBinding(result.program.stage, kind)),
+          "SPIR-V lacks a resource Binding decoration");
+  }
   Check(SpirvDecorationValueCount(result.spirv, 34u, 0u) ==
-            result.program.bindings.descriptors.size(),
+            static_cast<size_t>(std::popcount(result.program.bindings.descriptor_mask)),
         "SPIR-V resources do not all use descriptor set zero");
   CheckSpirvBinaryValidates(result.spirv);
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ExpectFatal(
-      [&] {
-        auto malformed = RecompileForTest(shader, options);
-        auto malformed_buffers = std::ranges::find_if(
-            malformed.program.bindings.descriptors, [](const auto &binding) {
-              return binding.kind == BindingKind::Buffers;
-        });
-        malformed_buffers->resources.clear();
-        (void)ShaderRecompiler::Spirv::EmitProgram(malformed.program,
-                                                   options.input_info);
-      },
-      "malformed native binding topology did not terminate SPIR-V emission");
+  const auto bindings = result.program.bindings;
+  result.program.bindings = {};
+  result.program.info.buffers[0].descriptor_index = UINT32_MAX;
+  Check(ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info) == result.spirv &&
+            result.program.bindings == bindings &&
+            result.program.info.buffers[0].descriptor_index == 0,
+        "repeated emission did not rebuild descriptor slots deterministically");
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ShaderRecompiler::IR::Inst *buffer_handle = nullptr;
   for (auto *block : result.program.blocks) {
     const auto found = std::ranges::find_if(*block, [](const auto &inst) {
@@ -14526,12 +14505,32 @@ void TestGraphicsPushConstantPlacement() {
       RecompileForTest(shader, options, nullptr, nullptr, PushDataStart);
   Check(placed.program.bindings.UsesPushData() &&
             placed.program.bindings.push_data_start_dword == PushDataStart &&
-            ShaderRecompiler::IR::FindBinding(placed.program.bindings,
-                                              BindingKind::ShaderData) == nullptr,
+            placed.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 0,
         "pixel shader did not use its assigned shared push-data position");
   Check(SpirvHasMemberDecorationValue(placed.spirv, OffsetDecoration, 0),
         "SPIR-V push-data block did not use the canonical zero base");
   CheckSpirvBinaryValidates(placed.spirv);
+
+  auto exact = RecompileForTest(shader, options, nullptr, nullptr, 28);
+  Check(exact.program.bindings.UsesPushData() &&
+            exact.program.bindings.push_data_start_dword == 28 &&
+            exact.program.bindings.ShaderDataDwords() == 4,
+        "exact-fit shader data did not use the remaining push space");
+  uint32_t cursor = 28;
+  exact.program.bindings.AdvancePushData(cursor);
+  Check(cursor == 32, "exact-fit shader data advanced the cursor incorrectly");
+  CheckSpirvBinaryValidates(exact.spirv);
+
+  auto spill = RecompileForTest(shader, options, nullptr, nullptr, 29);
+  auto full = RecompileForTest(shader, options, nullptr, nullptr, 32);
+  Check(!spill.program.bindings.UsesPushData() &&
+            spill.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 1 &&
+            spill.program.bindings == full.program.bindings && spill.spirv == full.spirv,
+        "insufficient push space did not produce canonical storage-backed data");
+  cursor = 29;
+  spill.program.bindings.AdvancePushData(cursor);
+  Check(cursor == 29, "spilled shader data consumed push space");
+  CheckSpirvBinaryValidates(spill.spirv);
 }
 
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
@@ -14716,7 +14715,7 @@ void TestCompilerStageInputOwnership() {
 #endif
 }
 
-void TestSpirvEmissionOwnsRequirements() {
+void TestSpirvRepeatedEmission() {
   using namespace ShaderRecompiler;
   const uint32_t shader[] = {EncodeSopp(0x01)};
   ShaderComputeInputInfo compute{};
@@ -14732,10 +14731,12 @@ void TestSpirvEmissionOwnsRequirements() {
   const auto first = emitter.Emit(IR::ValueOpcode::ReadFirstLane,
                                   {value, IR::Value(true)});
   emitter.Emit(IR::ValueOpcode::IAdd32, {first, lane});
+  compiled.program.shader_info_complete = false;
+  IR::CollectShaderInfo(compiled.program, options.input_info);
   const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
   CheckSpirvBinaryValidates(binary);
   Check((DisassembleSpirvBinary(binary).find("BuiltIn SubgroupLocalInvocationId") != std::string::npos),
-        "emission reused requirements from an earlier IR version");
+        "collection missed the subgroup requirement of the added IR");
   Check(Spirv::EmitProgram(compiled.program, options.input_info) == binary,
         "repeated emission reused IDs from the previous module");
 
@@ -14808,9 +14809,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   const auto dead_gds_result =
       compile("dead-gds", dead_gds,
               {.words = 64, .instructions = 20, .labels = 4, .branches = 3});
-  Check(ShaderRecompiler::IR::FindBinding(
-            dead_gds_result.program.bindings,
-            ShaderRecompiler::IR::DescriptorBindingKind::Gds) == nullptr,
+  Check(dead_gds_result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Gds)] == 0,
         "dead GDS load retained a descriptor binding");
 
   const uint32_t structured_phi[] = {
@@ -14951,9 +14950,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             wide_gds_metrics.workgroup_variables == 0u &&
             wide_gds_metrics.array_lengths == 1u,
         "native wide GDS fixture did not share one entry-dominating length");
-  Check(ShaderRecompiler::IR::FindBinding(
-            wide_gds_result.program.bindings,
-            ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr,
+  Check(wide_gds_result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Gds)] != 0,
         "live native wide GDS access did not allocate its descriptor binding");
   const auto count_shared = [](const auto &result,
                                ShaderRecompiler::IR::ValueOpcode opcode) {
@@ -15047,11 +15044,11 @@ int main() {
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
-  TestSpirvRequirementsAnalysis();
+  TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
-  TestSpirvEmissionOwnsRequirements();
+  TestSpirvRepeatedEmission();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();

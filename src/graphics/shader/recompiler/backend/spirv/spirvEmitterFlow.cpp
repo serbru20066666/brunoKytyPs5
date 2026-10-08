@@ -10,7 +10,7 @@ namespace {
 
 bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
 	const auto register_index = IR::RegIndex(reg);
-	const auto& registers = state.program.bindings.user_data_registers;
+	const auto& registers = state.program.info.user_data_registers;
 	const auto  found     = std::lower_bound(registers.begin(), registers.end(), register_index);
 	if (found == registers.end() || *found != register_index) {
 		return false;
@@ -472,7 +472,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
 	const auto  exec  = ctx.Arg(inst, 1);
-	if (state.program.stage == ShaderType::Pixel && exp.vm && state.requirements.pixel_valid_mask &&
+	if (state.program.stage == ShaderType::Pixel && exp.vm && state.program.info.pixel_valid_mask &&
 	    state.pixel_valid_mask_variable != 0) {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), value, exec, ConstantU32(state, 1),

@@ -6,7 +6,6 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -59,47 +58,23 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
-struct SpirvRequirements {
-	bool bvh                          = false;
-	bool subgroup_ballot              = false;
-	bool subgroup_barrier             = false;
-	bool subgroup_shuffle             = false;
-	bool subgroup_local_invocation_id = false;
-	bool compute_derivatives          = false;
-	bool image_gather_extended        = false;
-	bool function_lds                 = false;
-	bool function_scratch             = false;
-	bool pixel_valid_mask             = false;
-	bool buffer_int64_atomics         = false;
-	bool buffer_u8                    = false;
-	bool buffer_u16                   = false;
-	bool shared_int64_atomics         = false;
-	bool coherent_buffers             = false;
-	// A buffer store or atomic anywhere in the program. Without one, the buffers are declared
-	// read-only.
-	bool buffer_writes                = false;
-	bool float64                      = false;
-};
-
-SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
-
 struct EmitterState {
 	// Pack two floats into halves with the host's conversion instead of exact truncation.
 	bool native_half_pack = true;
-	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
+	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {
+	      program(program_), input_info(input_info_) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
-		if (IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
+		    input_info.compute != nullptr && input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
 	}
 
 	Builder                                          builder;
-	const IR::Program&                               program;
+	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
@@ -119,10 +94,9 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 	uint32_t                                         tess_patch_base     = 0;
 
-	const SpirvRequirements                          requirements;
-	uint32_t                                         lane_count                  = 1;
-	uint32_t                                         lane_half                   = 0;
-	uint32_t                                         storage_buffer_variable     = 0;
+	uint32_t                                         lane_count              = 1;
+	uint32_t                                         lane_half               = 0;
+	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
@@ -340,9 +314,6 @@ uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane);
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason);
 
-uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
-                               uint32_t resource);
-
 uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
@@ -437,7 +408,6 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
-uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
 

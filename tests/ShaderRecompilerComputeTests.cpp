@@ -43,7 +43,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -475,11 +475,12 @@ struct RenderExecutorTestAccess {
                                     : vk::ShaderStageFlagBits::eCompute;
       auto &set_bindings = layout_bindings.at(
           ShaderRecompiler::IR::NativeDescriptorSet(program.stage));
-      for (const auto &binding : program.bindings.descriptors) {
+      for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+        const auto index = std::countr_zero(mask);
+        const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
         set_bindings.push_back(
-            {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-             NativeDescriptorType(binding.kind), NativeDescriptorCount(binding),
-             shader_stage});
+            {ShaderRecompiler::IR::NativeBinding(program.stage, kind),
+             NativeDescriptorType(kind), program.bindings.descriptor_counts[index], shader_stage});
       }
     }
     PipelineCache::Pipeline pipeline{};
@@ -1816,15 +1817,11 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             image != result.program.info.images.end() &&
                 image->mip_count == test.expected_mip_descriptors,
             "runtime descriptor range did not specialize the mip count");
-    const auto resource =
-        static_cast<u32>(image - result.program.info.images.begin());
     const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(*image);
-    const auto *binding = kind ? ShaderRecompiler::IR::FindBinding(
-                                     result.program.bindings, *kind) : nullptr;
     Require(test.name, "dynamic mip binding",
-            binding != nullptr &&
-                std::ranges::count(binding->resources, resource) ==
-                    test.expected_mip_descriptors,
+            kind && image->descriptor_index != UINT32_MAX &&
+                image->descriptor_index + image->mip_count <=
+                    result.program.bindings.descriptor_counts[static_cast<size_t>(*kind)],
             "dynamic image did not receive one descriptor per mip");
   }
   if (test.expand_shader_data_storage) {
@@ -1837,49 +1834,45 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       block.AppendNewInst(ShaderRecompiler::IR::ValueOpcode::ReferenceU32,
                           {ShaderRecompiler::IR::Value(&user_data)});
     }
-    result.program.bindings = {};
-    result.program.binding_layout_complete = false;
-    ShaderRecompiler::IR::AllocateBindings(result.program);
-    const auto *shader_data = ShaderRecompiler::IR::FindBinding(
-        result.program.bindings,
-        ShaderRecompiler::IR::DescriptorBindingKind::ShaderData);
+    result.program.shader_info_complete = false;
+    ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
+    result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info);
+    const auto shader_data = result.program.bindings.descriptor_counts[
+        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
-            result.program.bindings.user_data_registers.size() == 33 &&
+            result.program.info.user_data_registers.size() == 33 &&
                 !result.program.bindings.UsesPushData() &&
-                shader_data != nullptr,
+                shader_data != 0,
             "oversized shader data did not use its storage fallback");
-    result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                        options.input_info);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
   CheckSpirvText(test, result.spirv);
-  const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_resources) {
+    std::vector<u32> resources;
+    for (u32 i = 0; i < result.program.info.buffers.size(); ++i) {
+      if (result.program.info.buffers[i].descriptor_index != UINT32_MAX) resources.push_back(i);
+    }
     Require(test.name, "live buffer bindings",
-            buffer_binding != nullptr &&
-                buffer_binding->resources == *test.expected_buffer_resources,
+            resources == *test.expected_buffer_resources,
             "dead buffer changed the surviving descriptor order");
   }
   std::vector<u32> packed_user_data;
-  for (const auto reg : result.program.bindings.user_data_registers) {
+  for (const auto reg : result.program.info.user_data_registers) {
     packed_user_data.push_back(
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  const auto buffer_count = result.program.bindings.memory_offset_count;
-  for (u32 i = 0; i < buffer_count; i++) {
-    u32 offset = 0;
-    const auto resource = buffer_binding->resources[i];
-    if (resource < test.storage_buffer_offsets.size()) {
-      offset = test.storage_buffer_offsets[resource];
-    }
+  for (u32 resource = 0; resource < result.program.info.buffers.size(); ++resource) {
+    const auto index = result.program.info.buffers[resource].descriptor_index;
+    if (index == UINT32_MAX) continue;
+    const auto offset = resource < test.storage_buffer_offsets.size()
+                            ? test.storage_buffer_offsets[resource] : 0u;
     Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
-    packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
-        offset << ((i % 4u) * 8u);
+    packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
+        offset << ((index % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
@@ -1975,7 +1968,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
   std::vector<u32> packed_user_data;
-  for (const auto reg : result.program.bindings.user_data_registers) {
+  for (const auto reg : result.program.info.user_data_registers) {
     packed_user_data.push_back(
         resources.user_data[reg - result.program.user_data_base]);
   }
@@ -2307,12 +2300,12 @@ public:
     ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.bindings.push_data_start_dword = 2;
-    vertex_program.bindings.user_data_registers = {0, 1};
+    vertex_program.info.user_data_registers = {0, 1};
     vertex_program.bindings.memory_offset_dword = 2;
     ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
     pixel_program.stage = ShaderType::Pixel;
     pixel_program.bindings.push_data_start_dword = 0;
-    pixel_program.bindings.user_data_registers = {0, 1};
+    pixel_program.info.user_data_registers = {0, 1};
     pixel_program.bindings.memory_offset_dword = 2;
     ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
     vertex_snapshot.user_data = {0x11111111u, 0x22222222u};
@@ -12568,19 +12561,23 @@ public:
                              block_words + 0x10000 / sizeof(uint32_t) - 4),
               "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
 
-      const auto allocate_bindings =
-          [&](ShaderRecompiler::IR::Program &program) {
-            program.shader_info_complete = true;
-            ShaderRecompiler::IR::AllocateBindings(program);
-          };
+      const auto set_image_bindings = [](ShaderRecompiler::IR::Program &program) {
+        for (auto &image : program.info.images) {
+          const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+          const auto index = static_cast<size_t>(kind);
+          image.descriptor_index = program.bindings.descriptor_counts[index];
+          program.bindings.descriptor_counts[index] += image.mip_count;
+          program.bindings.descriptor_mask |= uint64_t{1} << index;
+        }
+      };
       const auto make_buffer_program =
           [](ShaderType stage, ShaderRecompiler::IR::BufferResource resource) {
             ShaderRecompiler::IR::CompiledShaderInfo program{};
             program.stage = stage;
+            resource.descriptor_index = 0;
             program.info.buffers.push_back(resource);
-            program.bindings.descriptors.push_back(
-                {ShaderRecompiler::IR::DescriptorBindingKind::Buffers, {0}});
-            program.bindings.memory_offset_count = 1;
+            program.bindings.descriptor_counts[0] = 1;
+            program.bindings.descriptor_mask = 1;
             program.bindings.push_data_start_dword = 0;
             return program;
           };
@@ -12881,7 +12878,7 @@ public:
       }
       ShaderRecompiler::IR::ApplyResourceSpecialization(
           null_program, null_specialization);
-      allocate_bindings(null_program);
+      set_image_bindings(null_program);
       ShaderRecompiler::IR::CompiledShaderInfo null_info{};
       null_info.stage = null_program.stage;
       null_info.info = std::move(null_program.info);
@@ -12976,7 +12973,7 @@ public:
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       storage_resource.written = true;
       storage_program.info.images.push_back(storage_resource);
-      allocate_bindings(storage_program);
+      set_image_bindings(storage_program);
       ShaderRecompiler::IR::DescriptorValue storage_descriptor{};
       std::copy(std::begin(storage.fields), std::end(storage.fields),
                 storage_descriptor.dwords.begin());
@@ -13512,7 +13509,7 @@ public:
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_resource.read = true;
       sampled_program.info.images.push_back(sampled_resource);
-      allocate_bindings(sampled_program);
+      set_image_bindings(sampled_program);
       ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
       sampled_snapshot.images.push_back(storage_descriptor);
       ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
@@ -13594,7 +13591,7 @@ public:
       vertex_sampled_program.stage = ShaderType::Vertex;
       vertex_sampled_program.resource_tracking_complete = true;
       vertex_sampled_program.info.images.push_back(sampled_resource);
-      allocate_bindings(vertex_sampled_program);
+      set_image_bindings(vertex_sampled_program);
       ShaderRecompiler::IR::CompiledShaderInfo vertex_sampled_info{};
       vertex_sampled_info.stage = vertex_sampled_program.stage;
       vertex_sampled_info.info = std::move(vertex_sampled_program.info);
@@ -13606,7 +13603,7 @@ public:
       pixel_storage_program.stage = ShaderType::Pixel;
       pixel_storage_program.resource_tracking_complete = true;
       pixel_storage_program.info.images.push_back(storage_resource);
-      allocate_bindings(pixel_storage_program);
+      set_image_bindings(pixel_storage_program);
       ShaderRecompiler::IR::CompiledShaderInfo pixel_storage_info{};
       pixel_storage_info.stage = pixel_storage_program.stage;
       pixel_storage_info.info = std::move(pixel_storage_program.info);
@@ -13682,7 +13679,7 @@ public:
       split_ir.stage = ShaderType::Vertex;
       split_ir.resource_tracking_complete = true;
       split_ir.info.images = {storage_resource, sampled_resource};
-      allocate_bindings(split_ir);
+      set_image_bindings(split_ir);
       ShaderRecompiler::IR::CompiledShaderInfo split_program{};
       split_program.stage = split_ir.stage;
       split_program.info = std::move(split_ir.info);
@@ -13775,7 +13772,7 @@ public:
       depth_views_ir.stage = ShaderType::Pixel;
       depth_views_ir.resource_tracking_complete = true;
       depth_views_ir.info.images = {sampled_resource, sampled_resource};
-      allocate_bindings(depth_views_ir);
+      set_image_bindings(depth_views_ir);
       ShaderRecompiler::IR::CompiledShaderInfo depth_views_program{};
       depth_views_program.stage = depth_views_ir.stage;
       depth_views_program.info = std::move(depth_views_ir.info);
@@ -15859,29 +15856,20 @@ public:
       std::copy_n(test.compute_info.dispatch_threads_num, 3,
                   shader_data.begin() + layout.dispatch_thread_dword);
     }
-    auto Binding = [&](Kind kind) {
-      return ShaderRecompiler::IR::FindBinding(layout, kind);
+    auto Count = [&](Kind kind) {
+      return layout.descriptor_counts[static_cast<size_t>(kind)];
     };
     auto Native = [](Kind kind) {
       return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
     };
-    for (const auto &binding : layout.descriptors) {
-      const auto resource_class =
-          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
-        continue;
-      }
-      const auto &image =
-          compiled.program.info.images.at(binding.resources.front());
+    for (const auto &image : compiled.program.info.images) {
       bool supported =
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      if (image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         supported = supported ||
-                    image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
-                    image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
+                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -15909,11 +15897,10 @@ public:
           item.stageFlags = vk::ShaderStageFlagBits::eCompute;
           layout_bindings.push_back(item);
         };
-    for (const auto &binding : layout.descriptors) {
-      add_layout_binding(ShaderRecompiler::IR::NativeBinding(
-                             ShaderType::Compute, binding.kind),
-                         NativeDescriptorType(binding.kind),
-                         NativeDescriptorCount(binding));
+    for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1) {
+      const auto index = std::countr_zero(mask);
+      const auto kind = static_cast<Kind>(index);
+      add_layout_binding(Native(kind), NativeDescriptorType(kind), layout.descriptor_counts[index]);
     }
 
     vk::DescriptorSetLayoutCreateInfo layout_info{};
@@ -15974,9 +15961,9 @@ public:
       }
       pool_sizes.push_back({type, count});
     };
-    for (const auto &binding : layout.descriptors) {
-      add_pool_size(NativeDescriptorType(binding.kind),
-                    NativeDescriptorCount(binding));
+    for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1) {
+      const auto index = std::countr_zero(mask);
+      add_pool_size(NativeDescriptorType(static_cast<Kind>(index)), layout.descriptor_counts[index]);
     }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
@@ -16001,11 +15988,8 @@ public:
 
     std::vector<vk::WriteDescriptorSet> writes;
     std::vector<vk::DescriptorBufferInfo> buffer_infos;
-    std::vector<vk::DescriptorImageInfo> sampled_infos;
+    std::array<std::vector<vk::DescriptorImageInfo>, ShaderRecompiler::IR::ImageBindingCount> image_infos;
     std::vector<vk::ImageView> sampled_mip_views;
-    std::vector<vk::DescriptorImageInfo> storage_infos;
-    std::vector<vk::DescriptorImageInfo> storage_uint_infos;
-    std::vector<vk::DescriptorImageInfo> storage_atomic_infos;
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
@@ -16017,7 +16001,7 @@ public:
     vk::DescriptorBufferInfo bda_pagetable_info{};
     vk::DescriptorBufferInfo fault_buffer_info{};
 
-    if (Binding(Kind::SharedMemory) != nullptr) {
+    if (Count(Kind::SharedMemory) != 0) {
       const auto bytes = uint64_t{test.compute_info.lds_size_dwords} * sizeof(u32) *
           test.dispatch_x * test.dispatch_y * test.dispatch_z;
       shared_buffer = CreateHostBuffer(test.name, bytes, vk::BufferUsageFlagBits::eStorageBuffer, {});
@@ -16031,9 +16015,9 @@ public:
       writes.push_back(write);
     }
 
-    const bool uses_bda = Binding(Kind::BdaPagetable) != nullptr;
+    const bool uses_bda = Count(Kind::BdaPagetable) != 0;
     Require(test.name, "dispatch",
-            uses_bda == (Binding(Kind::FaultBuffer) != nullptr),
+            uses_bda == (Count(Kind::FaultBuffer) != 0),
             "BDA page table and fault buffer must be bound together");
     if (uses_bda) {
       EnsureBdaBuffers(test.name);
@@ -16056,16 +16040,16 @@ public:
       }
     }
 
-    const auto *buffers = Binding(Kind::Buffers);
-    if (buffers != nullptr) {
-      buffer_infos.resize(buffers->resources.size());
-      for (u32 i = 0; i < buffer_infos.size(); i++) {
-        auto &info = buffer_infos[i];
+    if (Count(Kind::Buffers) != 0) {
+      buffer_infos.resize(Count(Kind::Buffers));
+      for (u32 resource = 0; resource < compiled.program.info.buffers.size(); ++resource) {
+        const auto index = compiled.program.info.buffers[resource].descriptor_index;
+        if (index == UINT32_MAX) continue;
+        auto &info = buffer_infos[index];
         info.buffer = buffer.buffer;
         info.offset = 0;
         info.range = buffer.size;
         if (test.storage_buffer_range_bytes != 0) {
-          const auto resource = buffers->resources[i];
           const auto offset = resource < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[resource]
                                   : 0u;
@@ -16084,8 +16068,7 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
-    if (const auto *flattened = Binding(Kind::FlattenedSrt);
-        flattened != nullptr) {
+    if (Count(Kind::FlattenedSrt) != 0) {
       flattened_buffer =
           CreateStorageBuffer(test.name, compiled.resources.flattened_srt,
                               compiled.resources.flattened_srt.size());
@@ -16099,7 +16082,7 @@ public:
       write.pBufferInfo = &flattened_info;
       writes.push_back(write);
     }
-    if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
+    if (Count(Kind::ShaderData) != 0) {
       user_data_buffer =
           CreateStorageBuffer(test.name, shader_data, shader_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
@@ -16112,7 +16095,7 @@ public:
       write.pBufferInfo = &user_data_info;
       writes.push_back(write);
     }
-    if (const auto *gds = Binding(Kind::Gds); gds != nullptr) {
+    if (Count(Kind::Gds) != 0) {
       Require(test.name, "dispatch", gds_buffer != nullptr,
               "GDS descriptor requested but no GDS buffer was provided");
       gds_info = {gds_buffer->buffer, 0, gds_buffer->size};
@@ -16125,51 +16108,27 @@ public:
       write.pBufferInfo = &gds_info;
       writes.push_back(write);
     }
-    std::vector<const ShaderRecompiler::IR::DescriptorBinding *> sampled_bindings;
-    const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
-    for (const auto &binding : layout.descriptors) {
-      const auto resource_class =
-          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
-        continue;
-      }
-      const auto &image =
-          compiled.program.info.images.at(binding.resources.front());
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
-        sampled_bindings.push_back(&binding);
-      } else if (image.atomic) {
-        storage_atomic = &binding;
-      } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
-        storage = &binding;
-      } else {
-        storage_uint = &binding;
-      }
-    }
-    size_t sampled_count = 0;
-    for (const auto *binding : sampled_bindings) sampled_count += binding->resources.size();
-    sampled_infos.reserve(sampled_count);
     Require(test.name, "dispatch", sampled_resources.empty() ||
                 sampled_resources.size() == compiled.program.info.images.size(),
             "sampled resources must match the logical images");
-    for (const auto *sampled : sampled_bindings) {
-      Require(test.name, "dispatch", sampled_image != nullptr || !sampled_resources.empty(),
-              "sampled image descriptor requested but no sampled image was "
-              "provided");
-      const auto first_info = sampled_infos.size();
-      sampled_infos.resize(first_info + sampled->resources.size());
-      std::vector<u32> mip_indices(compiled.program.info.images.size());
-      for (u32 slot = 0; slot < sampled->resources.size(); slot++) {
-        auto &info = sampled_infos[first_info + slot];
-        const auto resource = sampled->resources[slot];
-        const auto *source_image = sampled_resources.empty() ? sampled_image
-                                                             : &sampled_resources[resource];
+    for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
+      const auto &image = compiled.program.info.images[resource];
+      const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+      auto &infos = image_infos[ShaderRecompiler::IR::ImageBindingIndex(kind)];
+      infos.resize(Count(kind));
+      const bool sampled = image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      const auto *source_image = sampled
+          ? (sampled_resources.empty() ? sampled_image : &sampled_resources[resource])
+          : (image.numeric_class == Prospero::TextureNumericClass::Float
+                 ? storage_image : storage_image_uint);
+      Require(test.name, "dispatch", source_image != nullptr,
+              "image descriptor requested but no matching image was provided");
+      for (u32 mip_index = 0; mip_index < image.mip_count; ++mip_index) {
+        auto &info = infos[image.descriptor_index + mip_index];
         info.imageView = source_image->view;
         info.imageLayout = source_image->layout;
-        if (compiled.program.info.images[resource].mip_mode ==
-            ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-          const auto mip = test.sampled_image_view_base_mip + mip_indices[resource]++;
+        if (sampled && image.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+          const auto mip = test.sampled_image_view_base_mip + mip_index;
           Require(test.name, "dispatch", mip < source_image->mip_levels,
                   "sampled mip descriptor exceeds the supplied image");
           vk::ImageViewCreateInfo view{};
@@ -16188,52 +16147,27 @@ public:
           sampled_mip_views.push_back(info.imageView);
         }
       }
+    }
+    for (u32 group = 0; group < image_infos.size(); ++group) {
+      const auto &infos = image_infos[group];
+      if (infos.empty()) continue;
+      const auto kind = static_cast<Kind>(ShaderRecompiler::IR::FirstImageBinding + group);
       vk::WriteDescriptorSet write{};
-      write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = Native(sampled->kind);
-      write.descriptorCount = static_cast<u32>(sampled->resources.size());
-      write.descriptorType = vk::DescriptorType::eSampledImage;
-      write.pImageInfo = sampled_infos.data() + first_info;
+      write.dstBinding = Native(kind);
+      write.descriptorCount = static_cast<u32>(infos.size());
+      write.descriptorType = NativeDescriptorType(kind);
+      write.pImageInfo = infos.data();
       writes.push_back(write);
     }
-    const auto BindStorage =
-        [&](const ShaderRecompiler::IR::DescriptorBinding *binding,
-            const Image *image, std::vector<vk::DescriptorImageInfo> *infos) {
-          if (binding == nullptr) {
-            return;
-          }
-          Require(
-              test.name, "dispatch", image != nullptr,
-              "storage image descriptor requested but no matching image was "
-              "provided");
-          infos->resize(binding->resources.size());
-          for (auto &info : *infos) {
-            info.imageView = image->view;
-            info.imageLayout = image->layout;
-          }
-          vk::WriteDescriptorSet write{};
-          write.sType = vk::StructureType::eWriteDescriptorSet;
-          write.dstSet = descriptor_set;
-          write.dstBinding = Native(binding->kind);
-          write.descriptorCount = static_cast<u32>(infos->size());
-          write.descriptorType = vk::DescriptorType::eStorageImage;
-          write.pImageInfo = infos->data();
-          writes.push_back(write);
-        };
-    BindStorage(storage, storage_image, &storage_infos);
-    BindStorage(storage_uint, storage_image_uint, &storage_uint_infos);
-    BindStorage(storage_atomic, storage_image_uint, &storage_atomic_infos);
-    const auto *samplers = Binding(Kind::Samplers);
-    if (samplers != nullptr) {
+    if (Count(Kind::Samplers) != 0) {
       Require(test.name, "dispatch", sampler != nullptr,
               "sampler descriptor requested but no sampler was provided");
-      sampler_infos.resize(samplers->resources.size());
+      sampler_infos.resize(Count(Kind::Samplers));
       for (auto &info : sampler_infos) {
         info.sampler = sampler;
       }
       vk::WriteDescriptorSet write{};
-      write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
       write.dstBinding = Native(Kind::Samplers);
       write.descriptorCount = static_cast<u32>(sampler_infos.size());
@@ -16309,7 +16243,7 @@ public:
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
-    if (buffers != nullptr) {
+    if (Count(Kind::Buffers) != 0) {
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask =
@@ -19767,8 +19701,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   }
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
   auto Has = [&](Kind kind) {
-    return ShaderRecompiler::IR::FindBinding(compiled.program.bindings, kind) !=
-           nullptr;
+    return compiled.program.bindings.descriptor_counts[static_cast<size_t>(kind)] != 0;
   };
   const auto dwords = std::max<size_t>(
       {test.initial.size(), test.expected.size(), static_cast<size_t>(1)});
@@ -19781,9 +19714,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vk::Sampler sampler = nullptr;
   bool needs_sampled_image = false;
   bool needs_storage_image = false;
-  for (const auto &binding : compiled.program.bindings.descriptors) {
-    const auto resource_class =
-        ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+  for (const auto &image : compiled.program.info.images) {
+    const auto resource_class = image.resource_class;
     if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
       needs_sampled_image = true;
     } else if (resource_class ==
@@ -35783,16 +35715,16 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       program.info.buffers[0].indirect_search_iterations = 0;
       program.info.buffers[0].indirect_resources.clear();
     }
-    program.binding_layout_complete = false;
-    AllocateBindings(program);
-    const auto *buffers = FindBinding(program.bindings, DescriptorBindingKind::Buffers);
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
     Require(test.name, "candidate bindings",
-            buffers != nullptr && buffers->resources ==
-                (null_buffers == 2u ? std::vector<u32>{0u} : std::vector<u32>{0u, 1u}),
+            program.bindings.descriptor_counts[0] == (null_buffers == 2u ? 1u : 2u) &&
+                program.info.buffers[0].descriptor_index == 0u &&
+                (null_buffers == 2u || program.info.buffers[1].descriptor_index == 1u),
             "indirect store lost a buffer binding");
     compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
     compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
     ValidateSpirv(test.name, compiled.spirv);
     if (null_buffers == 2u) {
       test.required_spirv.clear();
@@ -35901,8 +35833,9 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
-  AllocateBindings(program);
   ShaderComputeInputInfo compute{};
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     {.compute = &compute});
   ValidateSpirv(name, spirv);
@@ -35930,8 +35863,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
           "the sample operand lacks its nonuniform decoration");
 
   program.info.images[0].indirect_search_iterations = 0;
-  program.binding_layout_complete = false;
-  AllocateBindings(program);
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
   spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
   ValidateSpirv("DenseIndirectImageTable", spirv);
   Require(name, "dense image map disassembly", tools.Disassemble(spirv, &text),
@@ -35951,8 +35884,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     program.info.images.push_back(candidate);
   }
   program.info.images[0] = root;
-  program.binding_layout_complete = false;
-  AllocateBindings(program);
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
   spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
   ValidateSpirv(name, spirv);
   Require(name, "large image array disassembly", tools.Disassemble(spirv, &text),
@@ -35965,8 +35898,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   program.info.images[root.indirect_resources[103]].dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   program.info.images[root.indirect_resources[103]].cube = true;
-  program.binding_layout_complete = false;
-  AllocateBindings(program);
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
   spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
   ValidateSpirv(name, spirv);
   Require(name, "mixed contiguous image runs", tools.Disassemble(spirv, &text) &&
@@ -35991,8 +35924,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
               ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
               : ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
     }
-    program.binding_layout_complete = false;
-    AllocateBindings(program);
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
     spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
     ValidateSpirv(name, spirv);
     Require(name, "mixed SPIR-V disassembly", tools.Disassemble(spirv, &text),
@@ -36055,14 +35988,13 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       {Value(&output), Value(0u), Value(&byte_offset), Value(0u), Value(&sample_x), Value(true)});
   store.SetFlags(MemoryFlags{1u, 0u});
   program.info.buffers.push_back({.packed_stride = 1, .written = true});
-  program.binding_layout_complete = false;
-  AllocateBindings(program);
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
 
   TestCase test;
   test.name = "IndirectImageContiguousRuns";
   CompiledShader compiled;
   compiled.program = std::move(program);
-  compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
   constexpr std::array ordinals{0u, 1u, 2u, 3u, 4u, 5u, 2u, 0u};
   compiled.resources.flattened_srt.push_back(ordinals.size());
   compiled.resources.flattened_srt.insert(compiled.resources.flattened_srt.end(),
@@ -36085,6 +36017,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     compute.threads_num[1] = compute.threads_num[2] = 1u;
     compiled.program.wave_size = wave_size;
     compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
     ValidateSpirv(test.name, compiled.spirv);
     const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
     Require(test.name, "native array run samples", tools.Disassemble(compiled.spirv, &text) &&
@@ -40721,8 +40654,8 @@ void CheckResourcePlanHandoff() {
     ValidateSpirv(name, compiled.spirv);
     const auto &bindings = compiled.program.bindings;
     Require(name, "GPU data requirements",
-            bindings.user_data_registers.empty() && bindings.memory_offset_count == 1 &&
-                (FindBinding(bindings, DescriptorBindingKind::FlattenedSrt) != nullptr) ==
+            compiled.program.info.user_data_registers.empty() && bindings.descriptor_counts[0] == 1 &&
+                (bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrt)] != 0) ==
                     numeric_read,
             "descriptor-only shader retained SRT uploads or live scalar data was removed");
 

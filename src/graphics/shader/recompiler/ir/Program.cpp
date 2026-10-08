@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 
 #include <fmt/format.h>
 #include <map>
@@ -200,6 +201,16 @@ Value ResolveActiveU32(Value value, Value active) {
 		value = inst->Arg(1);
 	}
 	return {};
+}
+
+uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory) {
+	if (!memory.formatted) return memory.data_bits;
+	const auto format = memory.typed
+	                        ? Format::DecodeTBufferFormat(memory.data_format, memory.number_format)
+	                        : program.info.buffers[memory.resource].descriptor_format;
+	const auto info = Format::GetFormatInfo(format);
+	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
+	           ? 32u : info.component_bits[0];
 }
 
 bool HasShaderMemoryWrites(const Program& program) {

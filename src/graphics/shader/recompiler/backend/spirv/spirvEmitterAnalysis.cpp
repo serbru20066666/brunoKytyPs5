@@ -59,21 +59,6 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 	std::abort();
 }
 
-uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
-                               uint32_t resource) {
-	const auto* descriptor = IR::FindBinding(state.program.bindings, kind);
-	if (descriptor == nullptr) {
-		ExitDescriptorBindingFailure(state, kind, resource, "descriptor group was not allocated");
-	}
-	const auto found =
-	    std::find(descriptor->resources.begin(), descriptor->resources.end(), resource);
-	if (found == descriptor->resources.end()) {
-		ExitDescriptorBindingFailure(state, kind, resource,
-		                             "resource is absent from descriptor group");
-	}
-	return static_cast<uint32_t>(found - descriptor->resources.begin());
-}
-
 uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
@@ -162,13 +147,15 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 }
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
+	if (sampler >= state.program.info.samplers.size()) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Samplers, sampler,
+		                             "sampler resource index is out of range");
+	}
 	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
 	const auto pointer_type =
 	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
 	const auto pointer = DescriptorElementPointer(
-	    state, pointer_type, state.sampler_variable, ConstantU32(state, array_index),
+	    state, pointer_type, state.sampler_variable, ConstantU32(state, sampler),
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
 	const auto sampler_id = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
@@ -200,7 +187,7 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value());
 	if (array_index == 0u) {
-		array_index = ConstantU32(state, ResourceForDescriptor(state, *kind, resource) + mip);
+		array_index = ConstantU32(state, image.descriptor_index + mip);
 	}
 	const auto pointer_type = state.builder.Type(
 	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image));

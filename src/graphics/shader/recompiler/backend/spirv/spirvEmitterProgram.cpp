@@ -816,7 +816,7 @@ void EmitProgram(EmitterState& state) {
 		high.half       = 1;
 	}
 	std::optional<DispatcherFunctionState> dispatcher;
-	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
+	if (state.program.stage == ShaderType::Pixel && state.program.info.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
@@ -884,28 +884,23 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineBvhIntersect(state);
-	for (const auto* block: program.blocks) {
-		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
-			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
-		    })) {
-			ctx.scratch_u32_variable = state.builder.AllocateId();
-			if (state.lane_count == 2) {
-				high.scratch_u32_variable = state.builder.AllocateId();
-			}
-			break;
+	if (program.info.uses_swizzle) {
+		ctx.scratch_u32_variable = state.builder.AllocateId();
+		if (state.lane_count == 2) {
+			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
-	if (state.requirements.function_lds) {
+	if (state.program.info.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
 		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
 		    state.lds_variable, spv::StorageClassFunction);
 	}
-	if (state.requirements.function_scratch) {
+	if (state.program.info.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.builder.AddFunction(
 			    spv::OpVariable,

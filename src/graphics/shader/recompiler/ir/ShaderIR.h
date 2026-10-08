@@ -104,6 +104,7 @@ struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
+	uint32_t               descriptor_index   = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
 	uint32_t               packed_stride      = 0;
@@ -133,6 +134,7 @@ struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 
 	uint32_t                      source            = 0;
+	uint32_t                      descriptor_index  = UINT32_MAX;
 	uint32_t                      first_use_pc      = 0;
 	ImageResourceClass            resource_class    = ImageResourceClass::None;
 	Prospero::TextureNumericClass numeric_class     = Prospero::TextureNumericClass::Unsupported;
@@ -434,23 +436,16 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
-struct DescriptorBinding {
-	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
-	std::vector<uint32_t> resources;
-
-	bool operator==(const DescriptorBinding& other) const = default;
-};
-
-struct BindingLayout {
-	uint32_t                       push_data_start_dword = PushData::NoStart;
-	uint32_t                       dispatch_thread_dword = PushData::NoStart;
-	uint32_t                       memory_offset_dword = 0;
-	uint32_t                       memory_offset_count = 0;
-	std::vector<uint32_t>          user_data_registers;
-	std::vector<DescriptorBinding> descriptors;
+struct Bindings {
+	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
+	uint64_t descriptor_mask = 0;
+	uint32_t push_data_start_dword = PushData::NoStart;
+	uint32_t dispatch_thread_dword = PushData::NoStart;
+	uint32_t memory_offset_dword = 0;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+		return memory_offset_dword +
+		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -461,7 +456,7 @@ struct BindingLayout {
 		}
 	}
 
-	bool operator==(const BindingLayout& other) const = default;
+	bool operator==(const Bindings& other) const = default;
 };
 
 struct ShaderInfo {
@@ -476,11 +471,37 @@ struct ShaderInfo {
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
+	std::vector<uint32_t>            user_data_registers;
+	uint64_t                        live_buffers = 0;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
-	bool                             has_bitwise_xor    = false;
-	bool                             uses_dma           = false;
+	bool                            has_bitwise_xor               = false;
+	bool                            uses_dma                      = false;
+	bool                            uses_swizzle                  = false;
+	bool                            uses_lds                      = false;
+	bool                            uses_gds                      = false;
+	bool                            uses_flattened_srt            = false;
+	bool                            uses_dispatch_threads         = false;
+	bool                            bvh                           = false;
+	bool                            subgroup_ballot               = false;
+	bool                            subgroup_barrier              = false;
+	bool                            subgroup_shuffle              = false;
+	bool                            subgroup_local_invocation_id  = false;
+	bool                            compute_derivatives           = false;
+	bool                            image_gather_extended         = false;
+	bool                            function_lds                  = false;
+	bool                            function_scratch              = false;
+	bool                            pixel_valid_mask              = false;
+	bool                            buffer_int64_atomics          = false;
+	bool                            buffer_u8                     = false;
+	bool                            buffer_u16                    = false;
+	bool                            shared_int64_atomics          = false;
+	bool                            coherent_buffers              = false;
+	// A buffer store or atomic anywhere in the program. Without one, the buffers are declared
+	// read-only.
+	bool                            buffer_writes                 = false;
+	bool                            float64                       = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -552,7 +573,7 @@ struct CompiledShaderInfo {
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
-	BindingLayout                 bindings;
+	Bindings                      bindings;
 };
 
 struct UniformFillPlan {
@@ -785,10 +806,11 @@ struct Program: ResourcePlan {
 	std::vector<ExportInfo>       export_info;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
-	BindingLayout                 bindings;
-	bool                          binding_layout_complete = false;
+	Bindings                      bindings;
 
 };
+
+uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);
 
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);

@@ -5,8 +5,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// Completes the immutable shader interface after resource tracking. On failure Program::info and
-// all completion state remain unchanged.
+// Collects the shader interface, resource usage and instruction features after resource tracking.
+// The live-buffer mask of a program with `count` buffers: all of them (see CollectShaderInfo).
+uint64_t AllBuffersLive(size_t count);
 void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

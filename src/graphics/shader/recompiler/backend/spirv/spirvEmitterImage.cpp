@@ -867,7 +867,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto resource = image.indirect_resources[ordinal];
 			const auto& candidate = state.program.info.images[resource];
 			const auto kind = *IR::DescriptorBindingForImage(candidate);
-			const auto& binding = *IR::FindBinding(state.program.bindings, kind);
 			if (!runs.empty()) {
 				auto& run = runs.back();
 				const auto& first = state.program.info.images[run.resource];
@@ -875,17 +874,16 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
 				    IR::DescriptorBindingForImage(first) == kind &&
 				    candidate.mip_count == 1u && first.mip_count == 1u &&
-				    (ordinal == 1u || (next_slot < binding.resources.size() &&
-				                      binding.resources[next_slot] == resource))) {
+				    (ordinal == 1u || candidate.descriptor_index == next_slot)) {
 					// Native roots precede appended children; only the root may have a slot gap.
 					if (ordinal == 1u)
-						run.slot_bias = ResourceForDescriptor(state, kind, resource) - ordinal;
+						run.slot_bias = candidate.descriptor_index - ordinal;
 					++run.count;
 					continue;
 				}
 			}
 			runs.push_back({ordinal, 1u, resource,
-			                ResourceForDescriptor(state, kind, resource) - ordinal});
+			                candidate.descriptor_index - ordinal});
 		}
 		const auto EmitRun = [&](uint32_t index) {
 			const auto& run = runs[index];
@@ -893,8 +891,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto slot = Binary(state, spv::OpIAdd, TypeU32(state), selected,
 			                   ConstantU32(state, run.slot_bias));
 			if (run.first == 0u) {
-				const auto kind = *IR::DescriptorBindingForImage(image);
-				const auto root_slot = ResourceForDescriptor(state, kind, mem.resource);
+				const auto root_slot = image.descriptor_index;
 				if (root_slot != run.slot_bias) {
 					const auto is_root = Binary(state, spv::OpIEqual, TypeBool(state), selected,
 					                            ConstantU32(state, 0u));
