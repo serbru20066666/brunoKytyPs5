@@ -24,6 +24,8 @@ struct SpeculatedStage {
 	uint64_t                                     shader_base = 0;
 	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	// Of `specialization`, never 0 (see SpecializationHash in pipelineCache.cpp).
+	uint64_t                                     specialization_hash = 0;
 	ShaderRecompiler::IR::ReadLog                reads;
 };
 

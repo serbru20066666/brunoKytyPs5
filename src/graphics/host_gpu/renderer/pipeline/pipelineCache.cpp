@@ -324,7 +324,44 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		// SpecializationHash(specialization) once a lookup with a known hash matched it; 0 before.
+		uint64_t                                     specialization_hash = 0;
 	};
+
+	// A fingerprint of a specialization, by value and never 0. The draw speculation computes it
+	// for the specialization it prepares, on its thread, and the GPU thread that adopts that
+	// specialization finds its permutation by the fingerprint: comparing the vectors read memory
+	// the other core had just written, 2.4% of the GPU thread in the plaza. Two specializations
+	// of one program sharing a 64-bit fingerprint is not expected to happen.
+	// KYTY_DEBUG_AB=spechash compares the vectors in every other window; KYTY_VERIFY_SPEC=1
+	// compares them as well and exits on a difference.
+	static uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& s) {
+		uint64_t   hash = 0x243f6a8885a308d3ull;
+		const auto mix  = [&hash](uint64_t value) {
+			hash = (hash ^ value) * 0x9e3779b97f4a7c15ull;
+			hash ^= hash >> 32u;
+		};
+		mix(s.buffers.size());
+		for (const auto& buffer: s.buffers) {
+			mix(buffer.packed_stride);
+			mix(static_cast<uint64_t>(buffer.descriptor_format));
+			mix(buffer.descriptor_swizzle);
+			mix(buffer.zero_stride_oob ? 1u : 0u);
+		}
+		mix(s.images.size());
+		for (const auto& image: s.images) {
+			mix(static_cast<uint64_t>(image.numeric_class));
+			mix(static_cast<uint64_t>(image.dimension));
+			mix(image.mip_count);
+			mix(static_cast<uint64_t>(image.conversion_format));
+			mix(image.shader_swizzle);
+			mix(image.indirect_root);
+			mix(image.indirect_mapping_offset);
+			mix(image.indirect_search_iterations);
+			mix((image.cube ? 1u : 0u) | (image.fmask ? 2u : 0u));
+		}
+		return hash | 1u;
+	}
 
 	// A permutation's shader module and info, compiled on any thread.
 	struct CompiledModule {
@@ -349,6 +386,9 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		// SpecializationHash(specialization) when it was adopted from the draw speculation and not
+		// refreshed since; 0: not known.
+		uint64_t                                     specialization_hash = 0;
 		ShaderRecompiler::IR::MaterializationMemo    memo;
 		std::vector<Permutation>                    permutations;
 		// Permutations only grow and never repeat a (push data start, specialization) pair, so
@@ -663,6 +703,9 @@ struct PipelineCache::ProgramCache {
 				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 				    source.resource_plan, runtime, source.resources, source.specialization,
 				    &source.memo));
+				if (!source.memo.reused) {
+					source.specialization_hash = 0;
+				}
 				// Sources the precompile replay inserted get here for their first refresh.
 				if (!source.speculable.load(std::memory_order_relaxed)) {
 					source.speculable.store(true, std::memory_order_release);
@@ -672,12 +715,28 @@ struct PipelineCache::ProgramCache {
 				CountRefresh(source);
 			}
 			DrawPhaseTimer::ProbeScope probe(g_draw_phases, DrawPhaseTimer::ProgramMatch);
-			const auto matches = [&](const Permutation& candidate) {
+			static const bool hash_ab = AbSelected("spechash");
+			const uint64_t    known   = hash_ab && AbFeatureOff() ? 0 : source.specialization_hash;
+			const auto        matches = [&](Permutation& candidate) {
 				const auto& layout = candidate.program.bindings;
-				return layout.push_data_start_dword ==
-				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-				                                                    layout.ShaderDataDwords()) &&
-				       candidate.specialization == source.specialization;
+				if (layout.push_data_start_dword !=
+				    ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                             layout.ShaderDataDwords())) {
+					return false;
+				}
+				if (known != 0 && candidate.specialization_hash == known) {
+					if (verify_speculation && !(candidate.specialization == source.specialization)) {
+						EXIT("draw speculation: a specialization's fingerprint matched another\n");
+					}
+					return true;
+				}
+				if (!(candidate.specialization == source.specialization)) {
+					return false;
+				}
+				if (known != 0) {
+					candidate.specialization_hash = known;
+				}
+				return true;
 			};
 			auto index = source.last_permutation;
 			if (index >= source.permutations.size() ||
@@ -792,6 +851,7 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization, &entry->second.memo));
+			entry->second.specialization_hash = 0;
 			entry->second.speculable.store(true, std::memory_order_release);
 		}
 		auto& source = entry->second;
@@ -907,6 +967,7 @@ struct PipelineCache::ProgramCache {
 			speculation_failures[3].fetch_add(1, std::memory_order_relaxed);
 			return false;
 		}
+		out.specialization_hash = SpecializationHash(out.specialization);
 		out.user_data.assign(user_data.begin(), user_data.end());
 		out.shader_base = params.Base();
 		out.source      = source;
@@ -965,6 +1026,7 @@ struct PipelineCache::ProgramCache {
 			} else {
 				std::swap(source.resources, stage_result->snapshot);
 				std::swap(source.specialization, stage_result->specialization);
+				source.specialization_hash = stage_result->specialization_hash;
 				source.memo.valid  = false;
 				source.memo.reused = false;
 				speculation.adopted++;

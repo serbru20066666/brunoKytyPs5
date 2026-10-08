@@ -196,7 +196,20 @@ void DrawSpeculator::PrefetchNext() {
 	}
 	const auto& prepared = draw.prepared;
 	const auto* vertex   = reinterpret_cast<const char*>(&prepared.vertex_info);
-	Prefetch(&prepared, static_cast<size_t>(vertex - reinterpret_cast<const char*>(&prepared)) + 256);
+	// The registers are compared whole, but of the vertex table words (1.5 KB of room) a draw
+	// reads the first few dozen: asking for them all, with the registers, was fifty lines at
+	// once, more than the core fetches at a time, and the thread waited here for the rest (4% of
+	// its samples in the plaza). KYTY_DEBUG_AB=fetchtrim asks for them all in every other window.
+	static const bool trim_ab = AbSelected("fetchtrim");
+	if (trim_ab && AbFeatureOff()) {
+		Prefetch(&prepared,
+		         static_cast<size_t>(vertex - reinterpret_cast<const char*>(&prepared)) + 256);
+	} else {
+		const auto* tables = reinterpret_cast<const char*>(&prepared.vertex_tables);
+		Prefetch(&prepared,
+		         static_cast<size_t>(tables - reinterpret_cast<const char*>(&prepared)) + 192);
+		Prefetch(vertex, 256);
+	}
 	Prefetch(&prepared.vertex_info.resources_dst, 128);
 	Prefetch(&prepared.vertex_info.buffers, 128);
 	Prefetch(&prepared.vertex_info.stage,

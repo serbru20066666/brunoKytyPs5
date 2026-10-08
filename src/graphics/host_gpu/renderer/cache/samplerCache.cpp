@@ -24,7 +24,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		SamplerKey  key {};
 		vk::Sampler sampler;
 	};
-	thread_local std::array<Recent, 64> recent {};
+	thread_local std::array<Recent, 1024> recent {};
 	auto& slot = recent[SamplerKeyHash {}(key) % recent.size()];
 	if (slot.cache == m_id && slot.key == key) {
 		return slot.sampler;
