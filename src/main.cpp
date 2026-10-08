@@ -19,6 +19,15 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+
+#include <shellapi.h>
+#endif
+
 using namespace Common;
 using namespace Emulator;
 
@@ -542,6 +551,53 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Started with nothing to run, which is what a double click does: the player wanted the launcher
+// that sits beside this executable. Without one, say what this executable needs instead of
+// flashing a console that closes. Returns false when the usage text is the answer: from a shell,
+// and for a program reading our output, which is how the launcher asks for the version. A
+// launcher opened from here marks its environment, so that nothing it starts opens another.
+static bool OpenLauncherInstead() {
+	static constexpr wchar_t opened_mark[] = L"KYTY_OPENED_LAUNCHER";
+	DWORD                    attached[2] {};
+	if (GetConsoleProcessList(attached, 2) != 1 ||
+	    GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_CHAR ||
+	    GetEnvironmentVariableW(opened_mark, nullptr, 0) != 0) {
+		return false;
+	}
+	std::wstring path(MAX_PATH, L'\0');
+	for (;;) {
+		const DWORD length =
+		    GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+		if (length == 0) {
+			return false;
+		}
+		if (length < path.size()) {
+			path.resize(length);
+			break;
+		}
+		path.resize(path.size() * 2);
+	}
+	const auto      folder   = std::filesystem::path(path).parent_path();
+	const auto      launcher = folder / L"launcher.exe";
+	std::error_code error;
+	if (std::filesystem::exists(launcher, error)) {
+		SetEnvironmentVariableW(opened_mark, L"1");
+		const auto opened = reinterpret_cast<INT_PTR>(ShellExecuteW(
+		    nullptr, L"open", launcher.c_str(), nullptr, folder.c_str(), SW_SHOWNORMAL));
+		if (opened > 32) {
+			return true;
+		}
+	}
+	MessageBoxW(nullptr,
+	            L"This is the emulator itself, and it needs a game to run.\n\n"
+	            L"Open launcher.exe and start the game from there, or run:\n"
+	            L"kyty_emulator.exe --game <game folder>",
+	            L"brunoKytyPs5", MB_OK | MB_ICONINFORMATION);
+	return true;
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
@@ -558,6 +614,11 @@ static int Main(int argc, char* argv[]) {
 	}
 
 	if (argc < 2 && settings.empty()) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (OpenLauncherInstead()) {
+			return 0;
+		}
+#endif
 		PrintUsage();
 		return 0;
 	}
