@@ -1758,17 +1758,18 @@ void TestRuntimeUnsignedMinDescriptor() {
                {descriptor, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 0x330));
   fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
 
   std::array<uint32_t, 1> user_data{0xffffffffu};
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue value;
   const auto source = fixture.program.info.buffers[0].source;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, value) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(source, value) &&
             value.dwords[3] == 0x100u,
         "runtime descriptor unsigned minimum did not clamp its first operand");
   user_data[0] = 0x80u;
   Check(
-      SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, value) &&
+      SrtWalker(plan, runtime).EvaluateDescriptor(source, value) &&
           value.dwords[3] == 0x80u,
       "runtime descriptor unsigned minimum did not preserve its first operand");
 }
@@ -1875,6 +1876,7 @@ void TestSampleAdjustSamplerScratch() {
                {image, shift_sampler, fixture.ImageAddress()},
                fixture.AddMemory(memory, 0x200));
   fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
 
   const auto source = fixture.program.info.samplers[0].source;
   const auto stored = fixture.program.descriptor_sources[source]
@@ -1886,12 +1888,12 @@ void TestSampleAdjustSamplerScratch() {
   std::array<uint32_t, 4> user_data{4u, 1u, 2u, 0x80000abcu};
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue descriptor;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, descriptor) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(source, descriptor) &&
             descriptor.dwords[3] == 0x80000abcu,
         "SampleAdjust canonicalization lost sampler border fields");
   const auto shift_source = fixture.program.info.samplers[
       shift_sampler.Instruction()->Flags<uint32_t>()].source;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(shift_source, descriptor) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(shift_source, descriptor) &&
             std::ranges::equal(std::span(descriptor.dwords).first(4),
                                std::array{0x36u, 0xfff000u, 0x02500000u, 0u}),
         "SampleAdjust shift-only scratch was not reduced to its zero border payload");
@@ -2239,6 +2241,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
   SrtRuntime runtime{.user_data = user_data,
                      .read_memory = ReadTestMemory,
                      .userdata = &memory};
+  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue descriptor;
   std::vector<uint32_t> flat;
   const uint32_t request = fixture.program.info.buffers[0].source;
@@ -2246,27 +2249,25 @@ void TestSrtFlatteningAndRuntimeMemoization() {
     SrtWalker walker(plan, runtime);
     return walker.EvaluateDescriptor(request, descriptor) && walker.RefreshFlatBuffer(flat);
   };
-  Check(refresh(fixture.program), "typed runtime source evaluation failed");
+  Check(refresh(plan), "typed runtime source evaluation failed");
   Check(descriptor.dwords[0] == 0xdeadbeefu &&
             flat == std::vector<uint32_t>{0xdeadbeefu} && memory.reads == 1,
         "descriptor and flat SRT evaluation did not share one memoized read");
 
   memory.reads = 0;
   memory.words[1] = 0x12345678u;
-  Check(refresh(fixture.program) && descriptor.dwords[0] == 0x12345678u &&
+  Check(refresh(plan) && descriptor.dwords[0] == 0x12345678u &&
             flat == std::vector<uint32_t>{0x12345678u} && memory.reads == 1,
         "repeated runtime evaluation reused stale scalar memory");
 
   memory.reads = 0;
   memory.fail_after = 0;
-  Check(!refresh(fixture.program), "unavailable scalar memory was accepted");
+  Check(!refresh(plan), "unavailable scalar memory was accepted");
   memory.fail_after = UINT32_MAX;
-  Check(refresh(fixture.program) && descriptor.dwords[0] == 0x12345678u && memory.reads == 1,
+  Check(refresh(plan) && descriptor.dwords[0] == 0x12345678u && memory.reads == 1,
         "failed runtime evaluation left a value marked as visiting");
 
-  auto detached = ExtractResourcePlan(fixture.program);
-  Check(refresh(detached), "detached resource plan did not evaluate");
-  auto moved = std::move(detached);
+  auto moved = std::move(plan);
   memory.reads = 0;
   memory.words[1] = 0x87654321u;
   Check(refresh(moved) && descriptor.dwords[0] == 0x87654321u && memory.reads == 1,
@@ -2296,6 +2297,7 @@ void TestDynamicSrtReadRemainsExplicit() {
                {descriptor, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(buffer, 8));
   fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
 
   Check(fixture.program.srt_reads.empty() &&
             read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
@@ -2309,7 +2311,7 @@ void TestDynamicSrtReadRemainsExplicit() {
                      .read_memory = ReadTestMemory,
                      .userdata = &memory};
   DescriptorValue value;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(fixture.program.info.buffers[0].source, value) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(fixture.program.info.buffers[0].source, value) &&
             value.dwords[0] == 0xabcdef01u && memory.reads == 1,
         "dynamic typed scalar descriptor source was not evaluated");
 
@@ -2475,7 +2477,7 @@ void TestConditionalSamplerPhi() {
           memory.fail_address = 0x1000 + (first == 448 / 4 ? 480u : 448u);
           DescriptorValue selected;
           SrtWalker clean(plan, CleanRuntime(runtime));
-          Check(SrtWalker(plan, runtime, {}, &clean).EvaluateDescriptor(source, selected),
+          Check(SrtWalker(plan, runtime, &clean).EvaluateDescriptor(source, selected),
                 "conditional sampler did not survive detached plan lifetime");
           for (uint32_t word = 0; word < 4; ++word) {
             Check(selected.dwords[word] == memory.words[first + word],
@@ -2487,13 +2489,13 @@ void TestConditionalSamplerPhi() {
         no_clean_reader.read_specialization_memory = nullptr;
         {
           SrtWalker clean(plan, CleanRuntime(no_clean_reader));
-          Check(!SrtWalker(plan, no_clean_reader, {}, &clean).EvaluateDescriptor(source, selected),
+          Check(!SrtWalker(plan, no_clean_reader, &clean).EvaluateDescriptor(source, selected),
                 "conditional sampler used unchecked memory for its predicate");
         }
         memory.fail_address = 0x2000 + 196;
         {
           SrtWalker clean(plan, CleanRuntime(runtime));
-          Check(!SrtWalker(plan, runtime, {}, &clean).EvaluateDescriptor(source, selected),
+          Check(!SrtWalker(plan, runtime, &clean).EvaluateDescriptor(source, selected),
                 "conditional sampler ignored unavailable coherent predicate memory");
         }
       }
@@ -2544,6 +2546,7 @@ void TestFiniteImagePhiCycle() {
   fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
                fixture.AddMemory(memory, 4));
   fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
   const auto source = fixture.program.info.images[0].source;
   const auto &finite = fixture.program.descriptor_sources[source].indirect_descriptor;
   Check(finite && finite->sources.size() == 2,
@@ -2558,7 +2561,7 @@ void TestFiniteImagePhiCycle() {
         "finite image key did not preserve the loop-carried selection");
   std::array<uint32_t, 16> data;
   for (uint32_t i = 0; i < data.size(); ++i) data[i] = 100u + i;
-  SrtWalker walker(fixture.program, SrtRuntime{.user_data = data});
+  SrtWalker walker(plan, SrtRuntime{.user_data = data});
   for (uint32_t candidate = 0; candidate < 2; ++candidate) {
     DescriptorValue descriptor;
     Check(walker.EvaluateDescriptor(finite->sources[candidate], descriptor),
@@ -2658,10 +2661,11 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
   ConstantPropagationPass(fixture.program.blocks);
   RemoveIdentities(fixture.program.blocks);
   fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
   const std::array<uint32_t, 1> user_data{0x4000u};
   DescriptorValue descriptor;
   Check(fixture.program.info.buffers.size() == 1u &&
-            SrtWalker(fixture.program, {.user_data = user_data}).EvaluateDescriptor(
+            SrtWalker(plan, {.user_data = user_data}).EvaluateDescriptor(
                 fixture.program.info.buffers[0].source, descriptor) &&
             descriptor.dwords[0] == user_data[0],
         "runtime-rooted invariant loop lost its buffer source");
@@ -2687,11 +2691,12 @@ void TestInvariantLoopPhi() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 4), loop);
   fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
 
   std::array<uint32_t, 1> user_data{0x12345678u};
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue descriptor;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(fixture.program.info.buffers[0].source, descriptor) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(fixture.program.info.buffers[0].source, descriptor) &&
             descriptor.dwords[0] == user_data[0],
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
@@ -2799,10 +2804,11 @@ void TestBoundedRelativeRegisterWrites() {
       continue;
     }
     fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
     const std::array<uint32_t, 3> user_data{0x1000u, 0u, 72u};
     SrtRuntime runtime{.user_data = user_data};
     DescriptorValue descriptor;
-    Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(
+    Check(SrtWalker(plan, runtime).EvaluateDescriptor(
               fixture.program.info.buffers[0].source, descriptor) &&
               descriptor.dwords[2] == 72u,
           "impossible relative writes left a false descriptor dependency");

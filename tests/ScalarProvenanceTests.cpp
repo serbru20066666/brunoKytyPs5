@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdlib>
@@ -131,7 +132,7 @@ void TestImmediateFlatteningAndGvn() {
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "flattened SRT walk failed");
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
 }
@@ -147,7 +148,7 @@ void TestRawScalarComponentAlignment() {
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "raw scalar SRT walk failed");
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat), "raw scalar SRT walk failed");
   Check(
       flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
       "raw scalar base, immediate, and offset were not aligned independently");
@@ -202,7 +203,7 @@ void TestNestedSrtWalk() {
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "nested SRT walk failed");
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat), "nested SRT walk failed");
   Check(flat == std::vector<uint32_t>({0x2000u, 0xabcdef01u}),
         "nested typed SRT reads were not evaluated in dependency order");
 }
@@ -225,7 +226,7 @@ void TestShaderBaseAndUserData() {
   SrtRuntime runtime{.user_data = user_data,
                      .shader_base = 0x12345678abcdef00ull};
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result),
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).EvaluateDescriptor(0, result),
         "shader-relative descriptor evaluation failed");
   Check(result.dword_count == 3 && result.dwords[0] == 0xabcdef00u &&
             result.dwords[1] == 0x12345678u && result.dwords[2] == 0x24u,
@@ -250,7 +251,7 @@ void TestCarryAndBitFields() {
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), {}).EvaluateDescriptor(0, result),
         "carry and bit-field descriptor evaluation failed");
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
@@ -273,11 +274,12 @@ void TestInvariantAndDivergentPhi() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
+  const auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(plan, {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 7u,
         "loop-invariant typed phi was rejected");
-  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(1, result),
+  Check(!SrtWalker(plan, {}).EvaluateDescriptor(1, result),
         "divergent phi was accepted");
 }
 
@@ -374,7 +376,7 @@ void TestRuntime64BitDescriptorOps() {
       {.dwords = {low, high}, .dword_count = 2});
 
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(ExtractResourcePlan(fixture.program), {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
         "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
@@ -447,12 +449,13 @@ void TestUniformFirstLaneSamplerLod() {
   std::array<uint32_t, 7> user_data{};
   user_data[6] = 3u;
   SrtRuntime runtime{.user_data = user_data};
+  const auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00300300u,
         "uniform sampler LOD evaluated incorrectly");
   user_data[6] = 20u;
-  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00ffffffu,
         "uniform sampler LOD clamp evaluated incorrectly");
 }
@@ -487,11 +490,12 @@ void TestFloatComparisonDescriptorInputs() {
     fixture.program.descriptor_sources.push_back(
         {.dwords = {low, high}, .dword_count = 2});
 
+    const auto plan = ExtractResourcePlan(fixture.program);
     for (size_t index = 0; index < inputs.size(); index++) {
       const auto &input = inputs[index];
       const std::array user_data{input.bits};
       DescriptorValue result;
-      Check(SrtWalker(fixture.program, {.user_data = user_data})
+      Check(SrtWalker(plan, {.user_data = user_data})
                     .EvaluateDescriptor(0, result) &&
                 result.dwords[0] == (flush && index < 4 ? 1 : input.less_equal) &&
                 result.dwords[1] == (flush && index < 4 ? 1 : input.greater_equal),
@@ -566,7 +570,7 @@ void TestConstantBufferBounds() {
     TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
     SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
     std::vector<uint32_t> flat;
-    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
+    Check(SrtWalker(ExtractResourcePlan(fixture.program), runtime).RefreshFlatBuffer(flat) == test.valid,
           "constant-buffer walk misaligned or wrapped its offset components");
     Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
@@ -931,7 +935,7 @@ void TestUndefinedRuntimeValueFails() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
-  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
+  Check(!SrtWalker(ExtractResourcePlan(fixture.program), {}).EvaluateDescriptor(0, result),
         "undefined typed descriptor source was accepted");
 }
 

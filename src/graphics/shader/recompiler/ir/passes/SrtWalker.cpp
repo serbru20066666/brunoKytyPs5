@@ -331,10 +331,9 @@ private:
 } // namespace
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-                     std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
-                     Value active_mask)
-    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+                     SrtWalker* clean_evaluator, Value active_mask)
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
+      m_active_mask(active_mask.Resolve()),
       m_context(AcquireContext(program)) {}
 
 SrtWalker::~SrtWalker() { --m_program.ThreadScratch().evaluation_depth; }
@@ -463,7 +462,7 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
-	const auto flags = inst.Flags<MemoryFlags>();
+	const auto flags = inst.Flags<SrtReadFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
 		return false;
 	}
@@ -565,9 +564,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return EvaluateWide(inst.Arg(0), result);
 			}
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
-			                  inst.Arg(1));
+			SrtWalker  clean_active(m_program, clean_runtime, nullptr, inst.Arg(1));
+			SrtWalker  active(m_program, m_runtime, &clean_active, inst.Arg(1));
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:
@@ -581,25 +579,14 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			result = static_cast<uint32_t>(a) |
 			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 			return true;
-		case ValueOpcode::ReadConst: {
-			const auto slot = inst.Arg(1).Resolve();
-			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
-			    slot.U32() >= m_program.srt_reads.size()) {
-				return false;
-			}
-			if (slot.U32() < m_clean_flat_slots.size() &&
-			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
-				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
-				                                       result);
-			}
-			return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
-		}
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
 		case ValueOpcode::LoadBufferU32:
 			if (IsRawRead(m_program, inst)) {
-				if (inst.GetOpcode() == ValueOpcode::LoadBufferU32 && m_clean_evaluator != nullptr &&
-				    m_clean_evaluator->m_active_mask == m_active_mask) {
+				if (m_clean_evaluator != nullptr &&
+				    (inst.Flags<SrtReadFlags>().clean != 0u ||
+				     (inst.GetOpcode() == ValueOpcode::LoadBufferU32 &&
+				      m_clean_evaluator->m_active_mask == m_active_mask))) {
 					return m_clean_evaluator->EvaluateWide(Value(const_cast<Inst*>(&inst)), result);
 				}
 				return EvaluateRawRead(inst, result);
@@ -1009,8 +996,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			continue;
 		}
 		const auto& read  = m_program.srt_reads[slot];
-		const bool  clean = read.flat_offset < m_clean_flat_slots.size() &&
-		                   m_clean_flat_slots[read.flat_offset] != 0u;
+		const auto* inst  = read.value.ResolveInstruction();
+		const bool  clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
 			return false;
 		}
@@ -1098,12 +1085,60 @@ NodeOp ArithmeticOp(ValueOpcode op, size_t& args) {
 	return op == ValueOpcode::BitFieldInsert ? NodeOp::BitFieldInsert : NodeOp::Fail;
 }
 
+// Whether the plan's retained SRT read `slot` goes through the strict reader.
+bool SlotClean(const ResourcePlan& program, uint32_t slot) {
+	const auto* inst = program.srt_reads[slot].value.ResolveInstruction();
+	return inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
+}
+
+bool AnyCleanSlot(const ResourcePlan& program) {
+	for (uint32_t slot = 0; slot < program.srt_reads.size(); slot++) {
+		if (SlotClean(program, slot)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 class PlanCompiler {
 public:
 	PlanCompiler(const ResourcePlan& program, CompiledResourcePlan& compiled)
-	    : m_program(program), m_compiled(compiled) {}
+	    : m_program(program), m_compiled(compiled) {
+		// The plan's values reach a retained SRT read as the read's own instruction. Here each
+		// use goes through a ReadConst node in front of it, which a refresh answers from the
+		// flat buffer (see SrtEvaluator::EvaluateWide) and the memo and direct-condition
+		// analyses know by its slot.
+		for (uint32_t slot = 0; slot < program.srt_reads.size(); slot++) {
+			if (const auto* inst = program.srt_reads[slot].value.ResolveInstruction()) {
+				m_slot_of.emplace(inst, slot);
+			}
+		}
+	}
+
+	// The node of a retained SRT read itself (a slot's definition).
+	uint32_t SlotNode(uint32_t slot) { return RawNode(m_program.srt_reads[slot].value); }
 
 	uint32_t Node(Value value) {
+		const auto* read = value.Resolve().TryInstruction();
+		if (const auto slot = m_slot_of.find(read); read != nullptr && slot != m_slot_of.end()) {
+			if (const auto found = m_aliases.find(read); found != m_aliases.end()) {
+				return found->second;
+			}
+			const auto index = Push({});
+			m_aliases.emplace(read, index);
+			ResourceNode node;
+			node.aux                = slot->second;
+			node.args[0]            = RawNode(value);
+			node.flags              = SlotClean(m_program, slot->second) ? ResourceNode::CleanSlot : 0u;
+			node.op                 = NodeOp::ReadConst;
+			m_compiled.nodes[index] = node;
+			return index;
+		}
+		return RawNode(value);
+	}
+
+private:
+	uint32_t RawNode(Value value) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
 			uint64_t   bits  = 0;
@@ -1133,7 +1168,6 @@ public:
 		return index;
 	}
 
-private:
 	uint32_t Push(const ResourceNode& node) {
 		m_compiled.nodes.push_back(node);
 		return static_cast<uint32_t>(m_compiled.nodes.size() - 1u);
@@ -1197,10 +1231,7 @@ private:
 				}
 				node.aux     = slot.U32();
 				node.args[0] = Node(m_program.srt_reads[slot.U32()].value);
-				node.flags   = node.aux < m_program.clean_flat_slots.size() &&
-				                     m_program.clean_flat_slots[node.aux] != 0u
-				                   ? ResourceNode::CleanSlot
-				                   : 0u;
+				node.flags   = SlotClean(m_program, node.aux) ? ResourceNode::CleanSlot : 0u;
 				node.op      = NodeOp::ReadConst;
 				return node;
 			}
@@ -1281,6 +1312,9 @@ private:
 	const ResourcePlan&                          m_program;
 	CompiledResourcePlan&                        m_compiled;
 	std::unordered_map<const Inst*, uint32_t>    m_instructions;
+	// Retained SRT reads: their slot, and the ReadConst node in front of each.
+	std::unordered_map<const Inst*, uint32_t>    m_slot_of;
+	std::unordered_map<const Inst*, uint32_t>    m_aliases;
 	std::map<std::pair<uint32_t, uint64_t>, uint32_t> m_constants;
 };
 
@@ -1384,7 +1418,7 @@ private:
 void AnalyzeControlFlow(const ResourcePlan& program, CompiledResourcePlan& compiled) {
 	compiled.direct_conditions.assign(program.control_flow.size(), 0u);
 	const bool clean_slots =
-	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; });
+	    AnyCleanSlot(program);
 	for (uint32_t block = 0; block < program.control_flow.size(); block++) {
 		const auto condition = compiled.conditions[block];
 		compiled.direct_conditions[block] =
@@ -1434,7 +1468,7 @@ void AnalyzeControlFlow(const ResourcePlan& program, CompiledResourcePlan& compi
 
 void AnalyzeMemo(const ResourcePlan& program, CompiledResourcePlan& compiled) {
 	if (program.requires_specialization_memory ||
-	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; })) {
+	    AnyCleanSlot(program)) {
 		return;
 	}
 	MemoAnalysis analysis(compiled);
@@ -1562,9 +1596,17 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	PlanCompiler compiler(program, *compiled);
 	compiled->slots.reserve(program.srt_reads.size());
 	for (const auto& read: program.srt_reads) {
-		compiled->slots.push_back(compiler.Node(read.value));
+		compiled->slots.push_back(
+		    compiler.SlotNode(static_cast<uint32_t>(compiled->slots.size())));
 	}
-	compiled->clean_slots = program.clean_flat_slots;
+	// By flat offset, as a refresh asks.
+	compiled->clean_slots.assign(program.srt_reads.size(), 0u);
+	for (uint32_t slot = 0; slot < program.srt_reads.size(); slot++) {
+		const auto offset = program.srt_reads[slot].flat_offset;
+		if (offset < compiled->clean_slots.size() && SlotClean(program, slot)) {
+			compiled->clean_slots[offset] = 1u;
+		}
+	}
 	compiled->descriptors.resize(program.descriptor_sources.size());
 	compiled->key_counts.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
 	compiled->selector_firsts.resize(program.descriptor_sources.size(), ResourceNode::NoNode);

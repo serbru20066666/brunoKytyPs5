@@ -176,32 +176,28 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
-void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* source,
-                        std::span<uint8_t> slots, Value extra = {}) {
+void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
+                    const DescriptorSource* source, Value extra = {}) {
 	if (source == nullptr && extra.IsEmpty()) {
 		return;
 	}
-	std::vector<Value>       pending;
+	std::vector<Value> pending;
 	if (source != nullptr) {
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
 	std::vector<const Inst*> visited;
 	while (!pending.empty()) {
-		auto value = pending.back().Resolve();
+		auto* inst = pending.back().Resolve().TryInstruction();
 		pending.pop_back();
-		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
 			continue;
 		}
 		visited.push_back(inst);
-		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
-			const auto slot = inst->Arg(1).Resolve();
-			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
-				slots[slot.U32()] = 1u;
-				pending.push_back(program.srt_reads[slot.U32()].value);
-			}
-			continue;
+		if (planned_reads.contains(inst)) {
+			auto flags = inst->Flags<SrtReadFlags>();
+			flags.clean = 1u;
+			inst->SetFlags(flags);
 		}
 		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 			pending.push_back(inst->Arg(arg));
@@ -977,6 +973,12 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (source == nullptr) {
 			return value;
 		}
+		if (source->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = source->Arg(1).Resolve();
+			EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			        slot.U32() >= program.srt_reads.size());
+			return Clone(program.srt_reads[slot.U32()].value);
+		}
 		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
 		    ValidateRuntimeValue(program, source->Arg(0))) {
 			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
@@ -997,6 +999,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
+		    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
+			target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
+		}
 		cloned.emplace(source, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
 			for (size_t index = 0; index < source->NumArgs(); index++) {
@@ -1010,12 +1017,15 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		return Value(&target);
 	};
 
+	bool capture_indirect_reads = false;
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
 	for (const auto& source: program.descriptor_sources) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
 		if (target.indirect_descriptor.has_value()) {
+			plan.requires_specialization_memory = true;
+			capture_indirect_reads = true;
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
 			target.indirect_descriptor->selector_first =
 			    Clone(target.indirect_descriptor->selector_first);
@@ -1066,38 +1076,39 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
-	plan.clean_flat_slots.resize(plan.srt_reads.size());
-	bool capture_indirect_reads = false;
-	for (const auto& source: plan.descriptor_sources) {
-		if (!source.indirect_descriptor.has_value()) continue;
-		const auto& indirect                = *source.indirect_descriptor;
-		plan.requires_specialization_memory = true;
-		capture_indirect_reads = true;
-		if (indirect.selector)
-			MarkCleanFlatSlots(plan, Source(plan, indirect.selector->source), plan.clean_flat_slots);
-		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_mask);
-		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_first);
-		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.key_count);
-		if (indirect.sources.empty()) {
-			MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
-		} else {
-			for (const auto candidate: indirect.sources) {
-				MarkCleanFlatSlots(plan, Source(plan, candidate), plan.clean_flat_slots);
+	plan.capture_specialization_reads |= capture_indirect_reads || !plan.control_flow.empty();
+	if (plan.capture_specialization_reads) {
+		// Every former flat alias now targets its retained raw read. Mark those reads
+		// on the normalized graph, so discarded Phi/EXEC dependencies stay discarded.
+		std::unordered_set<const Inst*> planned_reads;
+		for (const auto& read: plan.srt_reads) {
+			auto* inst = read.value.ResolveInstruction();
+			EXIT_IF(inst == nullptr || (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			                           inst->GetOpcode() != ValueOpcode::ReadConstBuffer));
+			planned_reads.insert(inst);
+		}
+		for (const auto& source: plan.descriptor_sources) {
+			if (!source.indirect_descriptor.has_value()) continue;
+			const auto& indirect = *source.indirect_descriptor;
+			if (indirect.selector)
+				MarkCleanReads(planned_reads, Source(plan, indirect.selector->source));
+			MarkCleanReads(planned_reads, nullptr, indirect.selector_mask);
+			MarkCleanReads(planned_reads, nullptr, indirect.selector_first);
+			MarkCleanReads(planned_reads, nullptr, indirect.key_count);
+			if (indirect.sources.empty()) {
+				MarkCleanReads(planned_reads, Source(plan, indirect.table_source));
+			} else {
+				for (const auto candidate: indirect.sources) {
+					MarkCleanReads(planned_reads, Source(plan, candidate));
+				}
 			}
 		}
-	}
-	plan.capture_specialization_reads |=
-	    capture_indirect_reads ||
-	    (!plan.control_flow.empty() &&
-	     (std::ranges::any_of(plan.info.buffers, &BufferResource::written) ||
-	      std::ranges::any_of(plan.info.images, &ImageResource::written)));
-	if (plan.capture_specialization_reads) {
 		// Clean writable addresses prove that shader writes cannot overlap captured reads.
 		for (const auto& buffer: plan.info.buffers) {
-			if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
+			if (buffer.written) MarkCleanReads(planned_reads, Source(plan, buffer.source));
 		}
 		for (const auto& image: plan.info.images) {
-			if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
+			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
 		}
 	}
 	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
@@ -1680,7 +1691,7 @@ bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime
 	ReadCapture capture {runtime, snapshot.specialization_reads};
 	const auto  observed = ObservedRuntime(runtime, capture_reads, capture);
 	SrtWalker   clean(program, CleanRuntime(observed));
-	SrtWalker   walker(program, observed, program.clean_flat_slots,
+	SrtWalker   walker(program, observed,
 	                   capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	return Materialize(program, WalkerRoots {program}, runtime, observed, capture_reads, clean,
 	                   walker, snapshot, specialization, nullptr);
