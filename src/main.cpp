@@ -554,10 +554,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // Started with nothing to run, which is what a double click does: the player wanted the launcher
 // that sits beside this executable. Without one, say what this executable needs instead of
-// flashing a console that closes. Returns false from a shell, where the usage text is the answer.
+// flashing a console that closes. Returns false when the usage text is the answer: from a shell,
+// and for a program reading our output, which is how the launcher asks for the version. A
+// launcher opened from here marks its environment, so that nothing it starts opens another.
 static bool OpenLauncherInstead() {
-	DWORD attached[2] {};
-	if (GetConsoleProcessList(attached, 2) > 1) {
+	static constexpr wchar_t opened_mark[] = L"KYTY_OPENED_LAUNCHER";
+	DWORD                    attached[2] {};
+	if (GetConsoleProcessList(attached, 2) != 1 ||
+	    GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_CHAR ||
+	    GetEnvironmentVariableW(opened_mark, nullptr, 0) != 0) {
 		return false;
 	}
 	std::wstring path(MAX_PATH, L'\0');
@@ -577,6 +582,7 @@ static bool OpenLauncherInstead() {
 	const auto      launcher = folder / L"launcher.exe";
 	std::error_code error;
 	if (std::filesystem::exists(launcher, error)) {
+		SetEnvironmentVariableW(opened_mark, L"1");
 		const auto opened = reinterpret_cast<INT_PTR>(ShellExecuteW(
 		    nullptr, L"open", launcher.c_str(), nullptr, folder.c_str(), SW_SHOWNORMAL));
 		if (opened > 32) {

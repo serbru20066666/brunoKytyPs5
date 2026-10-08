@@ -167,6 +167,8 @@ void MainDialogPrivate::FindInterpreter() {
 
 		QProcess test;
 		test.setProgram(m_interpreter);
+		// Asked for by name: started with nothing to run, the emulator opens this launcher.
+		test.setArguments({QStringLiteral("--help")});
 		test.start();
 		test.waitForFinished();
 
