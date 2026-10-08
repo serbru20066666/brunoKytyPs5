@@ -48,6 +48,7 @@
 #include <QtCore>
 
 #include <memory>
+#include <utility>
 
 #include "ui_configuration_list_widget.h"
 
@@ -624,6 +625,12 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		    GetGameMetadata(GameContent::ReadFile(base, QStringLiteral("sce_sys/param.json"),
 		                                          GameContent::MaxMetadataSize),
 		                    fallback);
+		// Only PlayStation 5 titles are listed, and their param.json is what names them. A PS4
+		// dump, its patches and its add-ons have an eboot.bin too, but this emulator cannot run
+		// them.
+		if (metadata.title_id.isEmpty()) {
+			return;
+		}
 		auto info = std::make_unique<Configuration>();
 		info->custom_settings =
 		    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
@@ -713,15 +720,26 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		}
 
 		scan_archives(root, root);
-		QList<QDir> pending_dirs;
-		const auto  root_subdirs =
-		    root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-		for (const auto& subdir: root_subdirs) {
-			pending_dirs.append(QDir(subdir.absoluteFilePath()));
-		}
+		// A dump sits a few folders below a games folder. Walking every folder under it made
+		// the launcher slow to open when that folder was a whole disk.
+		constexpr int               max_depth = 3;
+		QList<std::pair<QDir, int>> pending_dirs;
+		const auto add_subdirs = [&pending_dirs](const QDir& directory, int depth) {
+			const auto subdirs =
+			    directory.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+			for (const auto& subdir: subdirs) {
+				const auto name = subdir.fileName();
+				if (name.startsWith(QLatin1Char('.')) || name.startsWith(QLatin1Char('$'))) {
+					continue;
+				}
+				pending_dirs.append(std::make_pair(QDir(subdir.absoluteFilePath()), depth));
+			}
+		};
+		add_subdirs(root, 1);
 
 		while (!pending_dirs.isEmpty()) {
-			QDir game_dir = pending_dirs.takeFirst();
+			const auto pending  = pending_dirs.takeFirst();
+			const QDir game_dir = pending.first;
 			scan_archives(game_dir, root);
 
 			if (game_dir.exists(eboot_name)) {
@@ -732,10 +750,8 @@ void ConfigurationListWidget::ScanGameDirectory() {
 				continue;
 			}
 
-			const auto subdirs =
-			    game_dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-			for (const auto& subdir: subdirs) {
-				pending_dirs.append(QDir(subdir.absoluteFilePath()));
+			if (pending.second < max_depth) {
+				add_subdirs(game_dir, pending.second + 1);
 			}
 		}
 	}
