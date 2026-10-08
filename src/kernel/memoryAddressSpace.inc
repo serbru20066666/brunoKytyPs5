@@ -458,6 +458,21 @@ public:
 			return false;
 		}
 
+		// The mutex is also held for the length of every transfer (a recording thread's copy of a
+		// texture's megabytes), and the GPU thread asking this for a buffer it was about to bind
+		// slept behind it: 1.3% of its samples in GPU Jungle. A range inside the mapping this
+		// thread last found whole is contained for as long as no mapping has changed since
+		// (m_map_generation), which needs neither the mutex nor the search.
+		{
+			const auto& cache = t_read_cache;
+			const auto& entry = cache.entry;
+			if (cache.owner == this && vaddr >= entry.vaddr && size <= entry.size &&
+			    vaddr - entry.vaddr <= entry.size - size &&
+			    m_map_generation.load(std::memory_order_acquire) == cache.generation) {
+				return true;
+			}
+		}
+
 		std::lock_guard lock(m_mutex);
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
@@ -470,6 +485,9 @@ public:
 			const auto entry_end = entry.vaddr + entry.size;
 			if (entry_end <= current) {
 				return false;
+			}
+			if (current == vaddr && entry_end >= end) {
+				t_read_cache = {this, m_map_generation.load(std::memory_order_relaxed), entry};
 			}
 			current = std::min(end, entry_end);
 		}
