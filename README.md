@@ -14,25 +14,38 @@ gráfica de la PS5.
 | Equipo de pruebas | Radeon RX 6800 XT, Intel Core i7-14700KF, Windows 11 |
 | Juego de referencia | ASTRO's PLAYROOM (PPSA01325) |
 | Punto de partida | 34–44 fps en juego (GPU Jungle y CPU Plaza) |
-| Ahora (0.3.0) | 60 fps en CPU Plaza (1440p con FSR), 41–47 fps en GPU Jungle |
+| Ahora (0.4.0) | 60 fps en CPU Plaza; en GPU Jungle, 57 fps en la entrada y 39 en lo más cargado (1440p con FSR) |
 | Meta | 60 fps estables |
 
 Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.3.1**. Los fps son los de la 0.3.0, medidos en la RX 6800 XT leyendo los que el emulador escribe en el título.
+Versión **0.4.0**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
-**Nuevo en 0.3.1 — L2 y R2 con presión.** Los juegos que distinguen entre apretar el gatillo suave y apretarlo a fondo no lo notaban: en la escalada de GPU Jungle de ASTRO's PLAYROOM los agarres frágiles (los rosas) nunca se rompían. El juego pregunta al mando en qué tramo de la resistencia del gatillo adaptativo está el dedo, y el emulador respondía siempre «en ninguno». Ahora responde según el efecto que el juego puso en cada gatillo y lo apretado que está.
+**Nuevo en 0.4.0 — menos trabajo del procesador por dibujo.** La entrada de GPU Jungle pasa de
+46,9 a 57,0 fps, CPU Plaza se queda clavada en 60 con margen y jugando hay muy pocos tirones.
+Lo más cargado de la selva sigue lejos de 60 (38,7 fps en la escalera del acantilado): para eso
+hace falta que el juego emita menos dibujos, no más recortes. La primera vez que se abre un juego
+con esta versión vuelve a compilar sus shaders (la caché de la anterior no sirve), así que los
+primeros minutos tienen tirones que luego no vuelven.
+
+**De la 0.3.1 — L2 y R2 con presión.** Los juegos que distinguen entre apretar el gatillo suave y
+apretarlo a fondo ya lo notan: en la escalada de GPU Jungle los agarres frágiles (los rosas) se
+rompen al apretar a fondo.
 
 ![Cuadros por segundo antes y después](docs/screenshots/fps-antes-y-despues.png)
 
-| Zona | Antes | 0.3.0 |
-| --- | --- | --- |
-| CPU Plaza, dibujando a 3840×2160 | 43,6 fps (base heredada) · 50,3 fps (0.2.0) | 51,8 fps |
-| CPU Plaza, dibujando a 2560×1440 con FSR | — | **60,0 fps estables** |
-| GPU Jungle, entrada, a 3840×2160 | 34,0 fps (0.1.0) · 44,5 fps (0.2.0) | 46,9 fps |
-| GPU Jungle, más adentro (acantilado) | — | 41–45 fps a cualquier resolución |
+| Zona | Antes | 0.3.0 | 0.4.0 |
+| --- | --- | --- | --- |
+| CPU Plaza, dibujando a 3840×2160 | 43,6 fps (base heredada) · 50,3 fps (0.2.0) | 51,8 fps | 52,1 fps (la limita la tarjeta) |
+| CPU Plaza, dibujando a 2560×1440 con FSR | — | 60,0 fps, con el hilo de gráficos al 99 % | **60,0 fps**, con el hilo al 95 % |
+| GPU Jungle, entrada | 34,0 fps (0.1.0) · 44,5 fps (0.2.0) | 46,9 fps | **57,0 fps** |
+| GPU Jungle, más adentro (acantilado) | — | 41–45 fps en otros puntos de la zona | 38,7 fps en el más cargado, la escalera (sin dato anterior del mismo punto) |
+
+Las cifras de la selva hasta la 0.3.0 son dibujando a 3840×2160 y la de la 0.4.0 a 2560×1440 con
+FSR; allí limita el procesador y la resolución no cambia los fps (la 0.3.0 daba lo mismo a
+3200×1800 que a 3840×2160). La de 52,1 es de una compilación intermedia de la 0.4.0.
 
 «Base heredada» es el fork tal como partió de KytyPS5 y BryKytyPS5 (commit `a9e1ae5`).
 
@@ -53,16 +66,39 @@ puede usar aquí: FSR 2, 3 y 4 necesitan vectores de movimiento y profundidad qu
 entrega al emulador. Es una casilla por juego (**FSR upscaling**) y `--fsr-upscaling true`; con
 `--fsr-softness 0`–`20` se elige cuánto marca los bordes (10 por defecto).
 
-### GPU Jungle: de 34 a 47 fps, y lo que falta
+### GPU Jungle: de 34 a 57 fps
 
-| 0.1.0 · 34,0 fps | 0.3.0 · 46,9 fps |
-| --- | --- |
-| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.3.0](docs/screenshots/astro-jungla-0.3.0-47fps.jpg) |
+| 0.1.0 · 34,0 fps | 0.3.0 · 46,9 fps | 0.4.0 · 57,0 fps |
+| --- | --- | --- |
+| ![GPU Jungle con 0.1.0](docs/screenshots/astro-jungla-0.1.0-34fps.jpg) | ![GPU Jungle con 0.3.0](docs/screenshots/astro-jungla-0.3.0-47fps.jpg) | ![GPU Jungle con 0.4.0](docs/screenshots/astro-jungla-0.4.0-57fps.jpg) |
+
+El mismo punto de la entrada en las tres; el encuadre de la última no es idéntico.
 
 En la selva limita el procesador, no la tarjeta: el juego emite entre 8000 y 10 600 dibujos por
-cuadro y un solo hilo los prepara, así que bajar la resolución ahí da estabilidad pero no fps.
-Lo que se ha recortado de ese hilo en 0.3.0, cada cosa medida encendiéndola y apagándola en la
-misma partida y comprobada contra el camino sin atajo:
+cuadro y un solo hilo los prepara, con otro que se le adelanta y otro que graba los comandos. Lo
+que se ha recortado de ese hilo, cada cosa medida encendiéndola y apagándola en la misma partida
+y comprobada contra el camino sin atajo.
+
+En 0.4.0 (a partir de un perfil tomado en la selva, con el hilo de gráficos al 98 %):
+
+- El hilo de gráficos esperaba al que graba los comandos solo para tener hechas unas copias de
+  memoria; ahora hace él las que falten y sigue: +2,9 % de dibujos por segundo.
+- La validación de los registros se repetía en cada dibujo aunque ningún comando los hubiera
+  tocado: −3,1 % de procesador por dibujo.
+- El estado dinámico (ventana, recorte, sesgo de profundidad) tampoco se recalcula si el dibujo
+  repite destinos, programa y registros: −1,4 a −1,9 %.
+- El hilo que se adelanta deja una huella de la especialización de cada shader y el principal
+  reconoce su variante por ella, en vez de comparar memoria recién escrita por otro núcleo:
+  +2,4 % de dibujos por segundo.
+- Los recursos del siguiente dibujo se piden por adelantado: +1,2 %; y se pide solo lo que se
+  lee: +0,6 %.
+- Candados más ligeros para los tres que se toman en cada dibujo, tablas de vértices que ya no
+  se ponen a cero enteras, y una consulta de memoria que ya no espera a un candado ajeno.
+
+Encendidas contra apagadas en la misma partida, las que se pueden conmutar dan entre un 7,5 % y
+un 9,6 % más de dibujos por segundo en CPU Plaza (tres pasadas); las demás van aparte.
+
+En 0.3.0:
 
 - Los destinos de render de un dibujo sirven para el siguiente mientras nada de lo que dependen
   cambia: −7,6 % de procesador por dibujo.
@@ -71,14 +107,15 @@ misma partida y comprobada contra el camino sin atajo:
   comando): −4 %.
 - Los datos del siguiente dibujo se piden por adelantado al hilo que se adelanta: −1,2 %.
 
-En total, el coste por dibujo bajó un 13 % (de 2,21 a 1,92 µs con los cronómetros puestos). Para
-60 fps en lo más cargado de la selva hace falta alrededor de un 20 % más, y eso ya no sale de
-recortes así: pide repartir la preparación de cada dibujo entre dos hilos, que es el trabajo
-siguiente.
+Probado y descartado, por si alguien lo intenta:
 
-Probado y descartado, por si alguien lo intenta: actualizar las sombras de las luces quietas un
-cuadro sí y otro no ahorra un 30 % de dibujos con la cámara quieta, pero en la selva las sombras
-parpadean; y fijar los hilos a núcleos distintos no cambia nada.
+- Actualizar las sombras de las luces quietas un cuadro sí y otro no ahorra un 30 % de dibujos
+  con la cámara quieta, pero en la selva las sombras parpadean.
+- Fijar los hilos a núcleos distintos no cambia nada.
+- Dejar sin proteger las páginas de memoria que el juego reescribe cada cuadro (para ahorrar sus
+  1300 fallos de página por cuadro): casi todas se escriben cada varios cuadros o tienen una
+  textura encima, y darlas por escritas siempre multiplica por seis lo que se sube a la tarjeta.
+- Comparar los registros de cada dibujo por una huella: calcularla cuesta más que compararlos.
 
 ### También en 0.3.0
 
