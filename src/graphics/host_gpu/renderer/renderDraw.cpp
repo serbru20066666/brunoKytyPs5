@@ -681,6 +681,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 #endif
 }
 
+// KYTY_VERIFY_DYNAMIC_KEEP=1: a draw that keeps the recorded dynamic state records it anyway, and
+// exits if that changed anything recorded.
+static bool VerifyDynamicKeep() {
+	static const bool enabled = std::getenv("KYTY_VERIFY_DYNAMIC_KEEP") != nullptr;
+	return enabled;
+}
+
+static bool SameDynamicState(const CommandBuffer::GraphicsState& a,
+                             const CommandBuffer::GraphicsState& b) {
+	return a.viewport_count == b.viewport_count && a.viewports == b.viewports &&
+	       a.scissor_count == b.scissor_count && a.scissors == b.scissors &&
+	       a.fixed_valid == b.fixed_valid && a.line_width == b.line_width &&
+	       a.blend_constants == b.blend_constants && a.depth_test == b.depth_test &&
+	       a.depth_write == b.depth_write && a.depth_compare == b.depth_compare &&
+	       a.depth_bias == b.depth_bias && a.stencil_test == b.stencil_test &&
+	       a.bias_valid == b.bias_valid && a.bias == b.bias &&
+	       a.stencil_valid == b.stencil_valid && a.stencil == b.stencil &&
+	       a.color_write_count == b.color_write_count && a.color_write == b.color_write;
+}
+
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
@@ -2231,8 +2251,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	g_draw_phases.Mark(DrawPhaseTimer::Commit);
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
-	auto& recorded_state = buffer.GetGraphicsState();
+	// The dynamic state follows from context registers, the last vertex stage's outputs, the
+	// depth target and the rendering. A draw that took the previous draw's targets has the
+	// registers, depth target and rendering of the draw that last recorded the state into this
+	// command buffer, when no command since could have changed those registers
+	// (g_target_state_serial): with the same program it would record nothing, and finding that
+	// out value by value was 3% of the GPU thread in GPU Jungle. KYTY_DEBUG_AB=dynkeep records
+	// for every draw in every other window.
+	auto&             recorded_state  = buffer.GetGraphicsState();
+	const void* const dynamic_program = vertex_stages.back().stage.program;
+	static const bool dynkeep_ab      = AbSelected("dynkeep");
+	const bool        dynamic_kept    =
+	    memo_taken && recorded_state.dynamic_program == dynamic_program &&
+	    recorded_state.dynamic_serial == g_target_state_serial && GraphicsStateFilterEnabled() &&
+	    !(dynkeep_ab && AbFeatureOff());
+	if (!dynamic_kept) {
+		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info,
+		                         rendering);
+		recorded_state.dynamic_program = dynamic_program;
+		recorded_state.dynamic_serial  = g_target_state_serial;
+	} else if (VerifyDynamicKeep()) [[unlikely]] {
+		const auto before = recorded_state;
+		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info,
+		                         rendering);
+		if (!SameDynamicState(before, recorded_state)) {
+			EXIT("dynamic keep: the kept dynamic state differs from the one recorded now\n");
+		}
+	}
 	if (m_context.GetGraphics().attachment_feedback_loop_dynamic_enabled &&
 	    (!recorded_state.feedback_valid || recorded_state.feedback != feedback_aspects)) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);

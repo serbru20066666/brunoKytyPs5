@@ -171,6 +171,10 @@ public:
 		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
 		bool                                        feedback_valid = false;
 		vk::ImageAspectFlags                        feedback;
+		// What the dynamic state was last recorded from: the last vertex stage's program and
+		// g_target_state_serial (see ExecutePreparedDraw).
+		const void*                                 dynamic_program = nullptr;
+		uint64_t                                    dynamic_serial  = 0;
 	};
 	[[nodiscard]] GraphicsState& GetGraphicsState() const noexcept { return m_graphics_state; }
 	// Whether a rendering instance is open, and a number that changes whenever one begins or ends.
