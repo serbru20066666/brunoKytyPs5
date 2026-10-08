@@ -4,6 +4,11 @@ name: Build and Release brunoKytyPs5
 # has been chosen for publishing is released, and pushes cost no build minutes.
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the build as a release (off: only build, test and keep the artifact)"
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -439,6 +444,7 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
+      inputs.publish &&
       github.repository == 'serbru20066666/brunoKytyPs5' &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
