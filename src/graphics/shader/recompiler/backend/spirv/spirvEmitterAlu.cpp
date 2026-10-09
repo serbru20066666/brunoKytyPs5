@@ -277,10 +277,6 @@ uint32_t EmitUMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32
 	return EmitUMax32(state, EmitUMin32(state, arg0, arg1), high_min);
 }
 
-uint32_t EmitFPIsNan32(EmitterState& state, uint32_t arg0) {
-	return EmitNative<spv::OpFUnordNotEqual, IR::Type::U1>(state, arg0, arg0);
-}
-
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, false);
 }

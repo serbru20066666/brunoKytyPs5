@@ -27901,6 +27901,48 @@ TestCase VectorCompareClassF32() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorCompareClassF32ImmediateAndDynamicMasks() {
+  using O = ShaderOpcode;
+  // One input for each architectural class bit, in bit order.
+  constexpr std::array<u32, 10> values{
+      0x7f800001u, 0x7fc00001u, 0xff800000u, 0xbf800000u, 0x80000001u,
+      0x80000000u, 0x00000000u, 0x00000001u, 0x3f800000u, 0x7f800000u};
+  constexpr std::array<u32, 8> masks{
+      0u, 0x3ffu, 3u, 7u, 0xfffffc00u, 0xffffffffu, 0xfffffc03u, 0xfffffc07u};
+  TestCase test;
+  test.name = "VectorCompareClassF32ImmediateAndDynamicMasks";
+  test.initial.assign(values.begin(), values.end());
+  test.initial.insert(test.initial.end(), masks.begin(), masks.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 1);
+  for (u32 index = 0; index < values.size(); ++index) {
+    AppendVMovU32(&code, 30, index * 4u);
+    AppendBufferLoadDword(&code, 0, 30);
+    for (u32 mask_index = 0; mask_index < masks.size(); ++mask_index) {
+      for (const bool dynamic : {false, true}) {
+        if (dynamic) {
+          AppendVMovU32(&code, 30, (values.size() + mask_index) * 4u);
+          AppendBufferLoadDword(&code, 2, 30);
+          code.push_back(EncodeVopc(0x88, Vgpr(0), 2));
+        } else {
+          AppendVop3(&code, 0x88, 106, Vgpr(0), 255);
+          code.push_back(masks[mask_index]);
+        }
+        code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+        AppendStoreVgpr(&code, 3, static_cast<u32>(test.expected.size()));
+        test.expected.push_back((masks[mask_index] & (1u << index)) != 0u);
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CMP_CLASS_F32,
+                  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpIsNan"};
+  return test;
+}
+
 TestCase VectorVopcSdwaCmpxClassF32CapturedExecMask() {
   using O = ShaderOpcode;
 
@@ -37744,6 +37786,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpxNeU64CapturedExecMask);
   AddCase(VectorVop3CmpxNeI64CapturedExecMask);
   AddCase(VectorCompareClassF32);
+  AddCase(VectorCompareClassF32ImmediateAndDynamicMasks);
   AddCase(VectorVopcSdwaCmpxClassF32CapturedExecMask);
   cases.push_back(VectorCmpClassF16(32));
   cases.push_back(VectorCmpClassF16(64));
@@ -43410,6 +43453,7 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, VectorCompareF32DenormalModes(mode));
     }
     RunCase(&vulkan, VectorCompareClassF32());
+    RunCase(&vulkan, VectorCompareClassF32ImmediateAndDynamicMasks());
     RunCase(&vulkan, VectorCompareF16Ops());
     return 0;
   }
