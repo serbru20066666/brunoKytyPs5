@@ -12853,7 +12853,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   options.input_info.pixel = &default_info;
   auto partial_result = RecompileForTest(partial_shader, options);
   const auto partial_source = DisassembleSpirvBinary(partial_result.spirv);
-  Check(SpirvSourceHasInstructionOperand(partial_source, "OpBitcast",
+  Check(SpirvSourceHasInstructionOperand(partial_source, "OpCompositeConstruct",
                                          "%uint_1065353216"),
         "disabled float alpha export did not default to 1.0f bits");
   CheckSpirvBinaryValidates(partial_result.spirv);
@@ -13255,8 +13255,9 @@ void TestLogicalAlphaBlendExport() {
   const auto source = DisassembleSpirvBinary(guest.spirv);
   Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
             source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+            CountSourceOccurrences(source, "OpStore %out_mrt_0 ") == 1 &&
             CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
-            SpirvInstructionOpcodeCount(guest.spirv, 81u) == 8u,
+            !SpirvContainsVectorShuffle(guest.spirv, {3u, 3u, 3u, 3u}),
         "guest dual-source export was replaced by synthetic alpha");
 }
 
