@@ -20026,6 +20026,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_LOAD_SBYTE:
   case Opcode::BUFFER_LOAD_USHORT:
   case Opcode::BUFFER_LOAD_SSHORT:
+  case Opcode::BUFFER_LOAD_SHORT_D16:
   case Opcode::BUFFER_LOAD_DWORDX2:
   case Opcode::BUFFER_LOAD_DWORDX3:
   case Opcode::BUFFER_LOAD_DWORDX4:
@@ -29739,6 +29740,44 @@ TestCase BufferLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase BufferLoadShortD16Captured() {
+  TestCase test;
+  test.name = "BufferLoadShortD16Captured";
+  auto& code = test.code;
+  AppendVMovU32(&code, 15, 1);
+  AppendVMovLiteral(&code, 1, 0xabcd1234u);
+  // Load an indexed raw halfword at record byte offset 14.
+  code.insert(code.end(), {0xe090200eu, 0x8000010fu});
+  AppendStoreVgpr(&code, 1, 0);
+  AppendVMovLiteral(&code, 1, 0xdeaf4321u);
+  code.push_back(EncodeSop1(0x04, 8, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), {0xe090200eu, 0x8000010fu});
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  AppendStoreVgpr(&code, 1, 1);
+  AppendVMovU32(&code, 15, 2);
+  AppendVMovLiteral(&code, 1, 0xbeef5678u);
+  code.insert(code.end(), {0xe090200eu, 0x8000010fu});
+  AppendStoreVgpr(&code, 1, 2);
+  AppendEnd(&code);
+  test.initial.assign(20, 0xa5a5a5a5u);
+  test.initial[11] = 0x8001cafeu; // Record 1 byte 14 is the high half at byte 46.
+  test.expected = test.initial;
+  test.expected[0] = 0xabcd8001u;
+  test.expected[1] = 0xdeaf4321u;
+  test.expected[2] = 0xbeef0000u;
+  test.user_data = MakeStructuredStorageBufferData(32, 2);
+  test.user_data[50] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.storage_buffer_range_bytes = 64;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
+      ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_STORE_DWORD,
+      ShaderOpcode::S_ENDPGM};
+  test.decoded_counts = {{"BUFFER_LOAD_SHORT_D16 v1.sdwa(sel=4,sext=0)", 3}};
+  return test;
+}
+
 TestCase BufferSubwordLoadsAtHostOffset(u32 bytes, u32 component, bool sign) {
   using O = ShaderOpcode;
   TestCase test;
@@ -37881,6 +37920,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferOffsetsUsePackedWords(false));
   cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
+  AddCase(BufferLoadShortD16Captured);
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
   }
@@ -43684,6 +43724,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadShortD16Captured());
     RunCase(&vulkan, FlatStoreSlcCaptured());
     RunCase(&vulkan, FlatLoadDlcCaptured(32));
     RunCase(&vulkan, FlatLoadDlcCaptured(64));
