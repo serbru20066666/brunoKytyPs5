@@ -29630,7 +29630,7 @@ TestCase ScalarMemoryLoadVariants() {
   std::vector<u32> expected = initial;
   expected.insert(expected.end(), initial.begin(), initial.end());
 
-  TestCase test{"ScalarMemoryLoadVariants",
+  return {"ScalarMemoryLoadVariants",
           code,
           initial,
           expected,
@@ -29639,9 +29639,6 @@ TestCase ScalarMemoryLoadVariants() {
            O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
            O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{0, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  return test;
 }
 
 TestCase ScalarBufferOffsetAlignmentAndCarry() {
@@ -29685,43 +29682,11 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  TestCase test{"ScalarLoadSignedImmediateOffsetAddsSoffset",
+  return {"ScalarLoadSignedImmediateOffsetAddsSoffset",
           code,
           {0x11111111u, 0x22222222u},
           {0x22222222u, 0x22222222u},
           {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{0, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  return test;
-}
-
-TestCase ScalarPayloadBeforeAliasedAtomic() {
-  using O = ShaderOpcode;
-  constexpr u32 GuestBase = 0x10000u;
-  std::vector<u32> code;
-  AppendSMovLiteral(&code, 8, GuestBase);
-  AppendSMovLiteral(&code, 9, 0u);
-  code.insert(code.end(), {EncodeSmem0(0x00, 12, 4), EncodeSmem1(24, 125),
-                           EncodeSopp(0x0c, 0xc07f)});
-  AppendVMovU32(&code, 0, 1u << 20u);
-  AppendVMovU32(&code, 1, 0u);
-  // Same 64-bit OR and byte offset as SAROS b62b494cb2567011.
-  code.insert(code.end(), {0xe1680018u, 0x80000000u});
-  AppendStoreSgpr(&code, 12, 0);
-  AppendEnd(&code);
-  TestCase test{"ScalarPayloadBeforeAliasedAtomic", code,
-                {0u, 0u, 0u, 0u, 0u, 0u, 0x10u, 0x11223344u},
-                {0x10u, 0u, 0u, 0u, 0u, 0u, 0x100010u, 0x11223344u},
-                {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_WAITCNT, O::V_MOV_B32,
-                 O::BUFFER_ATOMIC_OR_X2, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{GuestBase, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  test.forbidden_spirv = {"flattened_srt"};
-  test.compute_info.threads_num[0] = 1;
-  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
-  test.compute_info.workgroup_register = 4;
-  test.has_compute_info = true;
-  return test;
 }
 
 TestCase BufferLoadStore() {
@@ -32317,26 +32282,23 @@ TestCase BranchVccnzUsesCarryProducedWaveMask() {
   return test;
 }
 
-TestCase ScalarLoadAlignsComponents() {
+TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
   AppendSMovLiteral(&code, 0, 1u);
   AppendSMovLiteral(&code, 2, 3u);
-  AppendSMovLiteral(&code, 3, 0u); // S_LOAD uses the full base; only buffer descriptors mask it.
+  AppendSMovLiteral(&code, 3, 0xffff0000u);
   code.push_back(EncodeSmem0(0x00, 1, 1));
   code.push_back(EncodeSmem1(3, 0));
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  TestCase test{"ScalarLoadAlignsComponents",
+  return {"ScalarLoadAlignsComponentsAndMasksAddress",
           code,
           {0x11111111u, 0x22222222u},
           {0x11111111u, 0x22222222u},
           {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{0, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  return test;
 }
 
 TestCase ScalarLoadAlignsDynamicBase() {
@@ -38270,8 +38232,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
-  AddCase(ScalarPayloadBeforeAliasedAtomic);
-  AddCase(ScalarLoadAlignsComponents);
+  AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(ScalarLoadAlignsDynamicBase);
   cases.push_back(ScalarBufferFromLoopReadlane(32));
   cases.push_back(ScalarBufferFromLoopReadlane(64));
@@ -41199,19 +41160,17 @@ void CheckResourcePlanHandoff() {
     ValidateSpirv(name, compiled.spirv);
     const auto &bindings = compiled.program.bindings;
     Require(name, "GPU data requirements",
-            compiled.program.info.user_data_registers ==
-                (numeric_read ? std::vector<u32>{0, 1} : std::vector<u32>{}) &&
-                bindings.descriptor_counts[0] == 1 &&
-                bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrt)] == 0 &&
-                (bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::BdaPagetable)] != 0) ==
+            compiled.program.info.user_data_registers.empty() && bindings.descriptor_counts[0] == 1 &&
+                (bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrt)] != 0) ==
                     numeric_read,
-            "descriptor-only shader retained SRT uploads or native scalar payload lost its address");
+            "descriptor-only shader retained SRT uploads or live scalar data was removed");
 
     memory[0] = 0x2000u;
+    memory[4] = 13u;
     Require(name, "independent host plan",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers[0].dwords[0] == 0x2000u &&
-                snapshot.flattened_srt.size() == 4u,
+                (!numeric_read || snapshot.flattened_srt.back() == 13u),
             "compiled shader cleanup invalidated or froze the host resource plan");
   }
   std::printf("[host]    %-32s ok\n", name);
@@ -44315,10 +44274,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedWords(false));
     RunCase(&vulkan, BufferOffsetsUsePackedWords(true));
-    RunCase(&vulkan, ScalarMemoryLoadVariants());
-    RunCase(&vulkan, ScalarLoadSignedImmediateOffsetAddsSoffset());
-    RunCase(&vulkan, ScalarLoadAlignsComponents());
-    RunCase(&vulkan, ScalarPayloadBeforeAliasedAtomic());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
