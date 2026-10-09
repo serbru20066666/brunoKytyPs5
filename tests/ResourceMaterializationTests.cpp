@@ -436,7 +436,7 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
-void TestWrittenDescriptorUsesStrictReaderOnce() {
+void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -457,10 +457,10 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
-  // A host-evaluable branch captures resource reads and needs the writable
-  // descriptor's clean provenance for the renderer's disjointness proof.
+  // Only memory-derived host decisions need clean, disjoint descriptor reads.
   auto &condition = block.AppendNewInst(ValueOpcode::IEqual32,
-                                        {Value(&offset), Value(4u)});
+      {memory_condition ? Value(&read) : Value(&offset),
+       Value(memory_condition ? 0x8000u : 4u)});
   auto &store_block = AddValueBlock(program);
   AddValueBlock(program);
   program.blocks[0]->condition = Value(&condition);
@@ -481,8 +481,8 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
       {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
       .SetFlags(MemoryFlags{.index = 1});
   auto plan = ExtractResourcePlan(program);
-  Check(plan.capture_specialization_reads,
-        "conditional writable descriptor lost its alias proof");
+  Check(plan.capture_specialization_reads == memory_condition && !plan.control_flow.empty(),
+        "conditional writable descriptor used the wrong memory dependency policy");
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
   const std::array<uint32_t, 1> user_data{4u};
   const SrtRuntime runtime{
@@ -502,16 +502,21 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
       }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1,
-        "GPU-dirty dynamic writable descriptor bypassed strict provenance");
-  reads.clean = true;
-  reads.strict = 0;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u &&
-            snapshot.specialization_reads ==
-                std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}},
-        "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
+  for (const bool clean : {false, true}) {
+    reads = {.clean = clean};
+    // A failed predicate explores both edges and the writable descriptor retries its clean read.
+    const bool expected = !memory_condition || clean;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected &&
+              reads.ordinary == (memory_condition ? 0u : 1u) &&
+              reads.strict == (memory_condition ? (clean ? 1u : 2u) : 0u),
+          "writable descriptor changed reader policy or bypassed a dirty memory predicate");
+    if (!expected) continue;
+    Check(snapshot.buffers[0].dwords[0] == 0x8000u &&
+              snapshot.specialization_reads == (memory_condition
+                  ? std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}}
+                  : std::vector<std::pair<uint64_t, uint64_t>>{}),
+          "writable descriptor lost its address or captured an immutable predicate");
+  }
 }
 
 void TestFailedMaterializationRejectsStage() {
@@ -1015,7 +1020,8 @@ int main() {
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
-  TestWrittenDescriptorUsesStrictReaderOnce();
+  for (const bool memory_condition : {false, true})
+    TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();

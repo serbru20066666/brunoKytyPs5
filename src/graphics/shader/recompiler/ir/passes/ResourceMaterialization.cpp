@@ -1039,10 +1039,15 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	Value unknown;
+	bool capture_control_reads = false;
 	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
 		value = value.Resolve();
 		if (value.IsEmpty()) return {};
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+			capture_control_reads |=
+			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
+			return Clone(value);
+		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return {};
 		const auto op = inst->GetOpcode();
@@ -1072,7 +1077,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
-	plan.capture_specialization_reads |= capture_indirect_reads || !plan.control_flow.empty();
+	plan.capture_specialization_reads |= capture_indirect_reads || capture_control_reads;
 	if (plan.capture_specialization_reads) {
 		// Every former flat alias now targets its retained raw read. Mark those reads
 		// on the normalized graph, so discarded Phi/EXEC dependencies stay discarded.

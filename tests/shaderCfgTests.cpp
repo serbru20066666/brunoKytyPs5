@@ -13806,7 +13806,7 @@ void TestUniformSelectedDescriptorLoadAddress() {
   auto translated = ShaderRecompiler::TranslateProgram(shader, options);
   auto plan = ExtractResourcePlan(translated.program);
   Check(plan.srt_reads.size() == 4u && plan.info.buffers.size() == 1u &&
-            plan.info.buffers[0].written,
+            plan.info.buffers[0].written && !plan.capture_specialization_reads,
         "conditional scalar address duplicated or detached descriptor reads");
   const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     const auto flag = *static_cast<uint32_t *>(data);
@@ -13819,13 +13819,14 @@ void TestUniformSelectedDescriptorLoadAddress() {
     return true;
   };
   const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
-                           .userdata = &user_data[0], .read_specialization_memory = read};
+                           .userdata = &user_data[0]};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t flag : {0u, 1u, 0u}) {
     user_data[0] = flag;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.buffers[0].dwords[0] == 0x3000u + flag * 0x1000u,
+              snapshot.buffers[0].dwords[0] == 0x3000u + flag * 0x1000u &&
+              snapshot.specialization_reads.empty(),
           "conditional descriptor load read the untaken pointer");
   }
 }

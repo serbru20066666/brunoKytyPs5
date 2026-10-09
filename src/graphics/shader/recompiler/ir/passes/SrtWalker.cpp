@@ -973,7 +973,8 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		}
 		uint32_t condition = 0;
 		auto&    evaluator = index < direct.size() && direct[index] != 0u ? *this : strict;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
+		if (!block.condition.IsEmpty() &&
+		    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
 		    evaluator.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
@@ -2080,7 +2081,8 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	const auto slot_count = static_cast<ptrdiff_t>(m_program.srt_reads.size());
 	auto&      active     = m_program.ThreadScratch().active_sources;
 	auto&      strict    = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-	const bool evaluates = m_runtime.read_specialization_memory != nullptr;
+	const bool evaluates = m_runtime.read_specialization_memory != nullptr ||
+	                       !m_program.capture_specialization_reads;
 	const auto outcome   = [&](uint32_t index) -> uint8_t {
 		uint32_t condition = 0;
 		auto&    evaluator = m_compiled.direct_conditions[index] != 0u ? *this : strict;
