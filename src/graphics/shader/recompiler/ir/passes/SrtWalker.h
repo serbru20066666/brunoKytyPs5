@@ -41,7 +41,7 @@ struct SrtReadFlags {
 	                                                  : runtime.userdata;
 }
 
-enum class RuntimeValueType { Any, Integer };
+enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);

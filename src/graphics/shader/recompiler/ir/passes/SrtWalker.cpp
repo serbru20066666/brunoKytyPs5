@@ -166,7 +166,7 @@ private:
 	bool Validate(Value value, bool require_uniform = true) {
 		value = value.Resolve();
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
-		if (m_type == RuntimeValueType::Integer &&
+		if (m_type != RuntimeValueType::Any &&
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
 			return false;
 		}
@@ -195,6 +195,13 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
+		if (m_type == RuntimeValueType::ImmutableInteger &&
+		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+		     SharedAccessOf(op) != SharedAccess::None)) {
+			return finish(false);
+		}
 		if (op == ValueOpcode::ReadConst) {
 			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||
@@ -204,7 +211,7 @@ private:
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return finish(false);
 			}
-			if (m_type == RuntimeValueType::Integer) {
+			if (m_type != RuntimeValueType::Any) {
 				const auto active_mask = m_active_mask;
 				m_active_mask          = {};
 				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
@@ -216,7 +223,7 @@ private:
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
 		    inst->Arg(0).Resolve() == m_active_mask) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
-			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(2), false)) {
+			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(2), false)) {
 				return finish(false);
 			}
 			return finish(Validate(inst->Arg(1)));
@@ -244,7 +251,7 @@ private:
 			return finish(true);
 		}
 		if (op == ValueOpcode::Phi) {
-			if (m_type == RuntimeValueType::Integer && !ValidateArguments(*inst, false)) {
+			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
@@ -258,7 +265,7 @@ private:
 			    inst->Arg(1).GetType() != Type::U1) {
 				return finish(false);
 			}
-			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(1), false)) {
+			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
 				return finish(false);
 			}
 			const auto active_mask = m_active_mask;

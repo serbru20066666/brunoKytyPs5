@@ -609,23 +609,37 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
-	Value LowerDescriptorPhi(Value value) {
-		value           = value.Resolve();
-		const auto* phi = value.TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
-		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32) {
-			return value;
-		}
-		const auto* merge = phi->Parent();
-		const auto* branch = phi->PhiBlock(0);
-		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
-		    branch == phi->PhiBlock(1)) {
-			return value;
-		}
-		for (const auto& [original, selected]: m_descriptor_selections) {
-			if (original == phi) {
-				return selected;
+	Value LowerDescriptorValue(Value value) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return value;
+		// The scalar planner owns reads and lowers their address handles separately.
+		uint32_t memory_index = 0;
+		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
+		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
+		if (!inserted) return cached->second;
+		if (inst->GetOpcode() != ValueOpcode::Phi) {
+			Inst* projected = nullptr;
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
+				if (lowered == inst->Arg(arg).Resolve()) continue;
+				if (projected == nullptr) {
+					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
+					for (size_t i = 0; i < inst->NumArgs(); ++i) projected->SetArg(i, inst->Arg(i));
+				}
+				projected->SetArg(arg, lowered);
 			}
+			if (projected != nullptr) cached->second = Value(projected);
+			return cached->second;
+		}
+		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
+			return value;
+		}
+		const auto* merge = inst->Parent();
+		const auto* branch = inst->PhiBlock(0);
+		if (merge == nullptr || branch == nullptr || inst->PhiBlock(1) == nullptr ||
+		    branch == inst->PhiBlock(1)) {
+			return value;
 		}
 		if (branch->ImmSuccessors().size() != 2u) {
 			if (branch->ImmPredecessors().size() != 1u) {
@@ -638,7 +652,7 @@ private:
 		}
 		std::array<const Block*, 2> targets;
 		for (uint32_t arm = 0; arm < 2; arm++) {
-			const auto* incoming = phi->PhiBlock(arm);
+			const auto* incoming = inst->PhiBlock(arm);
 			if (incoming == merge ||
 			    (incoming != branch &&
 			     (incoming->ImmPredecessors().size() != 1u ||
@@ -654,19 +668,20 @@ private:
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer) ||
-		    !ValidateRuntimeValue(m_program, phi->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, phi->Arg(1))) {
+		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
+		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
+		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
+		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
 			return value;
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
 		const auto true_arg = term.true_block == targets[0] ? 0u : 1u;
 		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
 		selected.SetArg(0, info.condition);
-		selected.SetArg(1, phi->Arg(true_arg));
-		selected.SetArg(2, phi->Arg(true_arg ^ 1u));
-		m_descriptor_selections.emplace_back(phi, Value(&selected));
-		return Value(&selected);
+		selected.SetArg(1, inst->Arg(true_arg));
+		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
+		cached->second = Value(&selected);
+		return cached->second;
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -686,7 +701,7 @@ private:
 		for (uint32_t i = 0; i < width; i++) {
 			const auto value = base_reg != UINT32_MAX
 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
-			descriptor.dwords[i] = LowerDescriptorPhi(value);
+			descriptor.dwords[i] = LowerDescriptorValue(value);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
@@ -2399,7 +2414,7 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
-	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
+	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
 };
 
