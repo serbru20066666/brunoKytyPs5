@@ -11,7 +11,6 @@
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
-#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -985,6 +984,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
@@ -1103,7 +1103,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
-	plan.capture_specialization_reads |= capture_indirect_reads || capture_control_reads;
+	plan.capture_specialization_reads |=
+	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
 		// Every former flat alias now targets its retained raw read. Mark those reads
 		// on the normalized graph, so discarded Phi/EXEC dependencies stay discarded.
@@ -1138,7 +1139,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
 		}
 	}
-	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	if (capture_indirect_reads || !plan.source_reads.empty())
+		plan.resource_tracking_complete &= !program.has_address_writes;
 	return plan;
 }
 
@@ -1149,7 +1151,8 @@ bool g_verify_materialization = false;
 bool MaterializationAllowed(const ResourcePlan& program, const SrtRuntime& runtime,
                             bool& capture_reads) {
 	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
 	// ExtractResourcePlan folds the masked-image write checks into resource_tracking_complete.
@@ -1307,9 +1310,11 @@ private:
 	uint32_t                    m_next  = 0;
 };
 
-SrtRuntime ObservedRuntime(const SrtRuntime& runtime, bool capture_reads, ReadCapture& capture) {
+SrtRuntime ObservedRuntime(const ResourcePlan& program, const SrtRuntime& runtime,
+                           bool capture_reads, ReadCapture& capture) {
 	SrtRuntime observed = runtime;
-	capture.ranges.clear();
+	// The reads that linked the program's called function (none without S_SWAPPC) come first.
+	capture.ranges.assign(program.source_reads.begin(), program.source_reads.end());
 	if (capture_reads) {
 		observed.userdata = &capture;
 		observed.specialization_userdata = nullptr;
@@ -1544,7 +1549,7 @@ bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
 		                             runtime.read_memory_block != nullptr;
 		const auto   source = ordinary_blocks ? ordinary.Runtime() : clean_source;
 		ReadCapture  capture {source, snapshot.specialization_reads};
-		const auto   observed = ObservedRuntime(source, capture_reads, capture);
+		const auto   observed = ObservedRuntime(program, source, capture_reads, capture);
 		SrtEvaluator clean(program, compiled, CleanRuntime(observed));
 		// Only a refresh that captures its reads or needs strict memory evaluates through it.
 		SrtEvaluator walker(program, compiled, observed, true,
@@ -1716,7 +1721,7 @@ bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime
 		return false;
 	}
 	ReadCapture capture {runtime, snapshot.specialization_reads};
-	const auto  observed = ObservedRuntime(runtime, capture_reads, capture);
+	const auto  observed = ObservedRuntime(program, runtime, capture_reads, capture);
 	SrtWalker   clean(program, CleanRuntime(observed));
 	SrtWalker   walker(program, observed,
 	                   capture_reads || program.requires_specialization_memory ? &clean : nullptr);

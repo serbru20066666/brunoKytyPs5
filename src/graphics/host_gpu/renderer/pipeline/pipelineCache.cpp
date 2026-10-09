@@ -332,6 +332,7 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct Permutation {
+		std::vector<uint32_t>                       function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
@@ -389,11 +390,30 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
+		// The called function's code, as the last refresh linked it.
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			           ? std::span<const uint32_t>(call_source->linked->code)
+			                 .subspan(call_source->code.size())
+			           : std::span<const uint32_t> {};
+		}
+
+		// Whether the call now reaches other code than the linked one.
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		// Only for a program with S_SWAPPC (see GetLinked): such a source is never speculable.
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -645,13 +665,96 @@ struct PipelineCache::ProgramCache {
 		return result;
 	}
 
+	// Whether the code may hold an S_SWAPPC_B64 (SOP1 0x21), by its encoding alone: a literal may
+	// look like one, so PrepareShaderSource has the last word.
+	static bool MayCall(std::span<const uint32_t> code) {
+		return std::ranges::any_of(
+		    code, [](uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; });
+	}
+
+	// A program with S_SWAPPC: the function it calls is found from guest memory at each refresh
+	// and linked into the program, so a permutation also depends on that function's code. Rare,
+	// and kept apart from everything else: always synchronous, never speculated, memoized,
+	// compiled on a worker or recorded for the precompile.
+	// prepared: the decoded source of a program not in the cache yet; null for a cached one.
+	template <typename InputInfo>
+	ShaderProgram GetLinked(std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>::iterator entry,
+	                        ShaderRecompiler::ShaderSource* prepared, const ShaderParams& params,
+	                        InputInfo& input_info, uint32_t& push_data_cursor,
+	                        const ShaderRecompiler::CompileOptions&  options,
+	                        const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		const auto find = [&](SourceEntry& source) -> Permutation* {
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    source.resource_plan, runtime, source.resources, source.specialization, nullptr));
+			source.specialization_hash = 0;
+			source.last_permutation    = UINT32_MAX;
+			for (auto& candidate: source.permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword ==
+				        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                                 layout.ShaderDataDwords()) &&
+				    candidate.specialization == source.specialization &&
+				    std::ranges::equal(candidate.function_code, source.FunctionCode())) {
+					return &candidate;
+				}
+			}
+			return nullptr;
+		};
+		const auto use = [&](SourceEntry& source, Permutation& permutation) {
+			input_info.stage = {.program = &permutation.program, .resources = &source.resources};
+			permutation.program.bindings.AdvancePushData(push_data_cursor);
+			return permutation.handle;
+		};
+		ShaderRecompiler::TranslateResult translated;
+		if (prepared != nullptr) {
+			ShaderRecompiler::RefreshShaderSource(*prepared, runtime);
+			translated = ShaderRecompiler::TranslateProgram(prepared->linked->decoded, options);
+			translated.program.source_reads = prepared->reads;
+			auto retained =
+			    std::make_unique<ShaderRecompiler::ShaderSource>(std::move(*prepared));
+			{
+				std::unique_lock lock(programs_mutex);
+				entry = programs.try_emplace(lookup_key,
+				    ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+				    std::move(retained)).first;
+			}
+			(void)find(entry->second);
+		} else {
+			auto&      source  = entry->second;
+			const bool changed = source.RefreshCallSource(runtime);
+			if (!changed) {
+				if (auto* permutation = find(source)) {
+					return use(source, *permutation);
+				}
+			}
+			translated =
+			    ShaderRecompiler::TranslateProgram(source.call_source->linked->decoded, options);
+			translated.program.source_reads = source.call_source->reads;
+			if (changed) {
+				source.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				source.memo          = {};
+				if (auto* permutation = find(source)) {
+					return use(source, *permutation);
+				}
+			}
+		}
+		auto& source = entry->second;
+		source.permutations.push_back(CompilePermutation(
+		    params, options, std::move(translated), source.specialization, push_data_cursor));
+		auto&      permutation = source.permutations.back();
+		const auto function    = source.FunctionCode();
+		permutation.function_code.assign(function.begin(), function.end());
+		return use(source, permutation);
+	}
+
 	// Starts translating a source nothing has translated or queued yet (ProgramWait::Prefetch for
 	// a stage whose push data position is unknown until an earlier stage compiles).
 	template <typename InputInfo>
 	void QueueSourceTranslation(const ShaderParams& params, const InputInfo& input_info,
 	                            ShaderType stage) {
 		if (workers == nullptr ||
-		    Config::GetShaderLogDirection() != Config::LogDirection::Silent) {
+		    Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		    MayCall(params.code) || MayCall(params.back_code)) {
 			return;
 		}
 		lookup_key.stage           = stage;
@@ -797,6 +900,11 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto entry = programs.find(lookup_key);
+		if (entry != programs.end() && entry->second.call_source) [[unlikely]] {
+			return GetLinked(entry, nullptr, params, input_info, push_data_cursor,
+			                 MakeOptions(stage, params.hash, user_data, params.back_code, input_info),
+			                 runtime);
+		}
 		if (entry != programs.end() && &entry->second != refreshed) {
 			if (auto program = existing(entry->second)) {
 				return *program;
@@ -816,6 +924,14 @@ struct PipelineCache::ProgramCache {
 		};
 		auto options = MakeOptions(stage, params.hash, user_data, params.back_code, input_info);
 		std::optional<ShaderRecompiler::TranslateResult> translated;
+		if (entry == programs.end() && (MayCall(params.code) || MayCall(params.back_code)))
+		    [[unlikely]] {
+			auto prepared = ShaderRecompiler::PrepareShaderSource(params.code, options);
+			if (prepared.call) {
+				return GetLinked(entry, &prepared, params, input_info, push_data_cursor, options,
+				                 runtime);
+			}
+		}
 		if (entry == programs.end()) {
 			// A new source: translate it first.
 			if (auto queued = pending_sources.find(lookup_key); queued != pending_sources.end()) {
@@ -847,7 +963,7 @@ struct PipelineCache::ProgramCache {
 			{
 				std::unique_lock lock(programs_mutex);
 				entry = programs.try_emplace(lookup_key,
-				    ShaderRecompiler::IR::ExtractResourcePlan(translated->program)).first;
+				    ShaderRecompiler::IR::ExtractResourcePlan(translated->program), nullptr).first;
 			}
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
@@ -1493,7 +1609,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		}
 		if (entry == m_program_cache->programs.end()) {
 			std::unique_lock insert_lock(m_program_cache->programs_mutex);
-			entry = m_program_cache->programs.try_emplace(std::move(key), std::move(*result.plan))
+			entry = m_program_cache->programs.try_emplace(std::move(key), std::move(*result.plan), nullptr)
 			            .first;
 		}
 		entry->second.permutations.push_back(m_program_cache->MakePermutation(

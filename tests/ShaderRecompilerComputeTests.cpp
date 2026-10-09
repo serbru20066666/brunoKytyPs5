@@ -10432,6 +10432,105 @@ public:
     return result;
   }
 
+  void CheckScalarLeafCall() {
+    constexpr const char* name = "ScalarLeafCall";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto first = base + 0x1000;
+    constexpr auto second = base + 0x2000;
+    constexpr auto output = base + 0x4000;
+    std::vector<u32> code{
+        EncodeSMovB32(20, InlineU32(0)),
+        0xbeea03ffu, static_cast<u32>(base), 0xbeeb03ffu, static_cast<u32>(base >> 32u),
+        0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
+        0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
+        0xbf8cc07fu, 0xbe8e210eu, EncodeVop1(0x01, 1, 20),
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "call fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "call fixture mapping failed");
+    std::memset(mapped, 0, size);
+    const ShaderBufferResource table_desc{{static_cast<u32>(table),
+        static_cast<u32>(table >> 32u) | (16u << 16u), 8, 0x5204u}};
+    LibKernel::Memory::WriteBacking(base, table_desc.fields, sizeof(table_desc.fields));
+    const std::array leaf{EncodeSMovB32(20, 255), 41u, EncodeSop1(0x21, 125, 14)};
+    for (const auto address : {first, second})
+      LibKernel::Memory::WriteBacking(address, leaf.data(), sizeof(leaf));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& cache = context.GetBufferCache();
+      auto& shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
+      uint64_t original_id = 0;
+      struct Case { uint64_t address; u32 value; bool update; };
+      for (const auto test : {Case{first, 41, false}, Case{first, 41, false},
+                              Case{second, 41, false}, Case{second, 73, true},
+                              Case{first, 41, false}}) {
+        Require(name, "refresh function pointer", context.InvalidateMemory(table + 0x20, 8),
+                "function table escaped mapped memory");
+        const uint64_t target = test.address | 3u;
+        LibKernel::Memory::WriteBacking(table + 0x20, &target, sizeof(target));
+        if (test.update) {
+          auto [buffer, offset] = cache.ObtainBuffer(test.address + 4, 4, true);
+          buffer->Fill(offset, 4, test.value);
+          Require(name, "GPU-written function code", cache.HasGpuDirtyBytes(test.address + 4, 4),
+                  "code mutation did not remain GPU-owned before refresh");
+        }
+        ShaderComputeInputInfo input{};
+        const auto program = context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        if (original_id == 0) original_id = program.id;
+        Require(name, "exact function identity",
+                (program.id == original_id) == (test.value == 41),
+                "helper bytes were stale or identical relocated/restored code recompiled");
+        Require(name, "current code dependency",
+                std::ranges::find(input.stage.resources->specialization_reads,
+                    std::pair<uint64_t, uint64_t>{test.address, sizeof(leaf)}) !=
+                    input.stage.resources->specialization_reads.end(),
+                "function relocation retained an old code dependency");
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(output, sizeof(u32));
+        u32 actual = 0;
+        Require(name, "scalar leaf execution and return",
+                LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual)) && actual == test.value,
+                "caller did not observe the leaf's scalar result after return");
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "call fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -44117,6 +44216,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    vulkan.CheckScalarLeafCall();
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
@@ -44613,6 +44713,7 @@ int main(int argc, char **argv) {
   }
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
+  vulkan.CheckScalarLeafCall();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

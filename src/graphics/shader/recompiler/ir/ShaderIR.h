@@ -720,6 +720,7 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	bool                                requires_specialization_memory = false;
+	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

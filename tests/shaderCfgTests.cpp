@@ -10324,6 +10324,147 @@ void TestNewShaderRecompilerBranchConditionForms() {
   }
 }
 
+void TestMemoryFedScalarLeafCall() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0040000ull;
+  const uint32_t shader[] = {
+      0xbeea03ffu, 0xe0040000u, 0xbeeb03ffu, 0x0000000fu,
+      0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
+      0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
+      0xbf8cc07fu, 0xbe8e210eu, 0xbf810000u};
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+    uint64_t end = base + 0x10c;
+    bool clean = true;
+  } memory;
+  std::copy_n(std::array{0xe0040060u, 0x0010000fu, 8u, 0x5204u}.begin(),
+              4, memory.words.begin());
+  memory.words[32] = static_cast<uint32_t>(base + 0x103); // SWAPPC aligns the old pair.
+  memory.words[33] = static_cast<uint32_t>(base >> 32u);
+  memory.words[64] = EncodeSMovB32(3, 255);
+  memory.words[65] = 0x12345678;
+  memory.words[66] = EncodeSop1(0x21, 125, 14);
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    if (!m.clean || address < base || address > m.end || out.size_bytes() > m.end - address)
+      return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto source = PrepareShaderSource(shader, options);
+  Check(source.call && source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
+        "memory-fed SWAPPC did not retain an unresolved target");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
+              "unresolved SWAPPC silently fell through");
+#endif
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
+            linked.instructions[source.call->instruction].branch_target == 0x44 &&
+            source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x100, 12},
+        "aliased call target, exact leaf range, or continuation was lost");
+  const auto* storage = linked.instructions.data();
+  const auto* scratch = source.linked->observed_function.data();
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 && source.linked->decoded.instructions.data() == storage &&
+            source.linked->observed_function.data() == scratch,
+        "unchanged leaf rebuilt decoded instructions or refresh storage");
+  auto translated = TranslateProgram(linked, options);
+  translated.program.source_reads = source.reads;
+  const auto plan = IR::ExtractResourcePlan(translated.program);
+  Check(plan.source_reads == source.reads && plan.capture_specialization_reads,
+        "linked code dependencies were omitted from resource alias validation");
+
+  std::vector<uint32_t> writer(std::begin(shader), std::end(shader) - 1);
+  writer.insert(writer.end(), {EncodeVop1(0x01, 1, 3), EncodeMubuf0(0x1c, 0, false),
+                              EncodeMubuf1(1, 6, 0), EncodeSopp(0x01)});
+  std::array<uint32_t, 64> user_data{};
+  user_data[25] = static_cast<uint32_t>(base >> 32u);
+  user_data[26] = 4;
+  user_data[27] = 3u << 28u;
+  auto write_options = options;
+  write_options.user_data = user_data;
+  auto write_runtime = runtime;
+  write_runtime.user_data = user_data;
+  auto write_source = PrepareShaderSource(writer, write_options);
+  auto write_program = TranslateProgram(RefreshShaderSource(write_source, write_runtime), write_options);
+  write_program.program.source_reads = write_source.reads;
+  auto write_plan = IR::ExtractResourcePlan(write_program.program);
+  IR::ResourceSnapshot snapshot;
+  IR::ResourceSpecialization specialization;
+  const auto written = std::ranges::find_if(write_plan.info.buffers,
+      [](const auto& buffer) { return buffer.written; });
+  Check(written != write_plan.info.buffers.end(), "caller store lost its writable binding");
+  const auto output_index = static_cast<size_t>(written - write_plan.info.buffers.begin());
+  for (const auto offset : {0x80u, 0x100u, 0x1f0u}) {
+    user_data[24] = static_cast<uint32_t>(base + offset);
+    Check(IR::MaterializeResources(write_plan, write_runtime, snapshot, specialization) &&
+              snapshot.buffers[output_index].dwords[0] == user_data[24] &&
+              snapshot.buffers[output_index].dwords[2] == 4 &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair<uint64_t, uint64_t>{base + 0x80, 4}) != snapshot.specialization_reads.end() &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair<uint64_t, uint64_t>{base + 0x100, 12}) != snapshot.specialization_reads.end(),
+          "call dependencies or writable ranges were lost before binding validation");
+  }
+
+  // Relocating identical code updates dependencies without rebuilding the source.
+  std::copy_n(memory.words.begin() + 64, 3, memory.words.begin() + 96);
+  memory.words[32] = static_cast<uint32_t>(base + 0x180);
+  memory.end = base + 0x18c;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 && source.reads.back().first == base + 0x180,
+        "identical relocated leaf recompiled or retained its old memory dependency");
+  memory.words[97] = 0x87654321;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->code.back() == EncodeSop1(0x21, 125, 14),
+        "changed leaf bytes retained stale source");
+  // A newly selected shorter function may end before the old bulk-read length.
+  memory.words[96] = EncodeSMovB32(3, 129);
+  memory.words[97] = EncodeSop1(0x21, 125, 14);
+  memory.end = base + 0x188;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 3 && source.reads.back().second == 8,
+        "shorter exact-boundary leaf was not decoded after a failed old-span read");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  memory.clean = false;
+  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
+              "unreadable call dependencies reused stale linked code");
+  memory.clean = true;
+  auto ordinary = runtime;
+  ordinary.read_specialization_memory = nullptr;
+  ExpectFatal([&] { (void)RefreshShaderSource(source, ordinary); },
+              "call target query accepted an ordinary non-strict memory reader");
+  std::vector<uint32_t> escaping(std::begin(shader), std::end(shader) - 1);
+  escaping.insert(escaping.end(), {EncodeVop1(0x01, 1, 14),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0), EncodeSopp(0x01)});
+  ExpectFatal([&] {
+    auto escaping_source = PrepareShaderSource(escaping, options);
+    (void)TranslateProgram(RefreshShaderSource(escaping_source, runtime), options);
+  }, "saved native return PC escaped into GPU data");
+  memory.words[96] = EncodeSMovB32(14, 129);
+  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
+              "leaf clobbering its return pair was linked");
+  // AND_B64 writes the high half despite the decoder's generic scalar width.
+  const uint32_t high_writer[] = {
+      EncodeSMovB32(15, 129), EncodeSop2(0x0f, 14, 128, 128),
+      EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  auto pair_source = PrepareShaderSource(high_writer, options);
+  IR::SrtWalker pair_walker(pair_source.call_targets, runtime);
+  uint32_t high = 1;
+  Check(pair_walker.Evaluate(pair_source.call->target[1], high) && high == 0,
+        "scalar pair producer used a stale preceding high-half definition");
+  const uint32_t joined[] = {
+      EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
+      EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
+              "ambiguous reaching definitions were accepted for a call target");
+#endif
+}
+
 void TestNewShaderRecompilerSetpcBranch() {
   const uint32_t shader[] = {
       EncodeSop1(0x1f, 4, 0),      // s_getpc_b64 s[4:5]
@@ -15472,6 +15613,7 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
