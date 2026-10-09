@@ -36226,42 +36226,87 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   std::vector<VulkanHarness::Image> textures;
   for (u32 resource = 0; resource < 7u; ++resource) {
     const auto layers = resource == 4u ? 6u : 1u;
-    std::vector<u32> pixels(layers * 4u, std::bit_cast<u32>(float(resource)));
+    std::vector<u32> pixels(layers * 16u, std::bit_cast<u32>(float(resource)));
+    std::vector<u32> mip(layers * 4u,
+                         std::bit_cast<u32>(resource == 0u ? 0.0f : float(resource + 10u)));
     textures.push_back(vulkan.CreateImageMips(
-        test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
-        vk::ImageUsageFlagBits::eSampled, {pixels}, 4u,
+        test.name, 2, 2, vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {pixels, mip}, 4u,
         vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
         resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
   }
   const auto native_sampler = vulkan.CreateSampler(test.name);
-  for (const u32 wave_size : {32u, 64u}) {
-    compute.wave_size = wave_size;
-    compute.host_subgroup_size = vulkan.SubgroupSize();
-    compute.threads_num[0] = wave_size;
-    compute.threads_num[1] = compute.threads_num[2] = 1u;
-    compiled.program.wave_size = wave_size;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
-    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
-    ValidateSpirv(test.name, compiled.spirv);
-    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
-    Require(test.name, "native array run samples", tools.Disassemble(compiled.spirv, &text) &&
-                CountText(text, "OpImageSampleExplicitLod") == 3u * halves,
-            "mixed runs expanded into per-image samples");
-    test.initial.assign(wave_size, 0xdeadbeefu);
-    test.expected.assign(wave_size, 0u);
-    for (u32 lane = 0; lane < ordinals.size(); ++lane) {
-      test.expected[lane] = std::bit_cast<u32>(float(root.indirect_resources[ordinals[lane]]));
+  for (const bool fetch : {false, true}) {
+    if (fetch) {
+      test.name = "IndirectImageFetchContiguousRuns";
+      const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
+        return &inst == &sample;
+      });
+      auto &read = *block->PrependNewInst(
+          position, ValueOpcode::ImageRead,
+          {Value(&image), Value(&address), Value(true)}, memory_flag_bits);
+      sample.ReplaceUsesWith(Value(&read), false);
+      sampler.Invalidate();
+      compiled.program.info.samplers.clear();
+      compiled.program.info.sampled_pairs.clear();
+      compiled.program.info.images[4].cube = false;
+      compiled.program.memory_info[0].image_sample_flags = 0;
+      compiled.program.memory_info[0].image_has_mip = true;
+      for (u32 component = 0; component < 4u; ++component)
+        address.SetArg(component, Value(0u));
+      // Native DIM=2DArray places LOD after the layer, even for a 2D candidate.
+      address.SetArg(3, Value(1u));
+      compiled.program.shader_info_complete = false;
+      CollectShaderInfo(compiled.program, {.compute = &compute});
     }
-    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
-    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
-                    native_sampler, textures);
-    const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
-    vulkan.DestroyBuffer(&buffer);
-    CompareWords(test, "root, native slots, cube and mapping bounds", test.expected, actual);
+    for (const u32 wave_size : {32u, 64u}) {
+      compute.wave_size = wave_size;
+      compute.host_subgroup_size = vulkan.SubgroupSize();
+      compute.threads_num[0] = wave_size;
+      compute.threads_num[1] = compute.threads_num[2] = 1u;
+      compiled.program.wave_size = wave_size;
+      compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ValidateSpirv(test.name, compiled.spirv);
+      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      Require(test.name, "native array image runs", tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, fetch ? "OpImageFetch" : "OpImageSampleExplicitLod") == 3u * halves,
+              "mixed runs expanded into per-image accesses");
+      if (fetch) {
+        std::vector<u32> decorated;
+        std::vector<u32> fetched_images;
+        for (size_t offset = 5; offset < compiled.spirv.size();) {
+          const auto words = std::span<const u32>(compiled.spirv).subspan(
+              offset, compiled.spirv[offset] >> 16u);
+          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+            decorated.push_back(words[1]);
+          if (opcode == spv::OpImageFetch) fetched_images.push_back(words[3]);
+          offset += words.size();
+        }
+        Require(test.name, "nonuniform fetch operands",
+                std::ranges::count_if(fetched_images, [&](u32 operand) {
+                  return std::ranges::find(decorated, operand) != decorated.end();
+                }) == 2u * halves,
+                "a dynamically selected fetch image lacks its nonuniform decoration");
+      }
+      test.initial.assign(wave_size, 0xdeadbeefu);
+      test.expected.assign(wave_size, 0u);
+      for (u32 lane = 0; lane < ordinals.size(); ++lane) {
+        const auto resource = root.indirect_resources[ordinals[lane]];
+        test.expected[lane] = std::bit_cast<u32>(float(resource + (fetch && resource != 0u ? 10u : 0u)));
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                      fetch ? vk::Sampler{} : native_sampler, textures);
+      const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+      vulkan.DestroyBuffer(&buffer);
+      CompareWords(test, "root, native slots, cube and mapping bounds", test.expected, actual);
+    }
+    std::printf("[compute] %-32s ok\n", test.name);
   }
   vulkan.Device().destroySampler(native_sampler);
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
-  std::printf("[compute] %-32s ok\n", test.name);
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

@@ -144,6 +144,12 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	const auto kind = *IR::DescriptorBindingForImage(state.program.info.images[resource]);
 	state.builder.AddFunction(spv::OpLoad, state.images[IR::ImageBindingIndex(kind)].type,
 	                          image, pointer);
+	if (array_index != 0u) {
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+	}
 	return image;
 }
 
@@ -174,9 +180,6 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	}
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
 	if (array_index != 0u) {
-		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
-		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
-		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;

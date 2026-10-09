@@ -1909,7 +1909,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageRead);
 		}
 	}
 	for (auto& memory: memory_info) {
