@@ -869,7 +869,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
 				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
-			} else if (op != IR::ValueOpcode::GetSamplerResource) {
+			} else if (op == IR::ValueOpcode::GetSamplerResource) {
+				const auto resource = inst.Flags<uint32_t>();
+				first = resource < ir.info.samplers.size() &&
+				                !ir.info.samplers[resource].indirect_resources.empty() ? 1u : 0u;
+			} else {
 				continue;
 			}
 			for (size_t index = first; index < inst.NumArgs(); index++) {

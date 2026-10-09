@@ -898,14 +898,25 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
-		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+		const auto& samplers = state.program.info.samplers.at(mem.sampler).indirect_resources;
+		uint32_t sampler_index = 0;
+		if (!samplers.empty()) {
+			const auto* handle = inst.Arg(1).ResolveInstruction();
+			if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource)
+				ctx.Fail(inst, "has invalid finite sampler key provenance");
+			sampler_index = EmitIndexSwitch(
+			    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
+			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
+		}
+		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
+			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
+			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),

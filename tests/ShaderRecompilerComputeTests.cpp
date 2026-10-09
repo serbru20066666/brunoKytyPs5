@@ -15954,7 +15954,8 @@ public:
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
-                std::span<const Image> sampled_resources = {}) {
+                std::span<const Image> sampled_resources = {},
+                std::span<const vk::Sampler> sampler_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -16269,11 +16270,12 @@ public:
       writes.push_back(write);
     }
     if (Count(Kind::Samplers) != 0) {
-      Require(test.name, "dispatch", sampler != nullptr,
-              "sampler descriptor requested but no sampler was provided");
+      Require(test.name, "dispatch", sampler_resources.empty()
+                  ? sampler != nullptr : sampler_resources.size() == Count(Kind::Samplers),
+              "sampler resources must match the native sampler array");
       sampler_infos.resize(Count(Kind::Samplers));
-      for (auto &info : sampler_infos) {
-        info.sampler = sampler;
+      for (u32 index = 0; index < sampler_infos.size(); ++index) {
+        sampler_infos[index].sampler = sampler_resources.empty() ? sampler : sampler_resources[index];
       }
       vk::WriteDescriptorSet write{};
       write.dstSet = descriptor_set;
@@ -36088,6 +36090,122 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+void CheckFiniteInlineSamplerPhi(VulkanHarness &vulkan) {
+  TestCase test;
+  test.name = "FiniteInlineSamplerPhi";
+  auto &code = test.code;
+  code.insert(code.end(), {EncodeSop1(0x04, 36, InlineU32(0)),
+      EncodeSop1(0x04, 38, InlineU32(0)), EncodeSop1(0x04, 24, 126),
+      EncodeVop1(0x01, 10, 16), EncodeVopc(0xd5, InlineU32(0), 10)});
+  const auto skip_sampler = code.size();
+  code.push_back(EncodeSopp(0x08));
+  // Actual correlated inline sampler words from 905b2e2c: zero or {0,fff000,a500000,0}.
+  code.insert(code.end(), {EncodeSop2(0x24, 37, InlineU32(12), InlineU32(12)),
+      EncodeSop1(0x04, 38, 255), 0x0a500000u});
+  code[skip_sampler] = EncodeSopp(0x08, code.size() - skip_sampler - 1u);
+  code.push_back(EncodeSop1(0x04, 126, 24));
+  AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 1, 0x12345678u);
+  AppendVMovLiteral(&code, 2, 0x87654321u);
+  code.insert(code.end(), {EncodeVopc(0xd4, InlineU32(2), 10),
+      EncodeMimg0(0x27, 1), EncodeMimg1(1, 20, 0, 9),
+      EncodeMimg0(0x27, 1), EncodeMimg1(2, 20, 2, 9),
+      EncodeSop1(0x04, 126, 24), EncodeVop1(0x01, 30, 16),
+      EncodeVop2(0x1a, 31, InlineU32(3), 30),
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 12, 31),
+      EncodeMubuf0(0x1c, 4), EncodeMubuf1(2, 12, 31)});
+  AppendEnd(&code);
+  test.initial.assign(7, 0xa5a5a5a5u);
+  test.expected = {std::bit_cast<u32>(4.0f), 0xfffffff9u,
+      std::bit_cast<u32>(2.0f), 0xfffffff9u, 0x12345678u, 0x87654321u, 0xa5a5a5a5u};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[3] |= static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  const auto signed_image = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  std::copy_n(signed_image.begin(), 8, test.user_data.begin() + 8);
+  test.user_data[11] |= static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  test.user_data[50] = test.initial.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 16;
+  test.has_compute_info = true;
+  test.dispatch_x = 3;
+  test.opcodes = {ShaderOpcode::S_MOV_B64, ShaderOpcode::S_BFM_B32,
+      ShaderOpcode::S_CBRANCH_EXECZ, ShaderOpcode::V_MOV_B32, ShaderOpcode::V_CMPX_NE_U32,
+      ShaderOpcode::V_CMPX_GT_U32, ShaderOpcode::V_LSHLREV_B32,
+      ShaderOpcode::IMAGE_SAMPLE, ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.required_spirv = {"OpPhi", "NonUniform", "OpImageSampleExplicitLod"};
+  auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  std::set<u32> nonuniform_ids;
+  std::vector<std::pair<u32, u32>> sampled_ids;
+  for (size_t offset = 5; offset < compiled.spirv.size();) {
+    const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+    if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpDecorate &&
+        words[2] == spv::DecorationNonUniform) nonuniform_ids.insert(words[1]);
+    if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpSampledImage)
+      sampled_ids.emplace_back(words[2], words[4]);
+    offset += words.size();
+  }
+  Require(test.name, "dynamic sampler decorations", sampled_ids.size() >= 2 &&
+              std::ranges::all_of(sampled_ids, [&](const auto &ids) {
+                return nonuniform_ids.contains(ids.first) && nonuniform_ids.contains(ids.second);
+              }),
+          "fetched sampler or sampled image lost its NonUniform decoration");
+  const auto &samplers = compiled.program.info.samplers;
+  u32 roots = 0;
+  for (const auto &root : samplers) {
+    if (root.indirect_resources.empty()) continue;
+    ++roots;
+    Require(test.name, "correlated sampler candidates", root.indirect_resources.size() == 2,
+            "finite sampler was folded or lost a correlated branch state");
+    for (const auto child : root.indirect_resources)
+      Require(test.name, "sampler class remapping", child < samplers.size() &&
+                  samplers[child].force_point_filtering == root.force_point_filtering &&
+                  samplers[child].integer_border == root.integer_border,
+              "a finite candidate retained another image class's sampler");
+  }
+  Require(test.name, "finite sampler class variants", roots == 2 && samplers.size() == 4 &&
+              compiled.resources.samplers.size() == 2,
+          "the two-state sampler did not retain both float and signed image classes");
+  constexpr std::array<u32, 4> zero_sampler{};
+  constexpr std::array<u32, 4> linear_sampler{0, 0x00fff000u, 0x0a500000u, 0};
+  Require(test.name, "inline sampler states",
+          std::ranges::all_of(compiled.resources.samplers, [&](const auto &value) {
+            return std::equal(zero_sampler.begin(), zero_sampler.end(), value.dwords.begin()) ||
+                std::equal(linear_sampler.begin(), linear_sampler.end(), value.dwords.begin());
+          }) && compiled.resources.samplers[0] != compiled.resources.samplers[1],
+          "descriptor words were mixed between the two native sampler states");
+  auto pixels = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4; ++y)
+    for (u32 x = 2; x < 4; ++x) SetRgbaPixel(&pixels, 4, x, y, std::bit_cast<u32>(4.0f), 0, 0, 0);
+  std::array<VulkanHarness::Image, 2> images{
+      vulkan.CreateImageMips(test.name, 4, 4, vk::Format::eR32G32B32A32Sfloat,
+          vk::ImageUsageFlagBits::eSampled, {pixels}, 4, vk::ImageLayout::eShaderReadOnlyOptimal,
+          vk::ImageType::e2D, vk::ImageViewType::e2D, 1),
+      vulkan.CreateImageMips(test.name, 4, 4, vk::Format::eR32Sint,
+          vk::ImageUsageFlagBits::eSampled, {std::vector<u32>(16, 0xfffffff9u)}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D, vk::ImageViewType::e2D, 1)};
+  std::vector<vk::Sampler> native_samplers;
+  for (const auto &resource : samplers) {
+    ShaderSamplerResource descriptor{};
+    std::copy_n(compiled.resources.samplers[resource.snapshot_index].dwords.begin(), 4, descriptor.fields);
+    const auto filter = !resource.force_point_filtering && descriptor.XyMagFilter() == 1
+        ? vk::Filter::eLinear : vk::Filter::eNearest;
+    native_samplers.push_back(vulkan.CreateSampler(test.name, 1, filter));
+  }
+  auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, images, native_samplers);
+  CompareWords(test, "point, linear, remapped signed sampler and inactive output", test.expected,
+      vulkan.ReadBuffer(test.name, output, test.expected.size()));
+  vulkan.DestroyBuffer(&output);
+  for (const auto sampler : native_samplers) vulkan.Device().destroySampler(sampler);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -44512,6 +44630,7 @@ int main(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     CheckIndirectImageKeySwitch(vulkan);
+    CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -44675,6 +44794,7 @@ int main(int argc, char **argv) {
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
+  CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();

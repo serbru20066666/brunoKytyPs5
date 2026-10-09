@@ -430,7 +430,7 @@ public:
 					plan.handle->SetArg(word, Value(0u));
 				continue;
 			}
-			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
+			if (plan.handle->NumArgs() == 4u) {
 				plan.handle->SetArg(0, plan.key);
 				for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
 			} else {
@@ -1944,17 +1944,21 @@ private:
 		return found;
 	}
 
-	bool TryMakeFiniteImage(Inst& handle, IndirectDescriptorPlan& plan) {
-		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u)
+	bool TryMakeFiniteDescriptor(Inst& handle, IndirectDescriptorPlan& plan) {
+		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
+		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
+		    handle.NumArgs() != (sampler ? 4u : 8u))
 			return false;
-		if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
+		if (std::ranges::any_of(handle.Uses(), [&](const Use& use) {
 			const auto op = use.user->GetOpcode();
-			return op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw;
+			if (op != ValueOpcode::ImageSampleRaw) return sampler || op != ValueOpcode::ImageGatherRaw;
+			return sampler && (m_program.memory_info[use.user->Flags<MemoryFlags>().index]
+			                       .image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0u;
 		})) return false;
 		bool has_phi = false;
 		for (size_t word = 0; word < handle.NumArgs(); ++word) has_phi |= handle.Arg(word).Resolve().IsPhi();
 		if (!has_phi) return false;
-		// Normalize the eight synchronized descriptor words to one GPU ordinal.
+		// Normalize synchronized descriptor words to one GPU ordinal.
 		// Build the complete graph before changing IR so an unsupported leaf is transactional.
 		struct Choice {
 			DescriptorSource descriptor;
@@ -1970,7 +1974,15 @@ private:
 			const auto index = static_cast<uint32_t>(choices.size());
 			choices.push_back({descriptor});
 			uint32_t bad = 0;
-			if (ValidateSource(descriptor, bad)) return index;
+			if (ValidateSource(descriptor, bad)) {
+				// Finite inline samplers have literal leaves; live descriptor tables use the
+				// existing direct sampler planning path.
+				if (sampler && !std::ranges::all_of(
+				    std::span(descriptor.dwords).first(descriptor.dword_count),
+				    [](Value word) { return word.IsImmediate() && word.GetType() == Type::U32; }))
+					return UINT32_MAX;
+				return index;
+			}
 			const auto* branch = descriptor.dwords[bad].TryInstruction();
 			if (branch == nullptr || branch->Parent() == nullptr ||
 			    branch->GetOpcode() != ValueOpcode::Phi ||
@@ -2007,14 +2019,14 @@ private:
 			return index;
 		};
 		DescriptorSource root;
-		root.dword_count = 8u;
+		root.dword_count = handle.NumArgs();
 		for (uint32_t word = 0; word < root.dword_count; ++word) root.dwords[word] = handle.Arg(word);
 		if (visit(visit, root) == UINT32_MAX || choices.front().branch == nullptr) return false;
-		DescriptorSource image_source;
-		image_source.dword_count = 8u;
-		image_source.dwords.fill(Value(0u));
-		image_source.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
-		auto& sources = image_source.indirect_descriptor->sources;
+		DescriptorSource finite_source;
+		finite_source.dword_count = root.dword_count;
+		finite_source.dwords.fill(Value(0u));
+		finite_source.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
+		auto& sources = finite_source.indirect_descriptor->sources;
 		for (auto& choice: choices) {
 			if (choice.branch != nullptr) continue;
 			const auto source = InternSource(choice.descriptor);
@@ -2043,9 +2055,9 @@ private:
 			}
 		}
 		plan.handle = &handle;
-		plan.source = InternSource(image_source);
+		plan.source = InternSource(finite_source);
 		plan.key = choices.front().key;
-		plan.roots = image_source.dwords;
+		plan.roots = finite_source.dwords;
 		plan.reads.fill(nullptr);
 		return true;
 	}
@@ -2076,27 +2088,33 @@ private:
 				    inst.NumArgs() == 0u) {
 					continue;
 				}
-				auto* handle = inst.Arg(0).Resolve().TryInstruction();
-				if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) {
-					continue;
-				}
 				const auto flags = inst.Flags<MemoryFlags>();
 				const auto& memory = m_program.memory_info[flags.index];
-				DescriptorSource descriptor;
-				MakeSource(*handle, inst.GetOpcode() == ValueOpcode::StoreBufferU32 ? 4u : 8u,
-				           false, false, memory.resource * 4u, descriptor, flags.pc);
-				uint32_t bad_dword = 0;
-				if (ValidateSource(descriptor, bad_dword)) continue;
-				IndirectDescriptorPlan plan;
-				if (TryMakeIndirectImage(*handle, descriptor, plan) || TryMakeFiniteImage(*handle, plan) ||
-				    TryMakeIndirectBuffer(*handle, descriptor, plan)) {
-					for (const auto& previous: m_indirect_descriptors) {
-						if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
-						    !EquivalentValue(m_program, previous.key, plan.key))
-							Fail(flags.pc, "shared descriptor read has incompatible keys");
+				const auto plan_handle = [&](Value value, uint32_t width, uint32_t base, bool sampler) {
+					auto* handle = value.Resolve().TryInstruction();
+					if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) return;
+					DescriptorSource descriptor;
+					MakeSource(*handle, width, sampler, false, base, descriptor, flags.pc);
+					uint32_t bad_dword = 0;
+					if (ValidateSource(descriptor, bad_dword)) return;
+					IndirectDescriptorPlan plan;
+					if (sampler ? TryMakeFiniteDescriptor(*handle, plan)
+					             : (TryMakeIndirectImage(*handle, descriptor, plan) ||
+					                TryMakeFiniteDescriptor(*handle, plan) ||
+					                TryMakeIndirectBuffer(*handle, descriptor, plan))) {
+						for (const auto& previous: m_indirect_descriptors) {
+							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
+							    !EquivalentValue(m_program, previous.key, plan.key))
+								Fail(flags.pc, "shared descriptor read has incompatible keys");
+						}
+						m_indirect_descriptors.push_back(std::move(plan));
 					}
-					m_indirect_descriptors.push_back(std::move(plan));
-				}
+				};
+				plan_handle(inst.Arg(0), inst.GetOpcode() == ValueOpcode::StoreBufferU32 ? 4u : 8u,
+				            memory.resource * 4u, false);
+				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
+				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u)
+					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
 			}
 		}
 	}
@@ -2227,7 +2245,20 @@ private:
 			return UINT32_MAX;
 		}
 		m_info.samplers.push_back({source, pc});
-		return static_cast<uint32_t>(m_info.samplers.size() - 1);
+		const auto root = static_cast<uint32_t>(m_info.samplers.size() - 1);
+		const auto* descriptor = Source(source);
+		if (descriptor != nullptr && descriptor->indirect_descriptor) {
+			const auto& sources = descriptor->indirect_descriptor->sources;
+			if (sources.empty()) Fail(pc, "finite sampler has no candidates");
+			std::vector<uint32_t> resources {root};
+			for (size_t i = 1; i < sources.size(); ++i) {
+				const auto candidate = AddSampler(sources[i], pc);
+				if (candidate == UINT32_MAX) return UINT32_MAX;
+				resources.push_back(candidate);
+			}
+			m_info.samplers[root].indirect_resources = std::move(resources);
+		}
+		return root;
 	}
 
 	void AddSampledPair(uint32_t image, uint32_t sampler, uint32_t pc) {
@@ -2387,8 +2418,15 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-			          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
+			const auto* selected_sampler = sampler_handle != nullptr
+			    ? FindIndirectDescriptor(*sampler_handle) : nullptr;
+			if (selected_sampler != nullptr) {
+				sampler_source = selected_sampler->source;
+			} else {
+				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");

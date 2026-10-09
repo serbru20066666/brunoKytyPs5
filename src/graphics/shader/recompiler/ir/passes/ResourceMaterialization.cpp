@@ -692,6 +692,10 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 			return false;
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+		for (const auto candidate: base.samplers[pair.sampler].indirect_resources) {
+			if (candidate >= base.samplers.size()) return false;
+			usage[candidate] |= usage[pair.sampler];
+		}
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -1506,7 +1510,14 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 	}
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+		auto source = program.info.samplers[i].source;
+		if (source >= program.descriptor_sources.size()) return false;
+		const auto& descriptor = program.descriptor_sources[source];
+		if (descriptor.indirect_descriptor) {
+			if (descriptor.indirect_descriptor->sources.empty()) return false;
+			source = descriptor.indirect_descriptor->sources[0];
+		}
+		if (!evaluate(source, snapshot.samplers[i])) {
 			return false;
 		}
 		if (program.info.samplers[i].gather_lod) {
@@ -1824,11 +1835,20 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
+	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
+		const auto& binding = sampler_plan.bindings[index];
+		for (auto& candidate: samplers[index].indirect_resources) {
+			candidate = sampler_plan.mapping[candidate][static_cast<uint32_t>(binding.type)];
+			EXIT_IF(candidate == UINT32_MAX);
+		}
+	}
 	for (auto& pair: sampled_pairs) {
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
 		pair.sampler = sampler_plan.mapping[pair.sampler][type];
 		EXIT_IF(pair.sampler == UINT32_MAX);
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
+		for (const auto candidate: samplers[pair.sampler].indirect_resources)
+			samplers[candidate].depth_compare |= images[pair.image].depth_compare;
 	}
 
 	auto& memory_info = program.memory_info;

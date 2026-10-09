@@ -2647,6 +2647,129 @@ void TestFiniteImagePhiCycle() {
   }
 }
 
+void TestFiniteInlineSampler() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto* entry = fixture.block;
+  auto* defined = fixture.AddBlock();
+  auto* merge = fixture.AddBlock();
+  entry->AddBranch(defined);
+  entry->AddBranch(merge);
+  defined->AddBranch(merge);
+  const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  entry->condition = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                      .true_block = defined, .false_block = merge};
+  defined->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+  merge->terminator.kind = CFG::TerminatorKind::Return;
+  fixture.block = merge;
+  auto& lod = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto& filter = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  lod.AddPhiOperand(entry, Value(0u));
+  lod.AddPhiOperand(defined, Value(0x00fff000u));
+  filter.AddPhiOperand(defined, Value(0x0a500000u));
+  filter.AddPhiOperand(entry, Value(0u));
+  const auto sampler = fixture.Sampler({Value(0u), Value(&lod), Value(&filter), Value(0u)});
+  const auto direct = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  const auto previous = fixture.Sampler(
+      {Value(0u), Value(0x00fff000u), Value(0x0a500000u), Value(0u)});
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  for (const auto format : {F::k32Float, F::k32SInt}) {
+    const auto image = fixture.Image({Value(0x1000u), Value(uint32_t(format) << 20u),
+        Value(0u), Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u)),
+        Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    if (format == F::k32Float)
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, previous, fixture.ImageAddress()},
+                   fixture.AddMemory(memory, 0x440u));
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x1dd0u));
+    if (format == F::k32Float)
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, direct, fixture.ImageAddress()},
+                   fixture.AddMemory(memory, 0x1dd8u));
+  }
+  fixture.PlanAndTrack();
+  const auto root = fixture.program.memory_info[1].sampler;
+  const auto source = fixture.program.info.samplers[root].source;
+  const auto& finite = fixture.program.descriptor_sources[source].indirect_descriptor;
+  Check(finite && finite->sources.size() == 2 && fixture.program.info.samplers.size() == 3,
+        "finite inline sampler lost either state or aliased the direct sampler");
+  const auto* key = sampler.Instruction()->Arg(0).Instruction();
+  Check(key->GetOpcode() == ValueOpcode::Phi && key->Parent() == merge &&
+            key->PhiBlock(0) == entry && key->PhiBlock(1) == defined &&
+            key->Arg(0).U32() == 0 && key->Arg(1).U32() == 1,
+        "inline sampler DWORD correlation did not preserve its GPU selector");
+  const auto plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.read_specialization_memory = ReadTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite inline sampler could not materialize literal choices");
+  const auto candidates = fixture.program.info.samplers[root].indirect_resources;
+  Check(candidates.size() == 2 && snapshot.samplers[candidates[0]].dwords[1] == 0 &&
+            snapshot.samplers[candidates[0]].dwords[2] == 0 &&
+            snapshot.samplers[candidates[1]].dwords[1] == 0x00fff000u &&
+            snapshot.samplers[candidates[1]].dwords[2] == 0x0a500000u,
+        "finite sampler materialization mixed the two correlated DWORD states");
+  Check(candidates[1] == fixture.program.memory_info[0].sampler && candidates[1] < root,
+        "finite sampler did not reuse the earlier constant candidate");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  for (const uint32_t operation : {1u, 3u}) {
+    const auto selected = fixture.program.memory_info[operation].sampler;
+    const auto& choices = fixture.program.info.samplers[selected].indirect_resources;
+    Check(choices.size() == 2, "sampler class specialization lost a finite candidate");
+    for (uint32_t ordinal = 0; ordinal < choices.size(); ++ordinal) {
+      const auto& choice = fixture.program.info.samplers[choices[ordinal]];
+      Check(choice.snapshot_index == candidates[ordinal] &&
+                choice.force_point_filtering == (operation == 3u) &&
+                choice.integer_border == (operation == 3u),
+            "finite sampler class remapping changed candidate identity or filtering");
+    }
+  }
+  Check(fixture.program.info.samplers[fixture.program.memory_info[2].sampler]
+            .indirect_resources.empty(),
+        "direct sampler was changed into a dynamic selection");
+  auto invalid = ExtractResourcePlan(fixture.program);
+  invalid.info.samplers[0].source = static_cast<uint32_t>(invalid.descriptor_sources.size());
+  Check(!MaterializeResources(invalid, runtime, snapshot, specialization),
+        "invalid sampler source bypassed materialization validation");
+
+  Fixture adjusted;
+  auto* initial = adjusted.block;
+  auto* alternate = adjusted.AddBlock();
+  auto* join = adjusted.AddBlock();
+  initial->AddBranch(alternate);
+  initial->AddBranch(join);
+  alternate->AddBranch(join);
+  initial->condition = adjusted.Emit(ValueOpcode::IEqual32,
+      {adjusted.Emit(ValueOpcode::LaneId), Value(0u)});
+  initial->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = alternate, .false_block = join};
+  alternate->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = join};
+  join->terminator.kind = CFG::TerminatorKind::Return;
+  auto& selected = join->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  selected.AddPhiOperand(initial, Value(0u));
+  selected.AddPhiOperand(alternate, Value(0x00fff000u));
+  adjusted.block = join;
+  const auto shared = adjusted.Sampler({Value(0u), Value(&selected), Value(0u), Value(0u)});
+  const auto image = adjusted.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)});
+  for (const uint32_t flags : {0u, uint32_t(Decoder::ImageSampleFlagAdjust)}) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    memory.image_sample_flags = flags;
+    adjusted.Emit(ValueOpcode::ImageSampleRaw, {image, shared, adjusted.ImageAddress()},
+                  adjusted.AddMemory(memory, 0x1dd0u));
+  }
+  CheckFatal([&] { adjusted.PlanAndTrack(); }, "not a valid runtime value",
+             "finite sampler planning accepted a shared SampleAdjust handle");
+}
+
 void TestFiniteImageBitScanSentinel() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   for (const bool nonzero : {false, true}) {
@@ -3607,6 +3730,7 @@ int main() {
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
+    Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
