@@ -29634,32 +29634,29 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   return test;
 }
 
-TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
+TestCase BufferOffsetsUsePackedWords(bool storage) {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  for (u32 base : {0u, 4u}) {
-    AppendSMovLiteral(&code, base, 0x1000u + base * 0x1000u);
-    AppendSMovLiteral(&code, base + 1u, 4u << 16u);
-    AppendSMovLiteral(&code, base + 2u, 1u);
-    AppendSMovLiteral(&code, base + 3u, 1u << 24u);
-  }
-  AppendVMovLiteral(&code, 0, 0x12345678u);
-  code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
-  code.push_back(EncodeMubuf1(0, 0, 20));
-  AppendVMovLiteral(&code, 1, 0xabcdef01u);
-  code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
-  code.push_back(EncodeMubuf1(1, 1, 20));
-  AppendEnd(&code);
-
+  constexpr std::array offsets{0u, 12u, 20u, 28u, 36u};
   TestCase test;
-  test.name = "BufferOffsetsUsePackedLaneAndStorageFallback";
-  test.code = std::move(code);
-  test.initial = {0, 0, 0, 0};
-  test.expected = {0x12345678u, 0, 0, 0xabcdef01u};
+  test.name = storage ? "BufferOffsetsPackedWordsStorage" : "BufferOffsetsPackedWordsPush";
+  test.initial.resize(10);
+  test.expected = test.initial;
+  for (u32 i = 0; i < offsets.size(); ++i) {
+    const auto base = i * 4u;
+    AppendSMovLiteral(&test.code, base, 0x1000u + base * 0x1000u);
+    AppendSMovLiteral(&test.code, base + 1u, 4u << 16u);
+    AppendSMovLiteral(&test.code, base + 2u, 1u);
+    AppendSMovLiteral(&test.code, base + 3u, 1u << 24u);
+    const auto value = 0x12345678u + i;
+    AppendVMovLiteral(&test.code, i, value);
+    test.code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+    test.code.push_back(EncodeMubuf1(i, i, 20));
+    test.expected[offsets[i] / 4u] = value;
+  }
+  AppendEnd(&test.code);
   test.storage_buffer_range_bytes = 4;
-  test.storage_buffer_offsets = {0, 12};
-  test.expand_shader_data_storage = true;
+  test.storage_buffer_offsets.assign(offsets.begin(), offsets.end());
+  test.expand_shader_data_storage = storage;
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -37802,7 +37799,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
-  AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
+  cases.push_back(BufferOffsetsUsePackedWords(false));
+  cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
@@ -43788,7 +43786,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     CheckResourcePlanHandoff();
     VulkanHarness vulkan;
-    RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    RunCase(&vulkan, BufferOffsetsUsePackedWords(false));
+    RunCase(&vulkan, BufferOffsetsUsePackedWords(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {

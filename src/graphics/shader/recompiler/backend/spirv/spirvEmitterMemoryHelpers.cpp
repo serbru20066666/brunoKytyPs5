@@ -106,13 +106,13 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 
 void EmitMemoryOffsets(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
-	for (uint32_t i = 0; i < count; i++) {
+	for (uint32_t i = 0; i < count; i += 4u) {
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
-		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
-		state.memory_byte_offsets[i] = EmitBinaryU32(
-		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
-		    ConstantU32(state, 0xffu));
+		for (uint32_t lane = 0; lane < std::min(4u, count - i); ++lane) {
+			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
+		}
 	}
 }
 
