@@ -468,6 +468,7 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	Decoder::DecodeInstruction(joined_code, front_words - 1u, result.instructions.back());
 	Decoder::Program back_program;
 	Decoder::DecodeProgram(back, back_program);
+	result.has_swap_pc |= back_program.has_swap_pc;
 	const auto back_pc = front_words * sizeof(uint32_t);
 	for (auto& inst: back_program.instructions) {
 		// A back-stage PC-relative data reference requires its guest code address.
@@ -487,7 +488,6 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		EXIT_NOT_IMPLEMENTED(source.call.has_value() || options.stage != ShaderType::Compute);
 		source.call = ShaderSource::Call {.instruction = i};
 	}
-	if (!source.call) return;
 	EXIT_IF(options.input_info.compute == nullptr);
 	const auto& call = source.decoded.instructions[source.call->instruction];
 	EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
@@ -603,8 +603,8 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 	}
-	PrepareCallTarget(source, options);
-	if (source.call) {
+	if (source.decoded.has_swap_pc) {
+		PrepareCallTarget(source, options);
 		source.code.assign(code.begin(), code.end());
 		source.decoded.code = source.code;
 	}
@@ -614,7 +614,6 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
 	auto& reads = source.reads;
 	reads.clear();
-	if (!source.call) return source.decoded;
 	IR::SrtReadCapture capture(runtime, reads);
 	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
 	IR::SrtWalker walker(source.call_targets, clean);
@@ -707,12 +706,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
 	EXIT_IF(decoded.instructions.empty());
-	bool has_call = false;
-	for (const auto& inst: decoded.instructions) {
-		if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
-		has_call = true;
-		if (inst.branch_target == UINT32_MAX)
-			EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
+	if (decoded.has_swap_pc) {
+		for (const auto& inst: decoded.instructions) {
+			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
+				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
+		}
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
 	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
@@ -813,7 +811,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	if (has_call) {
+	if (decoded.has_swap_pc) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
 		for (const auto* block: ir.blocks)
 			for (const auto& inst: *block)

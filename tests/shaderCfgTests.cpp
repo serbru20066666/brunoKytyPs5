@@ -10389,6 +10389,17 @@ void TestMemoryFedScalarLeafCall() {
       0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
       0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
       0xbf8cc07fu, 0xbe8e210eu, 0xbf810000u};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.has_swap_pc, "decoded scalar call was not recorded");
+  const uint32_t literal[] = {EncodeSMovB32(0, 255), 0xbe8e210eu, EncodeSopp(0x01)};
+  Decoder::DecodeProgram(literal, decoded);
+  Check(!decoded.has_swap_pc && decoded.instructions.size() == 2,
+        "reused decoder retained a call or treated a literal as SWAPPC");
+  const uint32_t null_call[] = {EncodeSop1(0x21, 125, 14), EncodeSopp(0x01)};
+  Decoder::DecodeProgram(null_call, decoded);
+  Check(!decoded.has_swap_pc && decoded.instructions.front().opcode == Decoder::Opcode::S_SETPC_B64,
+        "NULL-destination SWAPPC was recorded as a call");
   struct Memory {
     std::array<uint32_t, 128> words{};
     uint64_t end = base + 0x10c;
@@ -10412,14 +10423,15 @@ void TestMemoryFedScalarLeafCall() {
   IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
   const auto options = MakeCompileOptions(ShaderType::Compute);
   auto source = PrepareShaderSource(shader, options);
-  Check(source.call && source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
+  Check(source.call && source.decoded.has_swap_pc &&
+            source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
               "unresolved SWAPPC silently fell through");
 #endif
   const auto& linked = RefreshShaderSource(source, runtime);
-  Check(source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
+  Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
             linked.instructions[source.call->instruction].branch_target == 0x44 &&
             source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x100, 12},
         "aliased call target, exact leaf range, or continuation was lost");
@@ -10519,6 +10531,9 @@ void TestMemoryFedScalarLeafCall() {
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
               "ambiguous reaching definitions were accepted for a call target");
+  const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
+              "call metadata bypassed the multiple-call rejection");
 #endif
 }
 
@@ -10564,7 +10579,10 @@ void TestFusedShaderHandoffPreservesRegisters() {
   options.back_code = back;
   for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
     front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
-    auto translated = TranslateProgram(front, options);
+    auto source = PrepareShaderSource(front, options);
+    Check(!source.decoded.has_swap_pc && !source.call,
+          "fused SETPC handoff entered scalar call preparation");
+    auto translated = TranslateProgram(source.decoded, options);
     uint32_t allocations = 0;
     for (const auto* block: translated.program.blocks) {
       for (const auto& inst: *block) {
@@ -10579,6 +10597,17 @@ void TestFusedShaderHandoffPreservesRegisters() {
     }
     Check(allocations == 1u, "fused shader omitted the back shader allocation");
   }
+  const uint32_t call_front[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x20, 0, 6)};
+  Check(Decoder::DecodeFrontProgram(call_front).has_swap_pc,
+        "front decoder omitted its scalar call");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal([&] { (void)PrepareShaderSource(call_front, options); },
+              "fused front call bypassed the non-compute rejection");
+  const uint32_t call_back[] = {EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  options.back_code = call_back;
+  ExpectFatal([&] { (void)PrepareShaderSource(front, options); },
+              "fused back call metadata was not propagated");
+#endif
 }
 
 void TestMeshExportStorage() {
