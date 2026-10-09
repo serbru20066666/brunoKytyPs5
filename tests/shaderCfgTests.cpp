@@ -13831,6 +13831,59 @@ void TestUniformSelectedDescriptorLoadAddress() {
   }
 }
 
+void TestNativeScalarAtomicPayloadStaysOnGpu() {
+  using namespace ShaderRecompiler::IR;
+  // Exact final block from SAROS b62b494cb2567011: read a mutable flag,
+  // atomically update that address, then test the loaded flag before S_TRAP.
+  const uint32_t shader[] = {
+      0x7e0002ffu, 0x00100000u, 0x7e020280u, 0xf4040100u,
+      0xfa000018u, 0xbf8cc07fu, 0x8801ff05u, 0x01000000u,
+      0xbe800304u, 0xbe820381u, 0xbe8303ffu, 0x00016204u,
+      0xf4001a82u, 0xfa000018u, 0xe1680018u, 0x80000000u,
+      0xbf8cc07fu, 0xbf0d846au, 0xbf840001u, 0xbf920001u,
+      0xbf810000u,
+  };
+  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto &program = translated.program;
+  const Inst *payload = nullptr;
+  for (const auto *block : program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+          program.memory_info[inst.Flags<MemoryFlags>().index].kind == ResourceKind::ScalarAddress)
+        payload = &inst;
+    }
+  }
+  Check(payload != nullptr && payload->Parent() != nullptr &&
+            !program.memory_info[payload->Flags<MemoryFlags>().index].planning_only &&
+            program.info.uses_dma && program.info.buffers.size() == 1 &&
+            program.info.buffers[0].atomic,
+        "native scalar payload was replaced by a host snapshot before its atomic write");
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_reads.size() == 2 && plan.control_flow.empty() &&
+            !plan.capture_specialization_reads,
+        "terminal native shader assertion entered resource planning");
+  struct Reads { uint32_t descriptors = 0; uint32_t payload = 0; } reads;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &reads = *static_cast<Reads *>(data);
+    if (address == 0x2018u) { ++reads.payload; return false; }
+    if (words.size() != 1 || (address != 0x1018u && address != 0x101cu)) return false;
+    ++reads.descriptors;
+    words[0] = address == 0x1018u ? 0x2000u : 0u;
+    return true;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
+                           .userdata = &reads, .read_specialization_memory = read};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.descriptors == 2 && reads.payload == 0 &&
+            snapshot.specialization_reads.empty() && snapshot.buffers[0].dwords[0] == 0x2000u,
+        "native resource materialization read the mutable flag or lost its atomic descriptor");
+}
+
 void TestTypedDescriptorRealCarryAndScalarLoads() {
   const uint32_t carry_shader[] = {
       EncodeSop1(0x1f, 0, 0),      // s_getpc_b64 s[0:1]
@@ -15304,6 +15357,7 @@ int main() {
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
+  TestNativeScalarAtomicPayloadStaysOnGpu();
   TestImmutableDescriptorPredicate();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();

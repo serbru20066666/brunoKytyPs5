@@ -436,7 +436,7 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
-void TestWrittenDescriptorPredicateReads(bool memory_condition) {
+void TestWrittenDescriptorPredicateReads(bool memory_condition, bool loop) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -468,12 +468,26 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
   program.blocks[0]->terminator.true_block = program.blocks[1];
   program.blocks[0]->terminator.false_block = program.blocks[2];
+
   program.blocks[1]->id = 1;
   program.blocks[1]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
   program.blocks[2]->id = 2;
   program.blocks[2]->terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  if (loop) {
+    // The predicate reaches the store through a continue block, then loops back.
+    auto &continued = AddValueBlock(program);
+    program.blocks[0]->terminator.true_block = &continued;
+    continued.terminator.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    continued.terminator.true_block = &store_block;
+    continued.AddBranch(&store_block);
+    store_block.terminator.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    store_block.terminator.true_block = &block;
+    store_block.AddBranch(&block);
+  }
+  block.AddBranch(program.blocks[0]->terminator.true_block);
+  block.AddBranch(program.blocks[2]);
   program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
   auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
       {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
@@ -1021,7 +1035,8 @@ int main() {
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
   for (const bool memory_condition : {false, true})
-    TestWrittenDescriptorPredicateReads(memory_condition);
+    for (const bool loop : {false, true})
+      TestWrittenDescriptorPredicateReads(memory_condition, loop);
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
