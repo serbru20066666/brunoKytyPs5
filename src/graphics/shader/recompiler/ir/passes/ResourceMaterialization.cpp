@@ -398,20 +398,22 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!indirect.selector_first.IsEmpty()) {
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
-			if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
-			    material.SwizzleEnabled() ||
-			    material.AddTid() || material.OutOfBounds() != 0u ||
-			    uint64_t {selector->offset} + 4u > material.Stride() ||
+			if (!DecodeBufferDescriptor(material_value, material) ||
 			    !clean.Evaluate(roots.SelectorFirst(source_index), first) ||
-			    !clean.Evaluate(roots.KeyCount(source_index), count) || count > MaxIndirectDescriptorProbes ||
-			    uint64_t {first} + count > material.NumRecords())
+			    !clean.Evaluate(roots.KeyCount(source_index), count) || count > MaxIndirectDescriptorProbes)
 				return false;
-			if (count != 0u && (uint64_t {first} + count - 1u) * material.Stride() +
-			                           selector->offset + 4u >
-			                       uint64_t {UINT32_MAX} + 1u)
+			// SMEM uses its instruction's byte stride; V# stride only supplies its bounds.
+			const auto step = selector->stride != 0u ? selector->stride : material.Stride();
+			if (selector->stride == 0u &&
+			    (material.Type() != 0u || material.SwizzleEnabled() || material.AddTid() ||
+			     material.OutOfBounds() != 0u || uint64_t {selector->offset} + 4u > step ||
+			     uint64_t {first} + count > material.NumRecords())) return false;
+			const auto end = count != 0u
+			    ? (uint64_t {first} + count - 1u) * step + selector->offset + 4u : 0u;
+			if (end > uint64_t {UINT32_MAX} + 1u || end > material.GetSize())
 				return false;
-			if (!read_keys(material, uint64_t {first} * material.Stride() + selector->offset,
-			               material.Stride(), count)) return false;
+			if (!read_keys(material, uint64_t {first} * step + selector->offset, step, count))
+				return false;
 		} else if (!indirect.selector_mask.IsEmpty()) {
 			uint32_t mask = 0;
 			uint32_t count = 0;

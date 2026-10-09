@@ -13884,6 +13884,156 @@ void TestNativeScalarAtomicPayloadStaysOnGpu() {
         "native resource materialization read the mutable flag or lost its atomic descriptor");
 }
 
+void TestBoundedScalarMaterialImageKeys() {
+  using namespace ShaderRecompiler::IR;
+  // SAROS 9fba2edffc549531: min(header count,64), scalar rows of 160 bytes,
+  // and separate float/uint image fields at 0x7c/0x94 in the same image heap.
+  std::vector<uint32_t> shader {
+      0xf4080106u, 0xfa0000a0u, 0xf4080806u, 0xfa0000b0u,
+      0xbf8cc07fu, 0xf4201550u, 0xfa000024u, 0xbf8cc07fu,
+      EncodeSop2(0x07, 85, 85, 0xc0), EncodeSMovB32(86, 128),
+      EncodeSMovB32(87, 126),
+  };
+  const auto loop = shader.size();
+  shader.insert(shader.end(), {0x7da2aaf9u, 0x86860056u, EncodeSopp(0x08),
+      0x931cff56u, 0x000000a0u, 0xf42006c2u, 0x38000094u,
+      0xf4200682u, 0x3800007cu, 0xbf8cc07fu, 0x8f58851bu, 0x8f3c851au,
+      0xf42c1304u, 0xb0000000u, 0xf42c0d04u, 0x78000000u, 0xbf8cc07fu,
+      0xf0000110u, 0x00130106u, 0xf0000110u, 0x000d0206u,
+      EncodeVop1(0x01, 3, 78), // Preserve a T# dimension word as native scalar payload.
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0),
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(2, 0, 0),
+      EncodeMubuf0(0x1c, 8, false), EncodeMubuf1(3, 0, 0),
+      EncodeSop2(0x02, 86, 86, 129), EncodeSMovB32(126, 87),
+      EncodeSopp(0x02)});
+  shader.back() = EncodeSopp(0x02, static_cast<uint16_t>(loop - shader.size()));
+  shader[loop + 2u] = EncodeSopp(0x08, shader.size() - loop - 3u);
+  shader.push_back(EncodeSopp(0x01));
+  std::array<uint32_t, 14> user_data{};
+  user_data[8] = 0x100000u;
+  user_data[9] = 32u << 16u;
+  user_data[10] = 198656u;
+  user_data[11] = 0x5204u;
+  user_data[12] = 0x1000u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  auto plan = ExtractResourcePlan(translated.program);
+  Check(plan.info.images.size() == 2 && plan.capture_specialization_reads,
+        "scalar material fields lost their distinct image roots or clean read capture");
+  for (const auto &image : plan.info.images) {
+    const auto &source = plan.descriptor_sources[image.source].indirect_descriptor;
+    Check(source && source->selector && source->selector->stride == 160u &&
+              (source->selector->offset == 0x7cu || source->selector->offset == 0x94u) &&
+              source->table_stride == 32u && !source->table_scalar &&
+              source->key_count.ResolveInstruction()->GetOpcode() == ValueOpcode::UMin32,
+          "scalar material image selection fell back to the whole heap");
+  }
+  Check(std::ranges::any_of(translated.program.blocks, [&](const auto *block) {
+    return std::ranges::any_of(*block, [&](const auto &inst) {
+      if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer) return false;
+      const auto &memory = translated.program.memory_info[inst.template Flags<MemoryFlags>().index];
+      return memory.component_count == 8u && memory.component_index == 2u &&
+             !memory.planning_only && inst.HasUses();
+    });
+  }), "scalar material projection removed a live T# dimension payload");
+  struct Memory {
+    uint32_t count = 2;
+    uint32_t stride = 160;
+    uint32_t records = 409;
+    uint64_t unavailable = 0;
+    bool clean = true;
+    bool mixed = false;
+    bool same_key = false;
+    uint32_t keys = 0;
+    uint32_t images = 0;
+  } memory;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &m = *static_cast<Memory *>(data);
+    if (!m.clean || address == m.unavailable) return false;
+    if (words.size() == 1 && address >= 0x10a0u && address < 0x10c0u) {
+      const uint32_t descriptors[] = {0x2000u, m.stride << 16u, m.records, 0x5204u,
+                                     0x4000u, 16u << 16u, 8u, 0x4dfacu};
+      words[0] = descriptors[(address - 0x10a0u) / 4u];
+      return true;
+    }
+    if (address == 0x4024u && words.size() == 1) { words[0] = m.count; return true; }
+    for (const uint32_t row : {0u, 1u}) {
+      for (const uint32_t field : {0x7cu, 0x94u}) {
+        if (address != 0x2000u + row * 160u + field || words.size() != 1) continue;
+        ++m.keys;
+        words[0] = (row == 0 || m.same_key ? 5582u : 5567u) + (field == 0x94u ? 6u : 0u);
+        return true;
+      }
+    }
+    for (const uint32_t key : {5567u, 5582u, 5573u, 5588u}) {
+      if (address != 0x100000u + key * 32u || words.size() != 8) continue;
+      ++m.images;
+      std::ranges::fill(words, 0u);
+      words[0] = key;
+      const bool integer = key == 5573u || key == 5588u;
+      words[1] = static_cast<uint32_t>(integer && !(m.mixed && key == 5573u)
+          ? Prospero::BufferFormat::k32UInt : Prospero::BufferFormat::k32Float) << 20u;
+      words[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor3D) << 28u);
+      return true;
+    }
+    return false;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = read};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t stride : {160u, 16u}) {
+    memory = {.stride = stride, .records = stride == 160u ? 409u : 20u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.keys == 4 && memory.images == 4 && snapshot.images.size() == 4,
+          "scalar material selection used V# stride as its instruction stride or scanned unused keys");
+    for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
+      const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
+      const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
+      const auto offset = specialization.images[root].indirect_mapping_offset;
+      Check(snapshot.flattened_srt[offset] == 2u &&
+                snapshot.flattened_srt[offset + 1u] == first &&
+                snapshot.flattened_srt[offset + 3u] == first + 15u,
+            "scalar material image mapping changed descriptor-index keys into byte offsets");
+    }
+  }
+  for (const bool same_key : {false, true}) {
+    memory = {.count = same_key ? 2u : 1u, .same_key = same_key};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.keys == (same_key ? 4u : 2u) && memory.images == 2 &&
+              snapshot.images.size() == 2 &&
+              std::ranges::all_of(specialization.images, [](const auto &image) {
+                return image.indirect_root == ImageResource::NoIndirectImage;
+              }), "single-candidate scalar material loop retained an indirect image mapping");
+  }
+  memory = {.count = 0};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.keys == 0 && memory.images == 0 && snapshot.images.size() == 2,
+        "empty scalar material loop retained image probes");
+  memory = {.clean = false};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "dirty scalar material proof was accepted");
+  memory = {.unavailable = 0x2094u};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unavailable selected material key was accepted");
+  memory = {.stride = 1, .records = 311};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.keys == 0,
+        "scalar material byte range escaped V# bounds");
+  memory = {.mixed = true};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "selected material fields bypassed image compatibility");
+  memory = {};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "native scalar material image selection did not recover after rejected candidates");
+  ApplyResourceSpecialization(translated.program, specialization);
+  Check(translated.program.info.images.size() == 4 &&
+            translated.program.info.images[0].indirect_resources.size() == 2 &&
+            translated.program.info.images[1].indirect_resources.size() == 2,
+        "native image reads lost their distinct material field dispatches");
+}
+
 void TestTypedDescriptorRealCarryAndScalarLoads() {
   const uint32_t carry_shader[] = {
       EncodeSop1(0x1f, 0, 0),      // s_getpc_b64 s[0:1]
@@ -15358,6 +15508,7 @@ int main() {
   TestUniformSelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
   TestNativeScalarAtomicPayloadStaysOnGpu();
+  TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();

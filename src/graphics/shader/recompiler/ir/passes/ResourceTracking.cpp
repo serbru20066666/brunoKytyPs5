@@ -1469,7 +1469,18 @@ private:
 			const auto* step = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
 			if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u ||
 			    step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32 ||
-			    step->Parent() != phi->PhiBlock(initial ^ 1u)) continue;
+			    step->Parent() == nullptr) continue;
+			// Structurization can forward the native increment through a synthetic continue block.
+			const auto* incoming = phi->PhiBlock(initial ^ 1u);
+			const auto* next = phi->Parent();
+			for (size_t edges = 0; incoming != step->Parent() && edges < m_program.blocks.size(); ++edges) {
+				if (incoming == nullptr || incoming->terminator.kind != CFG::TerminatorKind::Branch ||
+				    incoming->terminator.true_block != next || incoming->ImmPredecessors().size() != 1u)
+					break;
+				next = incoming;
+				incoming = incoming->ImmPredecessors()[0];
+			}
+			if (incoming != step->Parent()) continue;
 			uint32_t increment = 0;
 			if ((step->Arg(0).Resolve() == key &&
 			     ImmediateU32(step->Arg(1), increment) && increment == 1u) ||
@@ -1505,6 +1516,30 @@ private:
 		return BoundedLoop(key, use, [&](const Inst& compare, uint32_t) {
 			return ValidateRuntimeValue(m_program, compare.Arg(1), RuntimeValueType::Integer);
 		});
+	}
+
+	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect,
+	                            DescriptorSource& material_source) {
+		const auto* read = key.Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer) return false;
+		uint32_t memory_index = 0;
+		const auto* memory = ScalarReadMemory(*read, memory_index);
+		Value index;
+		uint32_t offset = 0, stride = 0;
+		if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+		    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(memory_index, *read) ||
+		    !MatchTableOffset(read->Arg(1), index, offset, stride) ||
+		    ((offset | stride | memory->offset) & 3u) != 0u ||
+		    uint64_t {offset} + memory->offset > UINT32_MAX) return false;
+		const auto* bound = BoundedLoop(index, read->Parent());
+		if (bound == nullptr || bound->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    !MakeRuntimeTableSource(*read, material_source)) return false;
+		indirect.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead {
+		    .source = InternSource(material_source), .stride = stride,
+		    .offset = offset + memory->offset});
+		indirect.selector_first = Value(0u);
+		indirect.key_count = bound->Arg(1);
+		return true;
 	}
 
 	void FoldBoundedLoopSelectors() {
@@ -1742,6 +1777,10 @@ private:
 			}
 			if ((table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
+		} else if (!plan.table_indexed &&
+		           MatchScalarMaterialKey(key, indirect, material_source)) {
+			// The host enumerates the guarded scalar loop; its key and T# payload stay on the GPU.
+			plan.retain_reads = true;
 		} else {
 			// A bounded V# supplies the complete image table. Leave every GPU selector
 			// and descriptor read in the shader; the host only translates table bytes.
