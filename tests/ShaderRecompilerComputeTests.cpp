@@ -31840,6 +31840,42 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   return test;
 }
 
+TestCase FlatStoreSlcCaptured() {
+  TestCase test;
+  test.name = "FlatStoreSlcCaptured";
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x0b, 26, InlineU32(1))); // s26 = 0x80000000.
+  AppendVMovLiteral(&code, 12, 0x000c0008u); // Packed halfwords 8 and 12 select byte offset 8.
+  code.insert(code.end(), {0x260c18f9u, 0x0504060cu, // Unsigned minimum of the two halfwords.
+      0xd5590007u, 0x0431fe1au, 0x70000000u});
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  // Exercise an SLC store through v[6:7].
+  code.insert(code.end(), {0xdc720000u, 0x007d0306u});
+  AppendVMovLiteral(&code, 3, 0xdeadbeefu);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), {0xdc720000u, 0x007d0306u});
+  code.push_back(EncodeSop1(0x04, 126, 193)); // Restore EXEC before readback.
+  code.insert(code.end(), {0xd5590007u, 0x0431fe1au, 0x70000000u,
+      EncodeFlat0(0x0c, 0), EncodeFlat1(4, 0x7d, 0, 6)});
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(65, 0xa5a5a5a5u);
+  test.expected.assign(64, 0x12345678u);
+  test.expected.push_back(0xa5a5a5a5u);
+  test.opcodes = {ShaderOpcode::S_BREV_B32, ShaderOpcode::V_MIN_U32,
+      ShaderOpcode::V_MED3_U32, ShaderOpcode::V_MOV_B32, ShaderOpcode::FLAT_STORE_DWORD,
+      ShaderOpcode::S_MOV_B64, ShaderOpcode::FLAT_LOAD_DWORD,
+      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.compute_info.scratch_size_dwords = 4;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.decoded_counts = {{"slc=1", 2}};
+  test.forbidden_spirv = {"get_bda_pointer"};
+  return test;
+}
+
 TestCase FlatLoadVariants() {
   using O = ShaderOpcode;
 
@@ -37934,6 +37970,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(TBufferStoreVariants);
   cases.push_back(FlatLoadDlcCaptured(32));
   cases.push_back(FlatLoadDlcCaptured(64));
+  AddCase(FlatStoreSlcCaptured);
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   cases.push_back(GlobalLoadShortD16Captured(32));
@@ -43647,6 +43684,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, FlatStoreSlcCaptured());
     RunCase(&vulkan, FlatLoadDlcCaptured(32));
     RunCase(&vulkan, FlatLoadDlcCaptured(64));
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
