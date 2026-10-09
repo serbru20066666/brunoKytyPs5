@@ -501,10 +501,6 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32);
 
-uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
-
-uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
-
 inline constexpr auto EmitBitcastF32ToU32 = EmitNative<spv::OpBitcast, IR::Type::U32, uint32_t>;
 
 inline constexpr auto EmitBitcastU32ToF32 = EmitNative<spv::OpBitcast, IR::Type::F32, uint32_t>;

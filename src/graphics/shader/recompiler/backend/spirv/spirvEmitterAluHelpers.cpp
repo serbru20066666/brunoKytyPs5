@@ -82,24 +82,6 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	return EmitAndConstant(state, EmitSelectValueU32(state, exp_eq_255, special, finite2), 0xffffu);
 }
 
-uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto cond = state.builder.AllocateId();
-	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
-	                          cond, lhs, rhs);
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs);
-	return ret;
-}
-
-uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto cond = state.builder.AllocateId();
-	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpSGreaterThan : spv::OpSLessThan, TypeBool(state),
-	                          cond, lhs, rhs);
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs);
-	return ret;
-}
-
 // OpIsNan holds for every NaN encoding, signaling ones included, and is one comparison where the
 // exponent and mantissa tests took five instructions: the module preserves NaN
 // (SignedZeroInfNanPreserve), so the driver may not fold it away.
