@@ -534,7 +534,8 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		if (inserted) {
 			Block translated;
 			Frontend::Translator translator(query, &translated, 1u,
-			    (options.input_info.compute->float_mode & 0x10u) == 0u);
+			    (options.input_info.compute->float_mode & 0x10u) == 0u,
+			    !options.input_info.compute->async_compute);
 			translator.TranslateInstruction(source.decoded.instructions[index]);
 			for (const auto& inst: translated) {
 				uint32_t destination = UINT32_MAX;

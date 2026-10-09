@@ -5526,7 +5526,7 @@ public:
     for (const auto mode : {0x41u, 0x61u}) {
       for (const auto &groups : empty_dispatches) {
         context.GetRenderExecutor().DispatchDirect(
-            0, scheduler.Current(), groups[0], groups[1], groups[2], mode);
+            0, scheduler.Current(), groups[0], groups[1], groups[2], mode, false);
       }
     }
     Require(name, "HTile fixture",
@@ -10488,14 +10488,22 @@ public:
       for (u32 i = 0; i < 4; ++i)
         shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
       uint64_t original_id = 0;
-      struct Case { uint64_t address; u32 value; bool update; };
+      struct Case { uint64_t address; u32 value; bool update; u32 field = 0; };
       for (const auto test : {Case{first, 41, false}, Case{first, 41, false},
                               Case{second, 41, false}, Case{second, 73, true},
-                              Case{first, 41, false}}) {
+                              Case{first, 41, false}, Case{first, 6, false, 0x1818},
+                              Case{first, 0, false, 0x0a18}}) {
         Require(name, "refresh function pointer", context.InvalidateMemory(table + 0x20, 8),
                 "function table escaped mapped memory");
         const uint64_t target = test.address | 3u;
         LibKernel::Memory::WriteBacking(table + 0x20, &target, sizeof(target));
+        if (test.field != 0) {
+          Require(name, "refresh hardware-field leaf", context.InvalidateMemory(first, sizeof(leaf)),
+                  "hardware-field leaf escaped mapped memory");
+          const std::array field_leaf{0xb96a0000u | test.field,
+              EncodeSMovB32(20, 106), EncodeSop1(0x21, 125, 14)};
+          LibKernel::Memory::WriteBacking(first, field_leaf.data(), sizeof(field_leaf));
+        }
         if (test.update) {
           auto [buffer, offset] = cache.ObtainBuffer(test.address + 4, 4, true);
           buffer->Fill(offset, 4, test.value);
@@ -11191,7 +11199,7 @@ public:
           for (uint32_t i = 0; i < user_data.size(); i++) {
             shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
           }
-          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u);
+          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
         };
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
         fill_metadata(metadata_words);

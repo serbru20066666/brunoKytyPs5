@@ -49,9 +49,9 @@ const PsTap& DebugPsTap();
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs)
+	           bool flush_f32_inputs, bool graphics_compute)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs) {}
+	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void CountLoopHeat(uint32_t counter);
@@ -305,6 +305,7 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
+	bool            graphics_compute;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

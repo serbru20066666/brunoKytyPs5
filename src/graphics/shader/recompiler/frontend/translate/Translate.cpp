@@ -1508,7 +1508,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, flush_f32_inputs);
+		Translator translator(result, block, vector_limit, flush_f32_inputs,
+		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			for (uint32_t counter = 0; heat_active && counter < heat.pcs.size(); counter++) {

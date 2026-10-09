@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -10324,6 +10325,62 @@ void TestNewShaderRecompilerBranchConditionForms() {
   }
 }
 
+void TestGraphicsComputeGetreg() {
+  using namespace ShaderRecompiler;
+  for (const auto [word, expected] : {std::pair{0xb96a1818u, 6u}, std::pair{0xb96a0a18u, 0u}}) {
+    Decoder::Instruction decoded;
+    Decoder::DecodeInstruction(std::span(&word, 1), 0, decoded);
+    Check(decoded.opcode == Decoder::Opcode::S_GETREG_B32 &&
+              decoded.dst.kind == Decoder::OperandKind::VccLo &&
+              decoded.src0.value == (word & 0xffffu), "GETREG field or VCC destination decoded incorrectly");
+    for (const auto wave : {32u, 64u}) {
+      IR::Program program;
+      program.wave_size = wave;
+      IR::Block block;
+      Frontend::Translator translator(program, &block, 1, false, true);
+      translator.TranslateInstruction(decoded);
+      bool wrote_vcc = false;
+      for (const auto& inst : block) {
+        Check(inst.GetOpcode() != IR::ValueOpcode::SetScc, "GETREG changed SCC");
+        if (inst.GetOpcode() == IR::ValueOpcode::SetVccLo) {
+          Check(inst.Arg(0).IsImmediate() && inst.Arg(0).U32() == expected,
+                "graphics compute hardware field has the wrong value");
+          wrote_vcc = true;
+        }
+      }
+      Check(wrote_vcc, "GETREG did not write VCC_LO");
+    }
+  }
+  const uint32_t shader[] = {0xb96a1818u, EncodeSopp(0x01)};
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+  ShaderComputeInputInfo graphics{}, async{};
+  async.async_compute = true;
+  (void)PrepareProgram(regs, sh, graphics);
+  (void)PrepareProgram(regs, sh, async);
+  Check(!graphics.async_compute && async.async_compute &&
+            MakeStageStaticKey(graphics) != MakeStageStaticKey(async) &&
+            MakeStageStaticKey(graphics).size() == MakeStageStaticKey(async).size(),
+        "compute input reset or cache identity lost queue provenance");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &async;
+  ExpectFatal([&] { (void)TranslateProgram(shader, options); }, "async GETREG used graphics constants");
+  auto vertex = MakeCompileOptions(ShaderType::Vertex);
+  ExpectFatal([&] { (void)TranslateProgram(shader, vertex); }, "vertex GETREG used compute constants");
+  options.input_info.compute = &graphics;
+  const uint32_t unsupported[] = {0xb96af818u, EncodeSopp(0x01)};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(unsupported, decoded);
+  Check(decoded.instructions[0].src0.value == 0xf818u, "GETREG selector was sign extended");
+  ExpectFatal([&] { (void)TranslateProgram(unsupported, options); }, "unsupported GETREG field was accepted");
+#endif
+}
+
 void TestMemoryFedScalarLeafCall() {
   using namespace ShaderRecompiler;
   constexpr uint64_t base = 0xfe0040000ull;
@@ -15613,6 +15670,7 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();

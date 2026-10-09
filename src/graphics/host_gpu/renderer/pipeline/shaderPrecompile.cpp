@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderPrecompile {
 namespace {
 
 constexpr std::array<uint8_t, 8> Magic {'K', 'Y', 'T', 'Y', 'S', 'H', 'D', 'R'};
-constexpr uint32_t               FormatVersion  = 4; // 4: vertex buffer_index, pixel alpha_blend_source_remap.
+constexpr uint32_t               FormatVersion  = 5; // 5: compute async_compute.
 constexpr uint32_t               MaxCodeWords   = 256u * 1024u;
 constexpr uint32_t               MaxRecordBytes = 4u * 1024u * 1024u;
 constexpr uint64_t               MaxFileBytes   = 256u * 1024u * 1024u;
@@ -180,7 +180,7 @@ void Fields(Archive& a, ShaderComputeInputInfo& i) {
 	Fields(a, static_cast<ShaderWorkgroupInputInfo&>(i));
 	// Dispatch sizes are runtime-only; the module uses declared threads_num.
 	a(i.group_id, i.dispatch_thread_dimensions, i.thread_ids_num, i.workgroup_register,
-	  i.tg_size_en);
+	  i.tg_size_en, i.async_compute);
 }
 
 template <typename Archive>
