@@ -624,11 +624,11 @@ struct PipelineCache::ProgramCache {
 		} else {
 			Decoder::DecodeProgram(params.code, front);
 		}
-		bool result = front.has_bvh || stores(front);
+		bool result = stores(front);
 		if (!result && !params.back_code.empty()) {
 			Decoder::Program back;
 			Decoder::DecodeProgram(params.back_code, back);
-			result = back.has_bvh || stores(back);
+			result = stores(back);
 		}
 		stores_data.emplace(params.hash, result);
 		return result;
