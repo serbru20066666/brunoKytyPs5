@@ -26767,9 +26767,10 @@ TestCase VectorCompareInteger64Edges() {
     const auto lhs = pairs[i][0], rhs = pairs[i][1];
     const auto signed_lhs = std::bit_cast<int64_t>(lhs);
     const auto signed_rhs = std::bit_cast<int64_t>(rhs);
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 9>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 11>{{
              {0xa0, false}, {0xa1, signed_lhs < signed_rhs},
-             {0xa3, signed_lhs <= signed_rhs}, {0xa5, lhs != rhs}, {0xa7, true},
+             {0xa3, signed_lhs <= signed_rhs}, {0xa4, signed_lhs > signed_rhs},
+             {0xa5, lhs != rhs}, {0xa6, signed_lhs >= signed_rhs}, {0xa7, true},
              {0xe0, false}, {0xe3, lhs <= rhs}, {0xe6, lhs >= rhs}, {0xe7, true}}}) {
       test.code.push_back(EncodeVopc(opcode, Vgpr(1), 3));
       store_mask(106, value);
@@ -26777,17 +26778,40 @@ TestCase VectorCompareInteger64Edges() {
       store_mask(20, value);
     }
     // A negative literal expands by signedness, including equality comparisons.
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 5>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 7>{{
              {0xa1, -1 < signed_rhs}, {0xa3, -1 <= signed_rhs},
-             {0xa5, -1 != signed_rhs},
+             {0xa4, -1 > signed_rhs}, {0xa5, -1 != signed_rhs},
+             {0xa6, -1 >= signed_rhs},
              {0xa2, -1 == signed_rhs}, {0xe3, 0xffffffffull <= rhs}}}) {
       test.code.push_back(EncodeVopc(opcode, 255, 3));
       test.code.push_back(0xffffffffu);
       store_mask(106, value);
+      if (opcode == 0xa4 || opcode == 0xa6) {
+        test.code.push_back(EncodeSop1(0x04, 10, 126));
+        test.code.push_back(EncodeVopc(opcode + 0x10, 255, 3));
+        test.code.push_back(0xffffffffu);
+        test.code.push_back(EncodeSop1(0x04, 20, 126));
+        test.code.push_back(EncodeSop1(0x04, 126, 10));
+        store_mask(20, value);
+      }
     }
-    AppendVop3(&test.code, 0xa3, 20, Vgpr(1), 255);
-    test.code.push_back(0xffffffffu);
-    store_mask(20, signed_lhs <= -1);
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 3>{{
+             {0xa3, signed_lhs <= -1}, {0xa4, signed_lhs > -1},
+             {0xa6, signed_lhs >= -1}}}) {
+      for (const u32 source : {255u, 193u}) { // Literal and inline -1.
+        AppendVop3(&test.code, opcode, 20, Vgpr(1), source);
+        if (source == 255) test.code.push_back(0xffffffffu);
+        store_mask(20, value);
+        if (opcode == 0xa4 || opcode == 0xa6) {
+          test.code.push_back(EncodeSop1(0x04, 10, 126));
+          AppendVop3(&test.code, opcode + 0x10, 22, Vgpr(1), source);
+          if (source == 255) test.code.push_back(0xffffffffu);
+          test.code.push_back(EncodeSop1(0x04, 20, 126));
+          test.code.push_back(EncodeSop1(0x04, 126, 10));
+          store_mask(20, value);
+        }
+      }
+    }
     test.code.push_back(EncodeSop1(0x04, 10, 126));
     AppendVop3(&test.code, 0xb2, 126, 255, Vgpr(3)); // CMPX_EQ_I64 sign-extends -1.
     test.code.push_back(0xffffffffu);
@@ -26810,7 +26834,8 @@ TestCase VectorCompareInteger64Edges() {
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
                   O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_LE_I64, O::V_CMP_EQ_I64,
-                  O::V_CMP_NE_I64, O::V_CMP_T_I64, O::V_CMPX_EQ_I64,
+                  O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64,
+                  O::V_CMP_T_I64, O::V_CMPX_EQ_I64, O::V_CMPX_GT_I64, O::V_CMPX_GE_I64,
                   O::V_CMP_F_U64, O::V_CMP_LE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64,
                   O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSLessThan", "OpULessThanEqual", "OpUGreaterThanEqual"};
@@ -26835,13 +26860,16 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         {0xc000000000000000ull, 0xbff0000000000000ull},
         {0x7ff0000000000000ull, 0x7ff0000000000000ull},
         {0x3ff0000000000001ull, 0x3ff0000000000000ull}}}}};
-  struct Compare { u32 encoding; O opcode; u32 group; };
+  struct Compare { u32 encoding; O opcode; u32 group; bool update_exec{true}; };
   constexpr std::array comparisons{
       Compare{0x99, O::V_CMPX_LT_I16, 0}, Compare{0x9a, O::V_CMPX_EQ_I16, 0},
       Compare{0x9b, O::V_CMPX_LE_I16, 0}, Compare{0x9c, O::V_CMPX_GT_I16, 0},
       Compare{0x9d, O::V_CMPX_NE_I16, 0}, Compare{0x9e, O::V_CMPX_GE_I16, 0},
       Compare{0xb0, O::V_CMPX_F_I64, 1}, Compare{0xb1, O::V_CMPX_LT_I64, 1},
       Compare{0xb2, O::V_CMPX_EQ_I64, 1}, Compare{0xb3, O::V_CMPX_LE_I64, 1},
+      Compare{0xb4, O::V_CMPX_GT_I64, 1}, Compare{0xb6, O::V_CMPX_GE_I64, 1},
+      Compare{0xa4, O::V_CMP_GT_I64, 1, false},
+      Compare{0xa6, O::V_CMP_GE_I64, 1, false},
       Compare{0xb7, O::V_CMPX_T_I64, 1}, Compare{0xf0, O::V_CMPX_F_U64, 1},
       Compare{0xf1, O::V_CMPX_LT_U64, 1}, Compare{0xf2, O::V_CMPX_EQ_U64, 1},
       Compare{0xf3, O::V_CMPX_LE_U64, 1}, Compare{0xf4, O::V_CMPX_GT_U64, 1},
@@ -26867,10 +26895,6 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   test.expected = test.initial;
   auto& code = test.code;
   code.push_back(EncodeSop1(0x04, 10, 126));
-  AppendSMovLiteral(&code, 106, vcc_lo);
-  AppendSMovLiteral(&code, 107, vcc_hi);
-  AppendSMovLiteral(&code, 22, vcc_lo);
-  AppendSMovLiteral(&code, 23, vcc_hi);
   for (const auto compare : comparisons) {
     for (u32 word = 0; word < 4; ++word) {
       code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
@@ -26897,6 +26921,8 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         case 0xb1: result = std::bit_cast<int64_t>(pair[0]) < std::bit_cast<int64_t>(pair[1]); break;
         case 0xb2: case 0xf2: result = pair[0] == pair[1]; break;
         case 0xb3: result = std::bit_cast<int64_t>(pair[0]) <= std::bit_cast<int64_t>(pair[1]); break;
+        case 0xa4: case 0xb4: result = std::bit_cast<int64_t>(pair[0]) > std::bit_cast<int64_t>(pair[1]); break;
+        case 0xa6: case 0xb6: result = std::bit_cast<int64_t>(pair[0]) >= std::bit_cast<int64_t>(pair[1]); break;
         case 0x3f: case 0xb7: case 0xf7: result = true; break;
         case 0xf1: result = pair[0] < pair[1]; break;
         case 0xf3: result = pair[0] <= pair[1]; break;
@@ -26924,6 +26950,10 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
     expected_exec[0] &= low_exec;
     expected_exec[1] &= high_exec;
     for (const bool vop3 : {false, true}) {
+      AppendSMovLiteral(&code, 106, vcc_lo);
+      AppendSMovLiteral(&code, 107, vcc_hi);
+      AppendSMovLiteral(&code, 22, vcc_lo);
+      AppendSMovLiteral(&code, 23, vcc_hi);
       AppendSMovLiteral(&code, 126, low_exec);
       if (wave_size == 64) AppendSMovLiteral(&code, 127, high_exec);
       if (vop3) AppendVop3(&code, compare.encoding, 22, Vgpr(1), Vgpr(3));
@@ -26931,9 +26961,17 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
       code.push_back(EncodeSMovB32(20, 126));
       code.push_back(EncodeSMovB32(21, 127));
       code.push_back(EncodeSop1(0x04, 126, 10));
+      const bool vcc_dest = !compare.update_exec && !vop3;
+      const bool sgpr_dest = !compare.update_exec && vop3;
+      // Wave32 writes only the low half of VCC or the selected SGPR pair.
+      const u32 mask_hi = wave_size == 64 ? expected_exec[1] : vcc_hi;
       for (const auto [reg, value] : std::array<std::pair<u32, u32>, 6>{{
-               {20, expected_exec[0]}, {21, expected_exec[1]},
-               {106, vcc_lo}, {107, vcc_hi}, {22, vcc_lo}, {23, vcc_hi}}}) {
+               {20, compare.update_exec ? expected_exec[0] : low_exec},
+               {21, compare.update_exec ? expected_exec[1] : (wave_size == 64 ? high_exec : 0)},
+               {106, vcc_dest ? expected_exec[0] : vcc_lo},
+               {107, vcc_dest ? mask_hi : vcc_hi},
+               {22, sgpr_dest ? expected_exec[0] : vcc_lo},
+               {23, sgpr_dest ? mask_hi : vcc_hi}}}) {
         AppendStoreSgprAtLaneDwordOffset(&code, reg, 0, u32(test.expected.size()));
         test.expected.insert(test.expected.end(), wave_size, value);
       }
@@ -43963,11 +44001,19 @@ int main(int argc, char **argv) {
     vulkan.CheckNativeIndirectDispatch();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--integer64-compare-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--integer64-compare-only") == 0 ||
+                    std::strcmp(argv[1], "--cmp-i64-only") == 0)) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());
     RunCase(&vulkan, VectorCompareExecWaveMasks(32));
     RunCase(&vulkan, VectorCompareExecWaveMasks(64));
+    RunCase(&vulkan, VectorCompare64WaveMasks(32, true));
+    RunCase(&vulkan, VectorCompare64WaveMasks(64, true));
+    RunCase(&vulkan, VectorVop3CompareEqI64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareEqU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareGtU64OnGpu());
+    RunCase(&vulkan, VectorVopcCompareLtU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareNeU64OnGpu());
     RunCase(&vulkan, VectorVopcCmpxNeU64CapturedExecMask());
     RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
     return 0;
