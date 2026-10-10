@@ -1949,14 +1949,18 @@ void TestSopkCompareImmediateExtension() {
 
 void TestDisabledDebugBranches() {
   using namespace ShaderRecompiler;
-  // Both debug branches fall through when conditional shader debugging is disabled.
+  // Debug branches fall through when conditional shader debugging is disabled.
   // Retain the post-ENDPGM helper displacement from PPSA08709 and exercise the
   // OR_USER variant encountered in PPSA03671 with the same body.
-  for (const auto opcode : {Decoder::Opcode::S_CBRANCH_CDBGSYS,
-                            Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER}) {
+  const std::pair<uint32_t, Decoder::Opcode> branches[] = {
+      {0x17, Decoder::Opcode::S_CBRANCH_CDBGSYS},
+      {0x18, Decoder::Opcode::S_CBRANCH_CDBGUSER},
+      {0x19, Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER},
+      {0x1a, Decoder::Opcode::S_CBRANCH_CDBGSYS_AND_USER}};
+  for (const auto [encoding, opcode] : branches) {
     std::array<uint32_t, 274> shader;
     shader.fill(EncodeSopp(0x00));
-    shader[0] = EncodeSopp(opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS ? 0x17 : 0x19, 0x10f);
+    shader[0] = EncodeSopp(encoding, 0x10f);
     shader[1] = EncodeVop1(0x01, 1, 129);
     shader[2] = EncodeMubuf0(0x1c, 0, false);
     shader[3] = EncodeMubuf1(1, 0, 0);
@@ -1966,6 +1970,7 @@ void TestDisabledDebugBranches() {
     Decoder::Program decoded;
     Decoder::DecodeProgram(shader, decoded);
     Check(decoded.instructions.front().opcode == opcode &&
+              decoded.instructions.front().opcode_id == encoding &&
               decoded.instructions.front().branch_target == 0x440u &&
               decoded.instructions.back().pc == 0x43cu &&
               decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
