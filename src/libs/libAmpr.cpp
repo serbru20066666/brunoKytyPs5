@@ -1279,7 +1279,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		uint64_t bytes_read = 0;
 		auto     result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
 		                                      command.size, &bytes_read);
-		DebugAprRead(host_path, command.file_offset, command.size, command.destination,
+		DebugAprRead(Common::PathToString(host_path), command.file_offset, command.size, command.destination,
 		             bytes_read, result);
 		if (result != OK) {
 			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
