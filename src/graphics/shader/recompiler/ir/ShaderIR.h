@@ -633,8 +633,9 @@ struct CompiledResourcePlan {
 	// Per descriptor source dword: the flat SRT offset when the dword is exactly a slot that the
 	// ordinary walker reads (so its value is already in the refreshed flat buffer), else NoNode.
 	std::vector<std::array<uint32_t, 8>> descriptor_slots;
-	std::vector<uint32_t>                key_counts;     // Indirect images, per descriptor source.
-	std::vector<uint32_t>                selector_masks; // Indirect images, per descriptor source.
+	std::vector<uint32_t>                key_counts;      // Indirect images, per descriptor source.
+	std::vector<uint32_t>                selector_firsts; // Indirect images, per descriptor source.
+	std::vector<uint32_t>                selector_masks;  // Indirect images, per descriptor source.
 	std::vector<uint32_t>                conditions;     // Per control_flow block.
 	// Per control_flow block: the condition reads only flat SRT slots (besides user data, the
 	// shader base and pure operations). Every refresh reads those slots directly anyway, so the

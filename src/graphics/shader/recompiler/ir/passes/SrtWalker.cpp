@@ -1489,6 +1489,7 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 	compiled->clean_slots = program.clean_flat_slots;
 	compiled->descriptors.resize(program.descriptor_sources.size());
 	compiled->key_counts.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
+	compiled->selector_firsts.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
 	compiled->selector_masks.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
 	for (uint32_t source = 0; source < program.descriptor_sources.size(); source++) {
 		const auto& descriptor = program.descriptor_sources[source];
@@ -1497,10 +1498,12 @@ const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
 		for (uint32_t dword = 0; dword < descriptor.dword_count && dword < dwords.size(); dword++) {
 			dwords[dword] = compiler.Node(descriptor.dwords[dword]);
 		}
-		if (descriptor.indirect_image.has_value()) {
-			compiled->key_counts[source] = compiler.Node(descriptor.indirect_image->key_count);
+		if (descriptor.indirect_descriptor.has_value()) {
+			compiled->key_counts[source] = compiler.Node(descriptor.indirect_descriptor->key_count);
+			compiled->selector_firsts[source] =
+			    compiler.Node(descriptor.indirect_descriptor->selector_first);
 			compiled->selector_masks[source] =
-			    compiler.Node(descriptor.indirect_image->selector_mask);
+			    compiler.Node(descriptor.indirect_descriptor->selector_mask);
 		}
 	}
 	compiled->conditions.reserve(program.control_flow.size());

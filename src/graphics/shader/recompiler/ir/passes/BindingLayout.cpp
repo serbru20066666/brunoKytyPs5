@@ -62,12 +62,6 @@ bool UsesGds(const Program& program) {
 				BindingFail("typed shader contains invalid shared-memory metadata");
 			}
 			uses_gds |= kind == ResourceKind::Gds;
-			} else if (kind == ResourceKind::Buffer || kind == ResourceKind::ScalarBuffer) {
-				EXIT_IF(resource >= program.info.buffers.size());
-				live_buffers.at(resource) = true;
-				for (const auto child: program.info.buffers[resource].indirect_resources) {
-					live_buffers.at(child) = true;
-				}
 		}
 	}
 	return uses_gds;

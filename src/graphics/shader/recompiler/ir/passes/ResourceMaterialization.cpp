@@ -234,10 +234,13 @@ struct WalkerRoots {
 
 	Value Fill(uint32_t index) const { return program.uniform_fill.values[index]; }
 	Value KeyCount(uint32_t source) const {
-		return program.descriptor_sources[source].indirect_image->key_count;
+		return program.descriptor_sources[source].indirect_descriptor->key_count;
+	}
+	Value SelectorFirst(uint32_t source) const {
+		return program.descriptor_sources[source].indirect_descriptor->selector_first;
 	}
 	Value SelectorMask(uint32_t source) const {
-		return program.descriptor_sources[source].indirect_image->selector_mask;
+		return program.descriptor_sources[source].indirect_descriptor->selector_mask;
 	}
 };
 
@@ -247,6 +250,7 @@ struct CompiledRoots {
 
 	uint32_t Fill(uint32_t index) const { return compiled.fill[index]; }
 	uint32_t KeyCount(uint32_t source) const { return compiled.key_counts[source]; }
+	uint32_t SelectorFirst(uint32_t source) const { return compiled.selector_firsts[source]; }
 	uint32_t SelectorMask(uint32_t source) const { return compiled.selector_masks[source]; }
 };
 
@@ -263,11 +267,13 @@ bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
 	return true;
 }
 
-template <typename Specialization, typename Normalize>
+template <typename Roots, typename Specialization, typename Normalize>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
+                                   const Roots&                                roots,
+                                   uint32_t                                    source_index,
                                    const DescriptorSource::IndirectDescriptor& indirect,
                                    uint32_t resource_index, uint32_t dword_count,
-                                   const SrtRuntime& runtime, SrtWalker& clean,
+                                   const SrtRuntime& runtime, typename Roots::Walker& clean,
                                    ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
@@ -297,7 +303,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		if (indirect.material_source == UINT32_MAX) {
 			uint32_t key_count = 0;
-			const bool evaluated = clean.Evaluate(roots.KeyCount(source), key_count);
+			const bool evaluated = clean.Evaluate(roots.KeyCount(source_index), key_count);
 			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
 			if (table_value.dword_count != 2u || !evaluated ||
 			    key_count > MaxIndirectDescriptorProbes ||
@@ -314,8 +320,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    material.SwizzleEnabled() ||
 			    material.AddTid() || material.OutOfBounds() != 0u ||
 			    uint64_t {indirect.selector_offset} + 4u > material.Stride() ||
-			    !clean.Evaluate(indirect.selector_first, first) ||
-			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectDescriptorProbes ||
+			    !clean.Evaluate(roots.SelectorFirst(source_index), first) ||
+			    !clean.Evaluate(roots.KeyCount(source_index), count) || count > MaxIndirectDescriptorProbes ||
 			    uint64_t {first} + count > material.NumRecords())
 				return false;
 			if (count != 0u && (uint64_t {first} + count - 1u) * material.Stride() +
@@ -337,8 +343,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			uint32_t mask = 0;
 			uint32_t count = 0;
 			if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
-			    !clean.Evaluate(roots.SelectorMask(source), mask) ||
-			    !clean.Evaluate(roots.KeyCount(source), count) || count == 0u || count > 32u) {
+			    !clean.Evaluate(roots.SelectorMask(source_index), mask) ||
+			    !clean.Evaluate(roots.KeyCount(source_index), count) || count == 0u || count > 32u) {
 				return false;
 			}
 			if (count < 32u) mask &= (1u << count) - 1u;
@@ -1294,7 +1300,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
+					        program, roots, base.source, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
@@ -1353,7 +1359,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
+			        program, roots, image.source, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, ShaderInfo::MaxImages, [&](DescriptorValue& value) {
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128))
 					        value.dwords.fill(0u);
