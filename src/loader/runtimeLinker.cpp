@@ -967,6 +967,37 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
+	if (size >= 9) {
+		// A library built with the glibc stack protector (EA SPORTS FC 27 links one statically)
+		// keeps its canary at fs:[0x28]:
+		//   mov <reg>, qword ptr fs:[0x28]   on entry
+		//   xor <reg>, qword ptr fs:[0x28]   before returning
+		// There is no guest FS base here, so both read one constant instead, which keeps the
+		// check consistent: the same 9 bytes become <op> <reg>, imm32 and a 2-byte nop.
+		constexpr uint32_t canary    = 0x2b1e5ca0u; // positive as a sign-extended imm32
+		auto*              start_ptr = reinterpret_cast<uint8_t*>(address);
+		auto*              end_ptr   = start_ptr + size - 9;
+		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
+			if (ptr[0] != 0x64 || (ptr[1] != 0x48 && ptr[1] != 0x4c) ||
+			    (ptr[2] != 0x8b && ptr[2] != 0x33) || (ptr[3] & 0xc7u) != 0x04u || ptr[4] != 0x25 ||
+			    ptr[5] != 0x28 || ptr[6] != 0x00 || ptr[7] != 0x00 || ptr[8] != 0x00) {
+				continue;
+			}
+			LOGF("Patch fs:[0x28] canary read at addr: [%016" PRIx64 "]\n",
+			     reinterpret_cast<uint64_t>(ptr));
+			const bool    is_mov   = ptr[2] == 0x8b;
+			const uint8_t reg      = (ptr[3] >> 3u) & 7u;
+			const bool    extended = ptr[1] == 0x4c;
+			ptr[0]                 = extended ? 0x49 : 0x48;
+			ptr[1]                 = is_mov ? 0xc7 : 0x81;
+			ptr[2]                 = static_cast<uint8_t>((is_mov ? 0xc0u : 0xf0u) | reg);
+			std::memcpy(ptr + 3, &canary, sizeof(canary));
+			ptr[7] = 0x66;
+			ptr[8] = 0x90;
+			ptr += 8;
+		}
+	}
+
 	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
 	    size >= Jit::Call9::GetSize()) {
 		// Replace:
