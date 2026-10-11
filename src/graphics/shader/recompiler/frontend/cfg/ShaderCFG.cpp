@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <fmt/format.h>
 #include <iterator>
@@ -1006,6 +1007,7 @@ public:
 			return a.after != b.after ? a.after < b.after : a.body_size < b.body_size;
 		});
 		m_route_expressions.resize(labels.size(), UINT32_MAX);
+		m_case_base.assign(source.blocks.size(), 0u);
 		for (const auto& block: source.blocks) {
 			auto* label = labels.at(block.id);
 			const auto end = std::next(label->position);
@@ -1031,8 +1033,28 @@ public:
 				add_goto(1, term.true_block);
 			} else if (term.kind == TerminatorKind::Return) {
 				Insert(m_root, end, Kind::Return);
+			} else if (term.kind == TerminatorKind::IndirectBranch) {
+				// A jump table: one goto per entry on "selector == its value", captured at the
+				// block like a branch condition, and the last entry as the default.
+				const bool  indexed = term.indirect_selector_code != UINT32_MAX;
+				const auto& values =
+				    indexed ? term.indirect_selector_values : term.indirect_target_pcs;
+				const auto& targets =
+				    indexed ? term.indirect_selector_targets : term.indirect_targets;
+				if (targets.empty() || values.size() != targets.size() ||
+				    block.id >= m_case_base.size()) {
+					Fail("indirect control flow requires dispatcher lowering");
+				} else {
+					m_case_base[block.id] = m_case_count;
+					for (size_t index = 0; index + 1u < targets.size(); index++) {
+						add_goto(Expression(ExprOp::Variable, CaseVariable(block.id, index)),
+						         targets[index]);
+					}
+					add_goto(1, targets.back());
+					m_case_count += static_cast<uint32_t>(targets.size() - 1u);
+				}
 			} else {
-				Fail("indirect control flow requires dispatcher lowering");
+				Fail("unknown control flow requires dispatcher lowering");
 			}
 			for (const auto& value: continues) {
 				if (value.after != block.id) continue;
@@ -1084,6 +1106,11 @@ private:
 	}
 	uint32_t CaptureVariable(uint32_t block) const {
 		return static_cast<uint32_t>(m_route_expressions.size()) + block;
+	}
+	// The variable of entry `index` of a jump-table block, after every capture variable.
+	uint32_t CaseVariable(uint32_t block, size_t index) const {
+		return static_cast<uint32_t>(m_route_expressions.size() + m_source.blocks.size()) +
+		       m_case_base[block] + static_cast<uint32_t>(index);
 	}
 	Node* New(Kind kind) {
 		m_nodes.emplace_back();
@@ -1327,7 +1354,9 @@ private:
 					const auto& previous = m_graph.blocks[current];
 					// Route assignments cannot observe guest writes; native predicates must stay at their original Code.
 					const bool captures_native = std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
-						return m_graph.expressions[assignment.expression].op == ExprOp::Native;
+						const auto op = m_graph.expressions[assignment.expression].op;
+						return op == ExprOp::Native || op == ExprOp::IndirectCase ||
+						       op == ExprOp::IndirectPcCase;
 					});
 					if (captures_native ||
 					    (previous.inst_begin != previous.inst_end && previous.inst_end != source.inst_begin)) {
@@ -1343,6 +1372,20 @@ private:
 					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
 						block.assignments.push_back({CaptureVariable(source.id),
 						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
+					}
+					if (source.terminator.kind == TerminatorKind::IndirectBranch) {
+						const auto& term    = source.terminator;
+						const bool  indexed = term.indirect_selector_code != UINT32_MAX;
+						const auto& values =
+						    indexed ? term.indirect_selector_values : term.indirect_target_pcs;
+						for (size_t index = 0; index + 1u < values.size(); index++) {
+							block.assignments.push_back(
+							    {CaseVariable(source.id, index),
+							     Expression(indexed ? ExprOp::IndirectCase : ExprOp::IndirectPcCase,
+							                values[index],
+							                indexed ? term.indirect_selector_code
+							                        : term.indirect_pc_sgpr)});
+						}
 					}
 					break;
 				}
@@ -1440,6 +1483,9 @@ private:
 	Node* m_root = nullptr;
 	std::vector<Node*> m_gotos;
 	std::vector<uint32_t> m_route_expressions;
+	// Per block, the first of its jump-table entry variables (see CaseVariable).
+	std::vector<uint32_t> m_case_base;
+	uint32_t              m_case_count = 0;
 	std::vector<uint32_t> m_order;
 };
 
@@ -1654,7 +1700,11 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	RecomputeAnalyses(graph);
 
-	if (indirect_setpc) {
+	// A jump table goes through the structurizer (one goto per entry). The dispatcher (a loop
+	// around a switch over every block) stays as its fallback and for KYTY_DEBUG_SETPC_DISPATCHER=1:
+	// AMD's driver took 10 s to build such a pipeline and lost the device drawing with it.
+	static const bool force_dispatcher = std::getenv("KYTY_DEBUG_SETPC_DISPATCHER") != nullptr;
+	if (indirect_setpc && force_dispatcher) {
 		graph.irreducible  = true;
 		graph.unsupported  = false;
 		graph.failure_kind = FailureKind::IrreducibleControlFlow;

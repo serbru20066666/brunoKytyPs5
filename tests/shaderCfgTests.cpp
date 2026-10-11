@@ -11398,21 +11398,20 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "S_SETPC_B64 jump table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.blocks.begin(), result.program.blocks.end(),
-      [](const auto *block) { return !block->terminator.cases.empty(); });
-  Check(jump != result.program.blocks.end() &&
-            (*jump)->ImmSuccessors().size() == 2,
-        "S_SETPC_B64 jump table did not retain both targets");
-  Check((*jump)->terminator.cases.size() == 2,
-        "S_SETPC_B64 jump table did not retain selector mapping");
+  // The fork structurizes a jump table (one goto per entry on its selector) instead of
+  // lowering the whole program to the dispatcher loop: no dispatcher, no OpSwitch, and both
+  // case bodies still there.
+  Check((result.ir_dump.find("mode=dispatcher") == std::string::npos),
+        "S_SETPC_B64 jump table fell back to the dispatcher");
+  Check(std::ranges::none_of(result.program.blocks, [](const auto *block) {
+          return !block->terminator.cases.empty();
+        }),
+        "structured S_SETPC_B64 jump table kept an indirect terminator");
   Check(
       (result.ir_dump.find("SLoadDword") == std::string::npos),
       "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "dispatcher SPIR-V lacks OpSwitch");
+  Check(!SpirvContainsOpcode(result.spirv, 251),
+        "structured jump table SPIR-V has an OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -11500,29 +11499,20 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "subtractive S_SETPC_B64 table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.blocks.begin(), result.program.blocks.end(),
-      [](const auto *block) { return !block->terminator.cases.empty(); });
-  Check(jump != result.program.blocks.end() &&
-            (*jump)->ImmSuccessors().size() == 2 &&
-            (*jump)->terminator.indexed &&
-            (*jump)->terminator.cases.size() == 3 &&
-            (*jump)->terminator.cases[0].value == 0u &&
-            (*jump)->terminator.cases[0].target->start_pc == 0x38u &&
-            (*jump)->terminator.cases[1].value == 4u &&
-            (*jump)->terminator.cases[1].target->start_pc == 0x40u &&
-            (*jump)->terminator.cases[2].value == 8u &&
-            (*jump)->terminator.cases[2].target->start_pc == 0x38u &&
-            std::ranges::none_of(
-                result.program.blocks,
-                [](const auto *block) { return block->start_pc == 0x04u; }),
-        "subtractive S_SETPC_B64 table targets or selector mapping changed");
+  // Structurized by the fork (see the jump-table test above): no dispatcher and no indirect
+  // terminator left; the skipped block at 0x04 stays out.
+  Check((result.ir_dump.find("mode=dispatcher") == std::string::npos),
+        "subtractive S_SETPC_B64 table fell back to the dispatcher");
+  Check(std::ranges::none_of(result.program.blocks,
+                             [](const auto *block) {
+                               return !block->terminator.cases.empty() ||
+                                      block->start_pc == 0x04u;
+                             }),
+        "subtractive S_SETPC_B64 table kept an indirect terminator or a dead block");
   Check((result.ir_dump.find("SLoadDword") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
+  Check(!SpirvContainsOpcode(result.spirv, 251),
+        "structured subtractive S_SETPC_B64 table has an OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

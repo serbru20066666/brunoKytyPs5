@@ -877,6 +877,11 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 			case CFG::ConditionExpression::Op::Native:
 				return native_condition(static_cast<CFG::BranchCondition>(value.lhs));
 			case CFG::ConditionExpression::Op::Not: return ir.LogicalNot(self(self, value.lhs));
+			case CFG::ConditionExpression::Op::IndirectCase:
+				return ir.IEqual(ReadScalarCode(value.rhs), IR::U32(IR::Value(value.lhs)));
+			case CFG::ConditionExpression::Op::IndirectPcCase:
+				return ir.IEqual(ir.GetScalarReg(static_cast<IR::ScalarReg>(value.rhs)),
+				                 IR::U32(IR::Value(value.lhs)));
 			case CFG::ConditionExpression::Op::Or:
 				return ir.LogicalOr(self(self, value.lhs), self(self, value.rhs));
 		}

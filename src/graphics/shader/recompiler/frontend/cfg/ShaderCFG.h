@@ -23,7 +23,9 @@ enum class BranchCondition {
 };
 
 struct ConditionExpression {
-	enum class Op { Constant, Variable, Native, Not, Or };
+	// IndirectCase / IndirectPcCase: the jump-table selector of the block (the scalar code or the
+	// pc register in rhs) equals lhs.
+	enum class Op { Constant, Variable, Native, Not, Or, IndirectCase, IndirectPcCase };
 	Op       op;
 	uint32_t lhs;
 	uint32_t rhs = UINT32_MAX;
