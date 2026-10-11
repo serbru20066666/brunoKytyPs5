@@ -1197,6 +1197,51 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	return OK;
 }
 
+// The buffers in order, at the file position, as one write each.
+int64_t KYTY_SYSV_ABI KernelWritev(int d, const KernelIovec* iov, int iovcnt) {
+	PRINT_NAME();
+
+	if (iov == nullptr && iovcnt != 0) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (iovcnt < 0 || iovcnt > 1024) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	int64_t total = 0;
+	for (int i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len == 0) {
+			continue;
+		}
+		const auto written = KernelWrite(d, iov[i].iov_base, iov[i].iov_len);
+		if (written < 0) {
+			return total != 0 ? total : written;
+		}
+		total += written;
+		if (static_cast<size_t>(written) != iov[i].iov_len) {
+			break;
+		}
+	}
+	return total;
+}
+
+int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	const int d = KernelOpen(path, 1 /* O_WRONLY */, 0);
+	if (d < 0) {
+		return d;
+	}
+	const int result = KernelFtruncate(d, length);
+	KernelClose(d);
+	return result;
+}
+
 int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	PRINT_NAME();
 
