@@ -434,6 +434,8 @@ void TestBoundedImageViewEligibility() {
     plan.descriptor_sources.push_back(source);
   }
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
+  // The fork keeps the plan's compiled form with it: a plan changed by hand compiles again.
+  plan.compiled.reset();
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
 }
@@ -2971,7 +2973,7 @@ void TestBoundedRelativeRegisterWrites() {
     const auto in_range = fixture.Emit(ValueOpcode::ULessThan32,
                                        {Value(&counter), Value(&bound)}, 0, header);
     fixture.program.blocks[1]->condition =
-        fixture.Emit(ValueOpcode::ConditionRef, {in_range},
+        fixture.Emit(ValueOpcode::ConditionRef, {in_range, in_range},
                      CFG::BranchCondition::VccNonZero, header);
     const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
@@ -3335,13 +3337,19 @@ void TestGuardedScalarDescriptorReads() {
       memory.data.words[0xb0 / 4] = 4u;
       ResourceSnapshot snapshot;
       ResourceSpecialization specialization;
+      uint32_t failed_reads = 0;
       if (!shared) {
         Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 0 &&
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "disabled feature speculatively dereferenced its null BVH table");
         memory.data.words[7] = 1;
-        Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
+        // The fork's compiled evaluation fails first (trying the slots as a run, then one by
+        // one), and a plan with nodes it does not support is then evaluated again by the
+        // reference walker: the failing refresh reads the null table more than once.
+        Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  memory.null_reads >= 1,
               "active feature accepted an unreadable BVH table");
+        failed_reads = memory.null_reads;
       }
       memory.data.words[0x40 / 4] = 0x1080u;
       memory.data.watched_address = 0x10a8u;
@@ -3356,7 +3364,8 @@ void TestGuardedScalarDescriptorReads() {
       if (!shared) {
         memory.data.words[7] = 0;
         memory.data.words[0x40 / 4] = 0;
-        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1 &&
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  memory.null_reads == failed_reads &&
                   std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
               "cached plan retained reads after the feature was disabled");
       }

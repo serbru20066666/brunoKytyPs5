@@ -2064,14 +2064,29 @@ bool SrtEvaluator::EvaluateInst(const ResourceNode& node, uint64_t& result) {
 			result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
 			         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
 			return true;
-		case NodeOp::LogicalAnd:
-			if (!binary()) return false;
-			result = (a != 0u) && (b != 0u);
+		// As SrtWalker: one operand that decides the result is enough, so a guard that is known
+		// to fail hides an operand that cannot be evaluated (a lane-varying predicate, a read
+		// through the null table of a disabled feature).
+		case NodeOp::LogicalAnd: {
+			const bool left = EvaluateWide(node.args[0], a);
+			if (left && a == 0u) {
+				result = 0u;
+				return true;
+			}
+			if (!EvaluateWide(node.args[1], b) || (b != 0u && !left)) return false;
+			result = b != 0u;
 			return true;
-		case NodeOp::LogicalOr:
-			if (!binary()) return false;
-			result = (a != 0u) || (b != 0u);
+		}
+		case NodeOp::LogicalOr: {
+			const bool left = EvaluateWide(node.args[0], a);
+			if (left && a != 0u) {
+				result = 1u;
+				return true;
+			}
+			if (!EvaluateWide(node.args[1], b) || (b == 0u && !left)) return false;
+			result = b != 0u;
 			return true;
+		}
 		case NodeOp::LogicalXor:
 			if (!binary()) return false;
 			result = (a != 0u) != (b != 0u);

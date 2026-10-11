@@ -1526,9 +1526,11 @@ bool MaterializeCompiled(const ResourcePlan& program, const SrtRuntime& runtime,
 	bool result        = false;
 	if (MaterializationAllowed(program, runtime, capture_reads)) {
 		const auto&  compiled = CompileResourcePlan(program);
-		// Read capture must see exact ranges.
+		// Strict reads only exist in plans that capture their reads. The capture sits above the
+		// block cache (see ObservedRuntime), so it records the exact ranges the evaluation asked
+		// for whether or not a block served them.
 		CleanBlockCache blocks(runtime);
-		const bool      use_blocks = runtime.specialization_block_reads && !capture_reads &&
+		const bool      use_blocks = runtime.specialization_block_reads &&
 		                        runtime.read_specialization_memory != nullptr;
 		const auto         clean_source = use_blocks ? blocks.Runtime() : runtime;
 		OrdinaryBlockCache ordinary(clean_source);

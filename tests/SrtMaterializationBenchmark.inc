@@ -105,8 +105,7 @@ TranslateJournalPlans(std::vector<ShaderPrecompile::PermutationRecord> &records)
       continue;
     }
     auto translated = TranslateProgram(record.code, options);
-    if (translated.skip_dispatch ||
-        !translated.program.resource_tracking_complete) {
+    if (!translated.program.resource_tracking_complete) {
       continue;
     }
     plans.push_back({.stage = record.stage,
@@ -145,9 +144,10 @@ SrtPlanShape AnalyzeSrtPlan(const ShaderRecompiler::IR::ResourcePlan &plan) {
     for (uint32_t i = 0; i < source.dword_count; ++i) {
       pending.push_back(source.dwords[i]);
     }
-    if (source.indirect_image) {
-      pending.push_back(source.indirect_image->key_count);
-      pending.push_back(source.indirect_image->selector_mask);
+    if (source.indirect_descriptor) {
+      pending.push_back(source.indirect_descriptor->key_count);
+      pending.push_back(source.indirect_descriptor->selector_first);
+      pending.push_back(source.indirect_descriptor->selector_mask);
     }
   }
   for (const auto &block : plan.control_flow) {
@@ -268,9 +268,6 @@ CompileJournalRecord(ShaderPrecompile::PermutationRecord &record,
       },
       record.info);
   auto translated = TranslateProgram(record.code, options);
-  if (translated.skip_dispatch) {
-    return std::nullopt;
-  }
   return CompileProgram(std::move(translated), options, record.specialization,
                         record.push_data_start_dword);
 }
@@ -581,12 +578,13 @@ void TimePipelineCompile(VulkanHarness &vulkan, const char *journal_path,
   const auto stage_flag =
       pixel ? vk::ShaderStageFlagBits::eFragment : vk::ShaderStageFlagBits::eCompute;
   std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
-  for (const auto &binding : compiled->program.bindings.descriptors) {
-    const auto count = NativeDescriptorCount(binding);
-    if (count != 0) {
+  const auto &descriptor_counts = compiled->program.bindings.descriptor_counts;
+  for (size_t index = 0; index < descriptor_counts.size(); index++) {
+    const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
+    if (descriptor_counts[index] != 0) {
       layout_bindings.push_back(
-          {ShaderRecompiler::IR::NativeBinding(record->stage, binding.kind),
-           NativeDescriptorType(binding.kind), count, stage_flag});
+          {ShaderRecompiler::IR::NativeBinding(record->stage, kind),
+           NativeDescriptorType(kind), descriptor_counts[index], stage_flag});
     }
   }
   vk::DescriptorSetLayoutCreateInfo layout_info{};
@@ -955,8 +953,11 @@ void RunSrtBenchmark(const char *journal_path, uint32_t profile_seconds = 0) {
     with_control_flow += !plan.control_flow.empty();
     with_fill += plan.uniform_fill.fill.words != 0;
     with_indirect += plan.requires_specialization_memory;
-    with_clean_slots += std::ranges::any_of(
-        plan.clean_flat_slots, [](uint8_t slot) { return slot != 0; });
+    with_clean_slots += std::ranges::any_of(plan.srt_reads, [](const auto &read) {
+      const auto *inst = read.value.ResolveInstruction();
+      return inst != nullptr &&
+             inst->template Flags<ShaderRecompiler::IR::SrtReadFlags>().clean != 0u;
+    });
     with_selects += shape.selects != 0;
     with_rfl += shape.read_first_lanes != 0;
     with_dynamic += shape.dynamic_reads != 0;
@@ -1345,8 +1346,7 @@ void RunJournalDisasm(const char *journal_path, std::span<char *const> hashes) {
                 record.wave_size, record.code.size());
     auto translated = TranslateProgram(record.code, options);
     std::printf("--- decoded\n%s", translated.decoded_dump.c_str());
-    if (translated.skip_dispatch ||
-        !translated.program.resource_tracking_complete ||
+    if (!translated.program.resource_tracking_complete ||
         translated.program.info.buffers.size() !=
             record.specialization.buffers.size() ||
         translated.program.info.images.size() >

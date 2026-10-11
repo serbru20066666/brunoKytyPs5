@@ -12530,7 +12530,11 @@ void TestWave32MaskProjection() {
             "mask projection accepted an arbitrary mask, lane or ballot half");
     }
     Check(raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == initial_mask.Resolve() &&
-              gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
+              // The fork's CollapseSelectChains gives a use nothing observes the select's true
+              // arm: either is the raw mask, not a projected lane predicate.
+              (gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve() ||
+               gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() ==
+                   combined_mask.Resolve()),
           "mask projection changed a raw scalar mask consumer");
     ResolveControlFlowIdentities(program);
     RemoveIdentities(program.blocks);

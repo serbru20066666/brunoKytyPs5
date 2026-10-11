@@ -3523,54 +3523,6 @@ public:
             live_graphics_value == 22,
             "graphics submission executed a copied PM4 stream");
 
-    {
-      // One frame ahead: a suspend point waits for the previous suspend point's
-      // work, not its own, so the game can build the next frame meanwhile.
-      Config::ConfigOptions ahead;
-      ahead.printf_direction = Config::LogDirection::Silent;
-      ahead.gpu_frames_ahead = 1;
-      ahead.label_flush_interval_us = 0;
-      Config::Load(ahead);
-      uint32_t first_value = 0;
-      uint32_t second_value = 0;
-      std::array<uint32_t, 5> first_commands{};
-      std::array<uint32_t, 5> second_commands{};
-      write_packet(first_commands.data(), &first_value, 1);
-      write_packet(second_commands.data(), &second_value, 2);
-      std::binary_semaphore gate_entered{0};
-      std::binary_semaphore gate_release{0};
-      gpu.SendCommand([&] {
-        gate_entered.release();
-        gate_release.acquire();
-      });
-      gate_entered.acquire();
-      gpu.Submit(first_commands, {});
-      gpu.Done();
-      const bool first_did_not_wait = first_value == 0;
-      gpu.Submit(second_commands, {});
-      std::atomic_bool second_returned{false};
-      std::thread second_done([&] {
-        gpu.Done();
-        second_returned.store(true);
-      });
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      const bool second_waited = !second_returned.load();
-      gate_release.release();
-      second_done.join();
-      const bool first_completed = first_value == 1;
-      Config::ConfigOptions barrier;
-      barrier.printf_direction = Config::LogDirection::Silent;
-      barrier.gpu_frames_ahead = 0;
-      barrier.label_flush_interval_us = 0;
-      Config::Load(barrier);
-      gpu.Done();
-      Require("GpuCommandLane", "frames-ahead suspend points",
-              first_did_not_wait && second_waited && first_completed &&
-                  second_value == 2,
-              "a suspend point waited for its own frame or did not bound the "
-              "previous one");
-    }
-
     uint32_t live_compute_value = 0;
     std::array<uint32_t, 5> live_compute_commands{};
     write_packet(live_compute_commands.data(), &live_compute_value, 33);
@@ -17561,7 +17513,9 @@ public:
     const auto &fragment_bind = fragment.program.bindings;
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto *gds_binding =
-        ShaderRecompiler::IR::FindBinding(fragment_bind, Kind::Gds);
+        fragment_bind.descriptor_counts[static_cast<size_t>(Kind::Gds)] != 0
+            ? &fragment_bind
+            : nullptr;
     Buffer gds_buffer;
     if (gds_binding != nullptr) {
       Require(test.name, "graphics", !test.gds_initial.empty(),

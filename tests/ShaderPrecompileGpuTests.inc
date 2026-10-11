@@ -110,7 +110,7 @@ void CheckShaderPrecompileGpu(VulkanHarness &vulkan) {
                                  const IR::ResourceSnapshot &resources) {
       shader.resources = resources;
       shader.packed_user_data.clear();
-      for (const auto reg : shader.program.bindings.user_data_registers) {
+      for (const auto reg : shader.program.info.user_data_registers) {
         shader.packed_user_data.push_back(
             resources.user_data.at(reg - shader.program.user_data_base));
       }

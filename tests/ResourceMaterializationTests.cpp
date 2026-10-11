@@ -502,6 +502,8 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
       }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The reads are counted: without the reference evaluation the test main turns on.
+  SetResourceMaterializationVerification(false);
   for (const bool clean : {false, true}) {
     reads = {.clean = clean};
     // A failed predicate explores both edges and the writable descriptor retries its clean read.
@@ -517,6 +519,7 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
                   : std::vector<std::pair<uint64_t, uint64_t>>{}),
           "writable descriptor lost its address or captured an immutable predicate");
   }
+  SetResourceMaterializationVerification(std::getenv("KYTY_TEST_REFERENCE_ONLY") == nullptr);
 }
 
 void TestFailedMaterializationRejectsStage() {
@@ -778,12 +781,11 @@ MemoPlan(MemoPlanExtra extra, bool condition) {
   if (condition) {
     // Slot 4 selects which of the two buffers is live.
     plan.control_flow.resize(3);
-    auto &read_const = plan.value_storage.emplace_back(ValueOpcode::ReadConst);
-    auto &srt_resource = plan.value_storage.emplace_back(ValueOpcode::GetSrtResource);
-    read_const.SetArg(0, Value(&srt_resource));
-    read_const.SetArg(1, Value(4u));
-    plan.control_flow[0].condition = Value(&read_const);
+    // The plan has no flat aliases: a value is the retained read itself.
+    plan.control_flow[0].condition = plan.srt_reads[4].value;
     plan.control_flow[0].successors = {1, 2};
+    // Only the slots that the blocks reached read are refreshed: the entry reads them all.
+    plan.control_flow[0].srt_reads = {0, 1, 2, 3, 4};
     plan.control_flow[1].sources = {0};
     plan.control_flow[2].sources = {1};
   }
@@ -820,9 +822,17 @@ struct MemoFixture {
 
 void TestCleanBlockReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  // The predicate reads slots 2 and 3 strictly; the branch condition on slot 4
-  // uses the direct value.
-  const auto plan = MemoPlan(MemoPlanExtra::MemoryPredicate, true);
+  // The predicate reads slots 2 and 3, marked here as the plan marks the reads a
+  // host decision depends on: they go through the strict reader. The branch
+  // condition on slot 4 uses the direct value.
+  auto plan = MemoPlan(MemoPlanExtra::MemoryPredicate, true);
+  for (const auto slot : {2u, 3u}) {
+    auto *read = const_cast<Inst *>(plan.srt_reads[slot].value.ResolveInstruction());
+    auto flags = read->Flags<SrtReadFlags>();
+    flags.clean = 1u;
+    read->SetFlags(flags);
+  }
+  plan.capture_specialization_reads = true;
   for (const auto offset : {0u, 0x30u}) {
     MemoFixture exact;
     MemoFixture blocks;
@@ -867,6 +877,9 @@ void TestDirectConditions() {
   auto dynamic_plan = MemoPlan(MemoPlanExtra::DynamicRead, true);
   dynamic_plan.control_flow[0].condition =
       dynamic_plan.descriptor_sources[2].dwords[0];
+  // As the plan of a program whose branch depends on memory: its reads are captured, and the
+  // conditions that are not direct go through the strict reader.
+  dynamic_plan.capture_specialization_reads = true;
   MemoFixture dynamic;
   dynamic.memory.reject_strict = true;
   Check(dynamic.Refresh(dynamic_plan), "strict-condition plan failed to refresh");
@@ -888,7 +901,7 @@ void TestDirectConditions() {
   MemoFixture inert;
   SetResourceMaterializationVerification(false);
   const bool refreshed = inert.Refresh(inert_plan);
-  SetResourceMaterializationVerification(true);
+  SetResourceMaterializationVerification(std::getenv("KYTY_TEST_REFERENCE_ONLY") == nullptr);
   ResourceSnapshot expected;
   ResourceSpecialization expected_specialization;
   const SrtRuntime reference_runtime{
@@ -974,9 +987,21 @@ void TestMemoTracksActiveSources() {
 
 void TestMemoRejectsUntrackedInputs() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // The first lane of a retained SRT read is that read (the plan drops the ReadFirstLane), so
+  // that plan depends on its slot alone and is memoizable.
+  {
+    const auto plan = MemoPlan(MemoPlanExtra::ReadFirstLane, false);
+    MemoFixture fixture;
+    Check(fixture.Refresh(plan) && CompileResourcePlan(plan).memoizable,
+          "the first lane of an SRT slot was not tracked as the slot");
+    const auto before = fixture.snapshot.buffers[2].dwords[0];
+    fixture.memory.words[3] ^= 0x20u;
+    Check(fixture.Refresh(plan) && !fixture.memo.reused &&
+              fixture.snapshot.buffers[2].dwords[0] != before,
+          "a first-lane slot change was hidden by the memo");
+  }
   for (const auto extra :
-       {MemoPlanExtra::DynamicRead, MemoPlanExtra::MemoryPredicate,
-        MemoPlanExtra::ReadFirstLane}) {
+       {MemoPlanExtra::DynamicRead, MemoPlanExtra::MemoryPredicate}) {
     const auto plan = MemoPlan(extra, false);
     MemoFixture fixture;
     Check(fixture.Refresh(plan), "untracked-input plan failed to refresh");
@@ -1013,7 +1038,7 @@ void DbgExit(int) { std::abort(); }
 int main() {
   // Every refresh below is also compared with the reference SrtWalker.
   Libs::Graphics::ShaderRecompiler::IR::SetResourceMaterializationVerification(
-      true);
+      std::getenv("KYTY_TEST_REFERENCE_ONLY") == nullptr);
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();
@@ -1023,7 +1048,11 @@ int main() {
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
+  // Counts its reads: without the reference evaluation.
+  Libs::Graphics::ShaderRecompiler::IR::SetResourceMaterializationVerification(false);
   TestFiniteImageRefreshReusesScalarReads();
+  Libs::Graphics::ShaderRecompiler::IR::SetResourceMaterializationVerification(
+      std::getenv("KYTY_TEST_REFERENCE_ONLY") == nullptr);
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestMemoTracksDescriptorInputs();
   TestMemoTracksActiveSources();
