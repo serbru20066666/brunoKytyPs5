@@ -472,7 +472,9 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 		return false;
 	}
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	// The load may put the offset in the selector's own register (S_LOAD_DWORD s17, s22, s17):
+	// the table load is not translated, so that register still holds the selector at the jump.
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}
@@ -1530,6 +1532,10 @@ Graph BuildGraph(const Decoder::Program& program) {
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
+				// The listing, for whoever has to teach ResolveSetpcTargets this form.
+				std::printf("unsupported dynamic S_SETPC_B64 at pc 0x%08x:%c%s%c", inst.pc, 10,
+				            Decoder::ProgramToString(program).c_str(), 10);
+				std::fflush(stdout);
 				ExitBuildFailure(
 				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
