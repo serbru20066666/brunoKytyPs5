@@ -107,15 +107,24 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 
 	auto&       state     = ctx.state;
 	const auto  guard     = state.loop_guard_variable;
-	const auto  loop_exit = [&](const IR::Block* target) {
+	// KYTY_DEBUG_LOOP_GUARD_LOOP=<n>: only the program's n-th loop is guarded.
+	static const int only_loop = std::getenv("KYTY_DEBUG_LOOP_GUARD_LOOP") != nullptr
+	                                 ? std::atoi(std::getenv("KYTY_DEBUG_LOOP_GUARD_LOOP"))
+	                                 : -1;
+	const auto loop_exit = [&](const IR::Block* target) {
+		int index = 0;
 		for (const auto* other: program.blocks) {
-			if (other->terminator.loop_header && other->terminator.merge_block == target) {
+			if (!other->terminator.loop_header) {
+				continue;
+			}
+			if (other->terminator.merge_block == target && (only_loop < 0 || index == only_loop)) {
 				return true;
 			}
+			index++;
 		}
 		return false;
 	};
-	if (guard != 0 && term.loop_header) {
+	if (guard != 0 && term.loop_header && loop_exit(term.merge_block)) {
 		const auto count = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, guard);
 		const auto next = state.builder.AllocateId();

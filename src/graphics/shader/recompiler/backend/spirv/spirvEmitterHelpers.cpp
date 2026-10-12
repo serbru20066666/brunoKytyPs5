@@ -167,9 +167,18 @@ uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot) {
 }
 
 uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
+	// KYTY_DEBUG_HELPER_LANES=1 (experiment, no measured effect): helper invocations do not
+	// count as launched.
+	uint32_t predicate = ConstantBool(state, true);
+	if (state.helper_invocation_variable != 0 && std::getenv("KYTY_DEBUG_HELPER_LANES") != nullptr) {
+		const auto helper = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), helper,
+		                          state.helper_invocation_variable);
+		predicate = EmitLogicalNotBool(state, helper);
+	}
 	const auto ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
 	const auto low      = state.builder.AllocateId();
 	const auto in_row   = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
 	const auto excluded = EmitBinaryU32(state, spv::OpShiftLeftLogical,
@@ -244,6 +253,43 @@ uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value,
 	if (!ShuffleByReduction(state) || (!word && !boolean) ||
 	    state.subgroup_local_invocation_id_variable == 0) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, result, scope, value, lane);
+		return result;
+	}
+	// KYTY_DEBUG_SHUFFLE_BALLOT=1: the lane's value from ballots alone, one per bit.
+	if (static const bool by_ballot = std::getenv("KYTY_DEBUG_SHUFFLE_BALLOT") != nullptr;
+	    by_ballot) {
+		const auto word_index =
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane, ConstantU32(state, 5));
+		const auto bit_index =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31));
+		const auto lane_bit = [&](uint32_t predicate) {
+			const auto ballot = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+			                          scope, predicate);
+			const auto ballot_word = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), ballot_word,
+			                          ballot, word_index);
+			return Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+			              Binary(state, spv::OpShiftRightLogical, TypeU32(state), ballot_word,
+			                     bit_index),
+			              ConstantU32(state, 1));
+		};
+		if (boolean) {
+			state.builder.AddFunction(spv::OpINotEqual, type, result, lane_bit(value),
+			                          ConstantU32(state, 0));
+			return result;
+		}
+		uint32_t built = ConstantU32(state, 0);
+		for (uint32_t bit = 0; bit < 32; bit++) {
+			const auto set = Binary(
+			    state, spv::OpINotEqual, TypeBool(state),
+			    Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, ConstantU32(state, 1u << bit)),
+			    ConstantU32(state, 0));
+			built = Binary(state, spv::OpBitwiseOr, TypeU32(state), built,
+			               Binary(state, spv::OpShiftLeftLogical, TypeU32(state), lane_bit(set),
+			                      ConstantU32(state, bit)));
+		}
+		state.builder.AddFunction(spv::OpCopyObject, type, result, built);
 		return result;
 	}
 	// The host's own invocation index: `lane` is one too (no guest half offset).

@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 
@@ -736,7 +737,19 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	auto       write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	// KYTY_DEBUG_DPP_SKIP=1 (experiment, no measured effect): with FI=0 and BC=0 a source lane
+	// switched off by EXEC leaves the destination lane unwritten instead of reading zero.
+	if (!flags.fetch_inactive && !flags.bound_control &&
+	    std::getenv("KYTY_DEBUG_DPP_SKIP") != nullptr) {
+		auto&      state         = ctx.state;
+		const auto target        = EmitDppTargetLane(state, flags);
+		const auto source_active =
+		    EmitBallotLaneActiveBool(state, ctx.Ballot(inst.Arg(2)), target.lane);
+		const auto both = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, write, source_active);
+		write = both;
+	}
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }

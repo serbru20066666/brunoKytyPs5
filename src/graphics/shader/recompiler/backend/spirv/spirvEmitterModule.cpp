@@ -583,7 +583,10 @@ void DefineInputs(EmitterState& state) {
 		}
 	}
 	if (const char* guard = std::getenv("KYTY_DEBUG_LOOP_GUARD");
-	    guard != nullptr) {
+	    guard != nullptr &&
+	    (std::getenv("KYTY_DEBUG_LOOP_GUARD_HASH") == nullptr ||
+	     std::strtoull(std::getenv("KYTY_DEBUG_LOOP_GUARD_HASH"), nullptr, 16) ==
+	         state.program.shader_hash)) {
 		state.loop_guard_limit    = static_cast<uint32_t>(std::strtoul(guard, nullptr, 10));
 		state.loop_guard_variable = DefineInterfaceVariable(state, TypeU32(state),
 		                                                    spv::StorageClassPrivate, "loop_guard");

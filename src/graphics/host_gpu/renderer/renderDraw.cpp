@@ -2466,6 +2466,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 				const auto address = static_cast<uint64_t>(value.dwords[0]) |
 				                     (static_cast<uint64_t>(value.dwords[1] & 0xfffu) << 32u);
+				// A buffer the GPU wrote is not readable until it is downloaded.
+				if (address != 0 && m_context.GetBufferCache().IsRegionGpuModified(address, 192)) {
+					m_context.GetBufferCache().ReadMemory(address, 192, false);
+					std::printf(" (downloaded)");
+				}
 				MEMORY_BASIC_INFORMATION memory {};
 				if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) !=
 				        0 &&
