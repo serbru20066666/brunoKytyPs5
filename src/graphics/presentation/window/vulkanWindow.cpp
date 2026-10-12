@@ -719,6 +719,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.inheritedConditionalRendering = VK_FALSE;
 		create_info.pNext                                   = &conditional_rendering;
 	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		device_fault.pNext            = const_cast<void*>(create_info.pNext);
+		device_fault.deviceFault      = VK_TRUE;
+		create_info.pNext             = &device_fault;
+		graphics.device_fault_enabled = true;
+	}
 	if (graphics.pipeline_library_enabled) {
 		pipeline_library.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext      = &pipeline_library;
@@ -1106,6 +1113,7 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
 		                             VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
 		                             VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {

@@ -37,6 +37,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	// VK_EXT_conditional_rendering: lets GPU-written DCC clear keys be applied without readback.
 	bool                               conditional_rendering_enabled         = false;
+	// VK_EXT_device_fault: a lost device can say why (see ReportDeviceFault).
+	bool                               device_fault_enabled                  = false;
 	// VK_EXT_graphics_pipeline_library: compile pipeline stages as libraries and link them.
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_library_fast_linking         = false;

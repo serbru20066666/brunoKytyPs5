@@ -105,6 +105,24 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 		}
 	};
 
+	auto&       state     = ctx.state;
+	const auto  guard     = state.loop_guard_variable;
+	const auto  loop_exit = [&](const IR::Block* target) {
+		for (const auto* other: program.blocks) {
+			if (other->terminator.loop_header && other->terminator.merge_block == target) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (guard != 0 && term.loop_header) {
+		const auto count = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, guard);
+		const auto next = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, count, ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, guard, next);
+	}
+
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch: {
 			const auto* target = term.true_block;
@@ -123,7 +141,25 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			if (guard != 0 && (loop_exit(true_block) || loop_exit(false_block))) {
+				const auto count = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, guard);
+				const auto spent = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), spent, count,
+				                          ConstantU32(state, state.loop_guard_limit));
+				const auto guarded = state.builder.AllocateId();
+				if (loop_exit(true_block)) {
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, condition,
+					                          spent);
+				} else {
+					const auto running = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), running, spent);
+					state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), guarded, condition,
+					                          running);
+				}
+				condition = guarded;
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -504,6 +540,10 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
+	if (ctx.state.loop_guard_variable != 0) {
+		ctx.state.builder.AddFunction(spv::OpStore, ctx.state.loop_guard_variable,
+		                              ConstantU32(ctx.state, 0));
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];

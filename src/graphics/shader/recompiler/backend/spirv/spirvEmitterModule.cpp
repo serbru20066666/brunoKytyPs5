@@ -582,6 +582,12 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
+	if (const char* guard = std::getenv("KYTY_DEBUG_LOOP_GUARD");
+	    guard != nullptr) {
+		state.loop_guard_limit    = static_cast<uint32_t>(std::strtoul(guard, nullptr, 10));
+		state.loop_guard_variable = DefineInterfaceVariable(state, TypeU32(state),
+		                                                    spv::StorageClassPrivate, "loop_guard");
+	}
 	if (state.program.info.subgroup_local_invocation_id || ShuffleByReduction(state)) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");

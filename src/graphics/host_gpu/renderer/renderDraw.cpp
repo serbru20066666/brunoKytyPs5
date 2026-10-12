@@ -2452,8 +2452,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		DrawLog::PrintStageKeys("vs", state.vertex_info[0].stage);
 		if (state.ps_active) {
 			DrawLog::PrintStageKeys("ps", state.ps_input_info.stage);
+			std::printf(" ps_inputs=%u:", state.ps_input_info.input_num);
+			for (uint32_t i = 0; i < state.ps_input_info.input_num; i++) {
+				std::printf(" %08x", state.ps_input_info.interpolator_settings[i]);
+			}
 		}
 		std::printf("\n");
+		if (state.vertex_info[0].stage) {
+			for (const auto& value: state.vertex_info[0].stage.resources->buffers) {
+				std::printf("draw-log vs buffer:");
+				for (uint32_t i = 0; i < value.dword_count; i++) {
+					std::printf(" %08x", value.dwords[i]);
+				}
+				const auto address = static_cast<uint64_t>(value.dwords[0]) |
+				                     (static_cast<uint64_t>(value.dwords[1] & 0xfffu) << 32u);
+				MEMORY_BASIC_INFORMATION memory {};
+				if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) !=
+				        0 &&
+				    memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+					std::printf(" @%" PRIx64 ":", address);
+					for (uint32_t i = 0; i < 48; i++) {
+						uint32_t word = 0;
+						std::memcpy(&word, reinterpret_cast<const void*>(address + i * 4u), 4);
+						std::printf(" %x", word);
+					}
+				}
+				std::printf(" state=%lx protect=%lx\n", memory.State, memory.Protect);
+			}
+		}
+		std::fflush(stdout);
 	}
 	if (DrawLog::StatsEnabled()) [[unlikely]] {
 		const auto* pixel  = state.ps_active ? state.ps_input_info.stage.program : nullptr;

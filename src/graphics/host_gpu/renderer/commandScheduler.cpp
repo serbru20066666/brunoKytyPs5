@@ -35,6 +35,45 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	std::fflush(stdout);
 }
 
+// What the driver knows about a lost device (VK_EXT_device_fault): its description, the memory
+// addresses involved and the vendor's own fault records.
+void ReportDeviceFault(GraphicContext& graphics) {
+	if (!graphics.device_fault_enabled) {
+		std::printf("device fault: VK_EXT_device_fault is not available\n");
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	if (graphics.device.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess) {
+		std::printf("device fault: no fault information\n");
+		return;
+	}
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	counts.vendorBinarySize = 0;
+	vk::DeviceFaultInfoEXT info {};
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendors.data();
+	const auto result  = graphics.device.getFaultInfoEXT(&counts, &info);
+	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+		std::printf("device fault: query failed: %s\n", vk::to_string(result).c_str());
+		return;
+	}
+	std::printf("device fault: %s (%u addresses, %u vendor records)\n", info.description.data(),
+	            counts.addressInfoCount, counts.vendorInfoCount);
+	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+		std::printf("device fault: address %s 0x%016" PRIx64 " precision 0x%" PRIx64 "\n",
+		            vk::to_string(addresses[i].addressType).c_str(),
+		            static_cast<uint64_t>(addresses[i].reportedAddress),
+		            static_cast<uint64_t>(addresses[i].addressPrecision));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+		std::printf("device fault: vendor \"%s\" code 0x%" PRIx64 " data 0x%" PRIx64 "\n",
+		            vendors[i].description.data(), static_cast<uint64_t>(vendors[i].vendorFaultCode),
+		            static_cast<uint64_t>(vendors[i].vendorFaultData));
+	}
+	std::fflush(stdout);
+}
+
 } // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
@@ -677,6 +716,9 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		ReportVulkanFatal("vkQueueSubmit", result, job.tick, job.debug_op, job.debug_submit,
 		                  job.debug_arg0, job.debug_arg1, job.debug_arg2, job.debug_arg3,
 		                  job.debug_arg4);
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceFault(graphics);
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }

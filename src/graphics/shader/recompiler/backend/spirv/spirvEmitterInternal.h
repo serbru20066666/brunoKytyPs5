@@ -142,6 +142,9 @@ struct EmitterState {
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	// KYTY_DEBUG_LOOP_GUARD=<n>: a private counter of loop iterations; loops exit past n.
+	uint32_t                   loop_guard_variable                   = 0;
+	uint32_t                   loop_guard_limit                      = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;

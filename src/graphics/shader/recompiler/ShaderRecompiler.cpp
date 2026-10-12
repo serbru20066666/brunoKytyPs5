@@ -17,6 +17,8 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
+#include <atomic>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -602,6 +604,16 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
+	}
+	// KYTY_DEBUG_LIST=<hash>: prints that program's decoded listing once.
+	if (static const char* wanted = std::getenv("KYTY_DEBUG_LIST");
+	    wanted != nullptr && std::strtoull(wanted, nullptr, 16) == options.shader_hash) {
+		static std::atomic_flag printed;
+		if (!printed.test_and_set()) {
+			std::printf("listing of %016llx:%c%s%c", static_cast<unsigned long long>(options.shader_hash),
+			            10, Decoder::ProgramToString(source.decoded).c_str(), 10);
+			std::fflush(stdout);
+		}
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTarget(source, options);
