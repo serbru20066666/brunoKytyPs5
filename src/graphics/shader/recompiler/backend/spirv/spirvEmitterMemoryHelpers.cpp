@@ -445,7 +445,9 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
-	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	// Guest atomics only order memory within their own wave. Wider scopes make AMD drivers emit
+	// s_barrier, which desynchronizes the workgroup when the atomic sits in divergent control flow.
+	const auto scope  = spv::ScopeSubgroup;
 	const auto memory = [&] {
 		switch (kind) {
 			case IR::ResourceKind::Lds:
