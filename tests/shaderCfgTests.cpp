@@ -1706,7 +1706,8 @@ void TestShaderStageBarriers() {
   Check(SpirvContainsOpcode(result.spirv, 224),
         "SPIR-V binary does not contain OpControlBarrier");
   Check(
-      std::find(result.spirv.begin(), result.spirv.end(), 264u) !=
+      // AcquireRelease | UniformMemory | WorkgroupMemory | ImageMemory.
+      std::find(result.spirv.begin(), result.spirv.end(), 0x948u) !=
           result.spirv.end(),
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
   CheckSpirvBinaryValidates(result.spirv);

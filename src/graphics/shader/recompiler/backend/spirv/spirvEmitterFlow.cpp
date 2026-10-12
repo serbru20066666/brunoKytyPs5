@@ -641,9 +641,15 @@ void EmitBarrier(EmitterState& state) {
 	const auto        memory_scope = tessellation   ? spv::ScopeInvocation
 	                                 : device_scope ? spv::ScopeDevice
 	                                                : spv::ScopeWorkgroup;
-	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
-	                        ? spv::MemorySemanticsUniformMemoryMask
-	                        : spv::MemorySemanticsWorkgroupMemoryMask;
+	// The barrier is where the guest's waves meet, so it is also where one wave must see what
+	// the others wrote to buffers and images: the barriers after atomics order memory within a
+	// subgroup only (see EmitAtomicMemoryBarrier). Without the buffer and image memory here the
+	// light lists of EA SPORTS FC 27 came out broken again (GPU timeout).
+	const auto memory = spv::MemorySemanticsUniformMemoryMask |
+	                    spv::MemorySemanticsImageMemoryMask |
+	                    (state.lds_storage_class == spv::StorageClassStorageBuffer
+	                         ? 0u
+	                         : spv::MemorySemanticsWorkgroupMemoryMask);
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
