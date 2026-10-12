@@ -119,6 +119,8 @@ int KYTY_SYSV_ABI HttpAddRequestHeader(int id, const char* name, const char* val
 int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg);
 int KYTY_SYSV_ABI HttpUnsetEpoll(int id);
 int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* post_data, size_t size);
+int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* error_num);
+int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int* error_num, uint32_t* detail);
 int KYTY_SYSV_ABI HttpAbortRequest(int request_id);
 int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxevents,
                                   int timeout);

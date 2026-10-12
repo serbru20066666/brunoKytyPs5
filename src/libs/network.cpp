@@ -3079,11 +3079,42 @@ int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* /*post_data*/, siz
 
 	EXIT_IF(g_net == nullptr);
 
-	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_TIMEOUT)) {
+	// The emulated console has no network (see NetCtlConnected): a request fails at once as
+	// unreachable, not as a timeout. EA SPORTS FC 27 takes a timeout for a server that does
+	// not answer and waits 30 s before its error; unreachable gives its offline notice at once.
+	constexpr int error = static_cast<int>(0x80431063u); // SCE_HTTP_ERROR_NETWORK
+	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), error)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
-	return HTTP_ERROR_TIMEOUT;
+	return error;
+}
+
+// The errno behind the last error of a request: the network is down (see NetCtlConnected).
+int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* error_num) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n", request_id);
+
+	if (error_num == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+	*error_num = 51; // ENETUNREACH
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int* error_num, uint32_t* detail) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %d\n", request_id);
+
+	if (error_num != nullptr) {
+		*error_num = 0;
+	}
+	if (detail != nullptr) {
+		*detail = 0;
+	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI HttpAbortRequest(int request_id) {

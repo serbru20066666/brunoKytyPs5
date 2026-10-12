@@ -724,6 +724,8 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
 	LIB_FUNC("EY28T2bkN7k", Http::HttpAddRequestHeader);
 	LIB_FUNC("1e2BNwI-XzE", Http::HttpSendRequest);
+	LIB_FUNC("0onIrKx9NIE", Http::HttpGetLastErrno);
+	LIB_FUNC("JBN6N-EY+3M", Http::HttpsGetSslError);
 	LIB_FUNC("hvG6GfBMXg8", Http::HttpAbortRequest);
 	LIB_FUNC("qISjDHrxONc", Http::HttpWaitRequest);
 	LIB_FUNC("0a2TBNfE3BU", Http::HttpGetStatusCode);
@@ -1808,6 +1810,24 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 }
 
 } // namespace LibNpEntitlementAccess
+
+namespace LibNpEntitlementAccessPft {
+
+LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
+
+// eDXKe9FndlE (name unknown): int f(uint32_t* status). EA SPORTS FC 27 polls it with the status
+// preset to 0 and accepts success with 0 or 1; it is left as the caller set it.
+static int KYTY_SYSV_ABI NpEntitlementAccessPftGetStatus(uint32_t* /*status*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
+LIB_DEFINE(InitNet_1_NpEntitlementAccessPft) {
+	LIB_FUNC("eDXKe9FndlE", LibNpEntitlementAccessPft::NpEntitlementAccessPftGetStatus);
+}
+
+} // namespace LibNpEntitlementAccessPft
 
 namespace LibNpAuth {
 
@@ -2980,6 +3000,7 @@ LIB_DEFINE(InitNet_1) {
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
+	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);
 	LibNpAuth::InitNet_1_NpAuth(s);
 	LibNpTrophy2::InitNet_1_NpTrophy2(s);
 	LibNpUniversalDataSystem::InitNet_1_NpUniversalDataSystem(s);
