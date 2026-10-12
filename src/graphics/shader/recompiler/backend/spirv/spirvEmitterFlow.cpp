@@ -641,11 +641,9 @@ void EmitBarrier(EmitterState& state) {
 	const auto        memory_scope = tessellation   ? spv::ScopeInvocation
 	                                 : device_scope ? spv::ScopeDevice
 	                                                : spv::ScopeWorkgroup;
-	const auto memory = spv::MemorySemanticsUniformMemoryMask |
-	                    spv::MemorySemanticsImageMemoryMask |
-	                    (state.lds_storage_class == spv::StorageClassStorageBuffer
-	                         ? 0u
-	                         : spv::MemorySemanticsWorkgroupMemoryMask);
+	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
+	                        ? spv::MemorySemanticsUniformMemoryMask
+	                        : spv::MemorySemanticsWorkgroupMemoryMask;
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
