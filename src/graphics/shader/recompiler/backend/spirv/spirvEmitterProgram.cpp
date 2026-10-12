@@ -83,6 +83,26 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	if (state.loop_guard_max_variable != 0 && state.gds_variable != 0) {
+		const std::pair<uint32_t, spv::Op> records[] {{2u, spv::OpAtomicUMax},
+		                                              {1u, spv::OpAtomicIAdd}};
+		for (const auto& [from_end, op]: records) {
+			const auto variable = from_end == 2u ? state.loop_guard_max_variable
+			                                     : state.loop_guard_trips_variable;
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+			const auto index = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpISub, TypeU32(state), index, state.gds_length,
+			                          ConstantU32(state, from_end));
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.gds_variable, ConstantU32(state, 0), index);
+			state.builder.AddFunction(op, TypeU32(state), state.builder.AllocateId(), pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+		}
+	}
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
@@ -168,6 +188,45 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 					                          running);
 				}
 				condition = guarded;
+				if (state.loop_guard_max_variable != 0) {
+					auto exiting = guarded;
+					if (!loop_exit(true_block)) {
+						exiting = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), exiting,
+						                          guarded);
+					}
+					const auto select = [&](uint32_t predicate, uint32_t yes, uint32_t no) {
+						const auto id = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpSelect, TypeU32(state), id, predicate, yes,
+						                          no);
+						return id;
+					};
+					const auto load = [&](uint32_t variable) {
+						const auto id = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpLoad, TypeU32(state), id, variable);
+						return id;
+					};
+					const auto longest = load(state.loop_guard_max_variable);
+					const auto larger  = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), larger, count,
+					                          longest);
+					const auto record = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), record, exiting,
+					                          larger);
+					state.builder.AddFunction(spv::OpStore, state.loop_guard_max_variable,
+					                          select(record, count, longest));
+					const auto cut = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), cut, exiting,
+					                          spent);
+					const auto trips = load(state.loop_guard_trips_variable);
+					const auto more  = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpIAdd, TypeU32(state), more, trips,
+					                          ConstantU32(state, 1));
+					state.builder.AddFunction(spv::OpStore, state.loop_guard_trips_variable,
+					                          select(cut, more, trips));
+					state.builder.AddFunction(spv::OpStore, guard,
+					                          select(exiting, ConstantU32(state, 0), count));
+				}
 			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
@@ -549,9 +608,11 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
-	if (ctx.state.loop_guard_variable != 0) {
-		ctx.state.builder.AddFunction(spv::OpStore, ctx.state.loop_guard_variable,
-		                              ConstantU32(ctx.state, 0));
+	for (const auto variable: {ctx.state.loop_guard_variable, ctx.state.loop_guard_max_variable,
+	                           ctx.state.loop_guard_trips_variable}) {
+		if (variable != 0) {
+			ctx.state.builder.AddFunction(spv::OpStore, variable, ConstantU32(ctx.state, 0));
+		}
 	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -753,11 +814,12 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	return result;
 }
 
-uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
+uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane,
+                                   bool lane_uniform) {
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	if (other_half == nullptr) {
-		return EmitSubgroupShuffle(state, type, Arg(inst, index), lane);
+		return EmitSubgroupShuffle(state, type, Arg(inst, index), lane, lane_uniform);
 	}
 	const auto low   = state.builder.AllocateId();
 	const auto physical_lane =

@@ -318,6 +318,8 @@ uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 // Changes whenever a shader is registered: stage inputs prepared while it held still hold for the
 // shader map (read it before preparing).
 [[nodiscard]] uint64_t ShaderMapVersion();
+// The hash of the shader registered at `addr`, or 0 if none is.
+[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
 
 // The guest reads a vertex stage's input preparation makes of its attribute and buffer tables (see
 // ShaderApplyAttribSemantics), recorded on a thread while t_vertex_table_reads points here.

@@ -9,8 +9,9 @@ void Translator::FailMissingTranslation(const Decoder::Instruction& inst) {
 }
 
 void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
-	current_opcode = inst.opcode;
-	current_pc     = inst.pc;
+	current_opcode      = inst.opcode;
+	current_instruction = &inst;
+	current_pc          = inst.pc;
 
 	switch (inst.opcode) {
 		case Decoder::Opcode::UNKNOWN:

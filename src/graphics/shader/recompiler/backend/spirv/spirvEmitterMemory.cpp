@@ -1373,7 +1373,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});
-	return EmitSubgroupShuffle(state, TypeU32(state), atomic, source_lane);
+	return EmitSubgroupShuffle(state, TypeU32(state), atomic, source_lane,
+	                           !WaveHalvesInHostSubgroup(state));
 }
 
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {

@@ -71,6 +71,7 @@ private:
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
+	IR::DppCombine         DppScanCombine(const Decoder::Operand& operand) const;
 	IR::Value              ReadOperand(const Decoder::Operand& operand, IR::Type type);
 	IR::U1                 ThreadBit(const std::array<IR::U32, 2>& mask);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
@@ -303,6 +304,7 @@ private:
 	IR::IREmitter   ir;
 	IR::U1          instruction_branch_condition;
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
+	const Decoder::Instruction* current_instruction = nullptr;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;

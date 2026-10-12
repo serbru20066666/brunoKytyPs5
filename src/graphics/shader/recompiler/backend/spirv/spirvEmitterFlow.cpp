@@ -637,10 +637,15 @@ void EmitBarrier(EmitterState& state) {
 		// Independent graphics invocations have no native workgroup left to synchronize.
 		return;
 	}
-	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
-	                        ? spv::MemorySemanticsUniformMemoryMask
-	                        : spv::MemorySemanticsWorkgroupMemoryMask;
+	static const bool device_scope = std::getenv("KYTY_DEBUG_BARRIER_DEVICE") != nullptr;
+	const auto        memory_scope = tessellation   ? spv::ScopeInvocation
+	                                 : device_scope ? spv::ScopeDevice
+	                                                : spv::ScopeWorkgroup;
+	const auto memory = spv::MemorySemanticsUniformMemoryMask |
+	                    spv::MemorySemanticsImageMemoryMask |
+	                    (state.lds_storage_class == spv::StorageClassStorageBuffer
+	                         ? 0u
+	                         : spv::MemorySemanticsWorkgroupMemoryMask);
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
@@ -718,9 +723,50 @@ uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	return result;
 }
 
+// The whole wave's reduction, over the lanes EXEC enables, as the source of a wave reduction step
+// (IR::DppCombine). The step then leaves every lane it writes holding that reduction, so the
+// lanes the rest of the reduction reads (the last of each row, through V_PERMLANEX16 and
+// V_READLANE) end with the value they get on the console; the other lanes' row prefixes are not
+// reproduced. Pixel shaders only: AMD's compiler cannot build their per-lane reads (see
+// EmitSubgroupShuffle), and reading them bit by bit is far too slow for FC 27's lighting loops.
+static uint32_t EmitDppWaveCombine(ValueEmitContext& ctx, const IR::Inst& inst, IR::DppCombine combine) {
+	auto&    state    = ctx.state;
+	spv::Op  op       = spv::OpGroupNonUniformBitwiseOr;
+	uint32_t identity = 0;
+	bool     floating = false;
+	switch (combine) {
+		case IR::DppCombine::UMin: op = spv::OpGroupNonUniformUMin, identity = 0xffffffffu; break;
+		case IR::DppCombine::UMax: op = spv::OpGroupNonUniformUMax, identity = 0; break;
+		case IR::DppCombine::SMin: op = spv::OpGroupNonUniformSMin, identity = 0x7fffffffu; break;
+		case IR::DppCombine::SMax: op = spv::OpGroupNonUniformSMax, identity = 0x80000000u; break;
+		case IR::DppCombine::FMin:
+			op = spv::OpGroupNonUniformFMin, identity = 0x7f800000u, floating = true;
+			break;
+		case IR::DppCombine::FMax:
+			op = spv::OpGroupNonUniformFMax, identity = 0xff800000u, floating = true;
+			break;
+		case IR::DppCombine::And: op = spv::OpGroupNonUniformBitwiseAnd, identity = ~0u; break;
+		case IR::DppCombine::Or: op = spv::OpGroupNonUniformBitwiseOr, identity = 0; break;
+		case IR::DppCombine::None: ctx.Fail(inst, "DPP wave combine without an operation");
+	}
+	auto       operand = Select(state, TypeU32(state), ctx.Arg(inst, 1), ctx.Arg(inst, 0),
+	                            ConstantU32(state, identity));
+	const auto type    = floating ? TypeF32(state) : TypeU32(state);
+	if (floating) {
+		operand = Unary(state, spv::OpBitcast, type, operand);
+	}
+	const auto reduced = state.builder.AllocateId();
+	state.builder.AddFunction(op, type, reduced, ConstantU32(state, spv::ScopeSubgroup),
+	                          spv::GroupOperationReduce, operand);
+	return floating ? Unary(state, spv::OpBitcast, TypeU32(state), reduced) : reduced;
+}
+
 uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state    = ctx.state;
 	const auto flags    = inst.Flags<IR::DppMoveFlags>();
+	if (flags.combine != IR::DppCombine::None && ShuffleByReduction(state)) {
+		return EmitDppWaveCombine(ctx, inst, flags.combine);
+	}
 	const auto target   = EmitDppTargetLane(state, flags);
 	const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
 	if (flags.fetch_inactive) {
@@ -779,7 +825,7 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto ballot   = ctx.Ballot(inst.Arg(1));
 	const auto lane     = ctx.FirstLane(ballot);
-	const auto shuffled = ctx.Shuffle(inst, 0, lane);
+	const auto shuffled = ctx.Shuffle(inst, 0, lane, !WaveHalvesInHostSubgroup(ctx.state));
 	if (WaveHalvesInHostSubgroup(ctx.state)) {
 		// Each half is its own guest wave: the value is uniform per half only.
 		return shuffled;
@@ -809,7 +855,8 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                   EmitAddU32(state, EmitLaunchedLaneAtOrBelow(state, lane),
 		                              EmitOwnWaveHalfBase(state)));
 	}
-	const auto shuffled = ctx.Shuffle(inst, 0, EmitLaunchedLaneAtOrBelow(state, ctx.Arg(inst, 1)));
+	const auto shuffled =
+	    ctx.Shuffle(inst, 0, EmitLaunchedLaneAtOrBelow(state, ctx.Arg(inst, 1)), true);
 	const auto result   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
 	                          TypeId(state, inst.Arg(0).GetType()), result,
@@ -866,9 +913,44 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-	const auto launched = EmitLaunchedLaneAtOrBelow(state, target);
-	const auto shuffled = ctx.Shuffle(inst, 0, launched);
-	uint32_t   result   = shuffled;
+	// Constant selects that name one lane for all 16 (V_PERMLANEX16 v, v, -1, -1 in wave
+	// reductions) read one lane per row: four reads of a lane every invocation names.
+	const bool one_per_row = ShuffleByReduction(state) && inst.Arg(1).IsImmediate() &&
+	                         inst.Arg(2).IsImmediate() && inst.Arg(1).U32() == inst.Arg(2).U32() &&
+	                         inst.Arg(1).U32() == (inst.Arg(1).U32() & 0xfu) * 0x11111111u;
+	uint32_t launched      = 0;
+	uint32_t shuffled      = 0;
+	uint32_t shuffled_exec = 0;
+	if (one_per_row) {
+		const auto target_row =
+		    EmitBinaryU32(state, spv::OpShiftRightLogical, row_value, ConstantU32(state, 4));
+		for (uint32_t source_row = 0; source_row < 4; source_row++) {
+			const auto source = EmitLaunchedLaneAtOrBelow(
+			    state, ConstantU32(state, source_row * 16u + (inst.Arg(1).U32() & 0xfu)));
+			const auto value = ctx.Shuffle(inst, 0, source, true);
+			const auto exec  = flags.fetch_inactive ? 0u : ctx.Shuffle(inst, 3, source, true);
+			if (source_row == 0) {
+				launched      = source;
+				shuffled      = value;
+				shuffled_exec = exec;
+				continue;
+			}
+			const auto in_row = Binary(state, spv::OpIEqual, TypeBool(state), target_row,
+			                           ConstantU32(state, source_row));
+			launched = Select(state, TypeU32(state), in_row, source, launched);
+			shuffled = Select(state, TypeU32(state), in_row, value, shuffled);
+			if (!flags.fetch_inactive) {
+				shuffled_exec = Select(state, TypeBool(state), in_row, exec, shuffled_exec);
+			}
+		}
+	} else {
+		launched = EmitLaunchedLaneAtOrBelow(state, target);
+		shuffled = ctx.Shuffle(inst, 0, launched);
+		if (!flags.fetch_inactive) {
+			shuffled_exec = ctx.Shuffle(inst, 3, launched);
+		}
+	}
+	uint32_t result = shuffled;
 	if (!flags.fetch_inactive) {
 		// A lane the host did not launch is active if the guest switched it on, which only the
 		// scalar EXEC copy records.
@@ -891,7 +973,7 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto source_exec  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), was_launched, launched, target);
 		state.builder.AddFunction(
-		    spv::OpSelect, TypeBool(state), source_exec, was_launched, ctx.Shuffle(inst, 3, launched),
+		    spv::OpSelect, TypeBool(state), source_exec, was_launched, shuffled_exec,
 		    Binary(state, spv::OpINotEqual, TypeBool(state), exec_bit, ConstantU32(state, 0)));
 		result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,

@@ -145,6 +145,10 @@ struct EmitterState {
 	// KYTY_DEBUG_LOOP_GUARD=<n>: a private counter of loop iterations; loops exit past n.
 	uint32_t                   loop_guard_variable                   = 0;
 	uint32_t                   loop_guard_limit                      = 0;
+	// KYTY_DEBUG_LOOP_GUARD_RESET: the counter restarts at each loop exit; the longest run and
+	// the runs cut by the guard go to the last two GDS dwords when the program returns.
+	uint32_t                   loop_guard_max_variable               = 0;
+	uint32_t                   loop_guard_trips_variable             = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -248,7 +252,9 @@ struct ValueEmitContext {
 	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
 	uint32_t              Ballot(IR::Value predicate);
 	uint32_t              FirstLane(uint32_t ballot);
-	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
+	// `lane_uniform`: every invocation reads the same lane (see EmitSubgroupShuffle).
+	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane,
+	                              bool lane_uniform = false);
 	uint32_t              Result(const IR::Inst& inst);
 	uint32_t              Define(const IR::Inst& inst, uint32_t value);
 	uint32_t              ResourceIndex(IR::Value value, IR::ValueOpcode opcode);
@@ -311,8 +317,11 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 // Whether the program reads other lanes by a subgroup reduction instead of
 // OpGroupNonUniformShuffle (see EmitSubgroupShuffle).
 bool ShuffleByReduction(const EmitterState& state);
-// The value that host subgroup invocation `lane` holds.
-uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane);
+bool DebugShuffleByReduction(const EmitterState& state);
+// The value that host subgroup invocation `lane` holds. `lane_uniform`: every invocation reads the
+// same lane.
+uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane,
+                             bool lane_uniform = false);
 // Whether a wave32 guest program may run in a 64-lane host subgroup (vertex stages: drivers need
 // not take a required subgroup size there). Host lanes 32-63 are then a second guest wave, so
 // lane choices and ballots stay within the invocation's own 32 lanes.

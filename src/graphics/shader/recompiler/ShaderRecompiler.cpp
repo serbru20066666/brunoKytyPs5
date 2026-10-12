@@ -18,14 +18,18 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -605,11 +609,17 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 	}
-	// KYTY_DEBUG_LIST=<hash>: prints that program's decoded listing once.
+	// KYTY_DEBUG_LIST=<hash>[,<hash>...] (lowercase hex): prints those programs' decoded
+	// listings once each.
+	char hash_text[17];
+	std::snprintf(hash_text, sizeof(hash_text), "%016llx",
+	              static_cast<unsigned long long>(options.shader_hash));
 	if (static const char* wanted = std::getenv("KYTY_DEBUG_LIST");
-	    wanted != nullptr && std::strtoull(wanted, nullptr, 16) == options.shader_hash) {
-		static std::atomic_flag printed;
-		if (!printed.test_and_set()) {
+	    wanted != nullptr && std::strstr(wanted, hash_text) != nullptr) {
+		static std::mutex                  printed_mutex;
+		static std::unordered_set<uint64_t> printed;
+		std::scoped_lock                   lock(printed_mutex);
+		if (printed.insert(options.shader_hash).second) {
 			std::printf("listing of %016llx:%c%s%c", static_cast<unsigned long long>(options.shader_hash),
 			            10, Decoder::ProgramToString(source.decoded).c_str(), 10);
 			std::fflush(stdout);

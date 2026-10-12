@@ -32,6 +32,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fmt/format.h>
 #include <memory>
@@ -1592,9 +1593,42 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 }
 
+// KYTY_DEBUG_GDS_DUMP=<hash>[,<hash>...] (lowercase hex): before each dispatch of those compute
+// shaders, waits for the GPU and prints GDS dwords 0-7.
+static bool DebugGdsDumpWanted(uint64_t cs_addr, uint64_t& hash) {
+	static const char* wanted = std::getenv("KYTY_DEBUG_GDS_DUMP");
+	if (wanted == nullptr || cs_addr == 0) {
+		return false;
+	}
+	hash = ShaderHashAt(cs_addr);
+	char text[17];
+	std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+	return std::strstr(wanted, text) != nullptr;
+}
+
+static void DebugGdsDump(const Buffer& gds, uint64_t hash, const char* kind, uint32_t x,
+                         uint32_t y, uint32_t z) {
+	std::array<uint32_t, 8> words {};
+	Sync::ReadGds(gds, words.data(), 0, static_cast<uint32_t>(words.size()));
+	// KYTY_DEBUG_LOOP_GUARD_RESET keeps the longest guarded loop and its cut runs at the end.
+	std::array<uint32_t, 2> tail {};
+	Sync::ReadGds(gds, tail.data(), static_cast<uint32_t>(gds.Size() / sizeof(uint32_t)) - 2u, 2u);
+	std::printf("gds-dump: cs=%016llx %s groups=%ux%ux%u gds=%08x %08x %08x %08x %08x %08x %08x "
+	            "%08x longest=%u cut=%u\n",
+	            static_cast<unsigned long long>(hash), kind, x, y, z, words[0], words[1], words[2],
+	            words[3], words[4], words[5], words[6], words[7], tail[0], tail[1]);
+	std::fflush(stdout);
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (uint64_t hash = 0; DebugGdsDumpWanted(m_sh_ctx.GetCs().cs_regs.data_addr, hash))
+	    [[unlikely]] {
+		SynchronizeGpu();
+		DebugGdsDump(*m_renderer.GetBufferCache().GetGdsBuffer(), hash, "direct", thread_group_x,
+		             thread_group_y, thread_group_z);
+	}
 
 	uint32_t frame_num = 0;
 
@@ -1631,6 +1665,13 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (uint64_t hash = 0; DebugGdsDumpWanted(m_sh_ctx.GetCs().cs_regs.data_addr, hash))
+	    [[unlikely]] {
+		SynchronizeGpu();
+		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+		DebugGdsDump(*m_renderer.GetBufferCache().GetGdsBuffer(), hash, "indirect", args->x,
+		             args->y, args->z);
+	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }

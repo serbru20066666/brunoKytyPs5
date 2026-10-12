@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -229,7 +231,24 @@ uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
 	                          GLSLstd450FindUMsb, word);
 	const auto launched = EmitAddU32(state, base, highest);
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any, word, ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, any, launched, lane);
+	// With no launched lane at or below, the lowest launched one: the guest lane is outside
+	// every live mask, and a host read of an invocation that does not exist gives zero, which
+	// a wave-wide minimum then spreads to every lane.
+	uint32_t fallback = lane;
+	if (state.program.wave_size == 64u && state.lane_count == 1 &&
+	    !WaveHalvesInHostSubgroup(state)) {
+		const auto low_any = Binary(state, spv::OpINotEqual, TypeBool(state), low,
+		                            ConstantU32(state, 0));
+		const auto high    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+		const auto lowest  = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpExtInst, TypeU32(state), lowest, GlslStd450(state), GLSLstd450FindILsb,
+		    Select(state, TypeU32(state), low_any, low, high));
+		fallback = Select(state, TypeU32(state), low_any, lowest,
+		                  EmitAddU32(state, lowest, ConstantU32(state, 32)));
+	}
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, any, launched, fallback);
 	return result;
 }
 
@@ -240,24 +259,41 @@ bool ShuffleByReduction(const EmitterState& state) {
 	       !keep_shuffle;
 }
 
-// AMD's shader compiler (32.0.21045.5002, RX 6800 XT) dies with an access violation building a
-// pixel shader of EA SPORTS FC 27 that shuffles inside nested loops; the same module compiles
-// once every shuffle is a reduction. In pixel shaders a lane's value is therefore read as the OR
-// over the subgroup of "am I that lane ? value : 0". An inactive lane then reads as zero, where
-// a shuffle's result is undefined.
-uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane) {
+// AMD's shader compiler (32.0.21045.5002, RX 6800 XT) dies with an access violation building
+// pixel shaders of EA SPORTS FC 27 that read other lanes inside nested loops. Every operation
+// that gives each lane a different value from other lanes takes it down there (Shuffle,
+// ShuffleXor, ShuffleUp, clustered reductions, scans); ballots and whole-subgroup reductions
+// compile. In pixel shaders a lane every invocation names is therefore read as the OR over the
+// subgroup of "am I that lane ? value : 0", and any other lane bit by bit from ballots. An
+// inactive lane reads as zero, where a shuffle's result is undefined.
+// KYTY_DEBUG_SHUFFLE_HASH=<hash>[,<hash>...] (lowercase hex): those shaders read other lanes as
+// pixel shaders do, whatever their stage.
+bool DebugShuffleByReduction(const EmitterState& state) {
+	static const char* hashes = std::getenv("KYTY_DEBUG_SHUFFLE_HASH");
+	if (hashes == nullptr) {
+		return false;
+	}
+	char hash_text[17];
+	std::snprintf(hash_text, sizeof(hash_text), "%016llx",
+	              static_cast<unsigned long long>(state.program.shader_hash));
+	return std::strstr(hashes, hash_text) != nullptr;
+}
+
+uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane,
+                             bool lane_uniform) {
 	const auto scope   = ConstantU32(state, spv::ScopeSubgroup);
 	const auto result  = state.builder.AllocateId();
 	const bool word    = type == TypeU32(state);
 	const bool boolean = type == TypeBool(state);
-	if (!ShuffleByReduction(state) || (!word && !boolean) ||
+	static const bool uniform_only = std::getenv("KYTY_DEBUG_SHUFFLE_UNIFORM_ONLY") != nullptr;
+	const bool        debug_reduce =
+	    DebugShuffleByReduction(state) && (lane_uniform || !uniform_only);
+	if (!(ShuffleByReduction(state) || debug_reduce) || (!word && !boolean) ||
 	    state.subgroup_local_invocation_id_variable == 0) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, result, scope, value, lane);
 		return result;
 	}
-	// KYTY_DEBUG_SHUFFLE_BALLOT=1: the lane's value from ballots alone, one per bit.
-	if (static const bool by_ballot = std::getenv("KYTY_DEBUG_SHUFFLE_BALLOT") != nullptr;
-	    by_ballot) {
+	if (!lane_uniform) {
 		const auto word_index =
 		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane, ConstantU32(state, 5));
 		const auto bit_index =

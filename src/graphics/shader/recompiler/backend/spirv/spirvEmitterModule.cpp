@@ -2,8 +2,24 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+// KYTY_DEBUG_COHERENT_HASH=<hash>[,<hash>...] (lowercase hex): those programs' buffers are
+// Coherent, so that every load bypasses the per-CU caches.
+static bool DebugCoherentBuffers(const EmitterState& state) {
+	const char* hashes = std::getenv("KYTY_DEBUG_COHERENT_HASH");
+	if (hashes == nullptr) {
+		return false;
+	}
+	char hash_text[17];
+	std::snprintf(hash_text, sizeof(hash_text), "%016llx",
+	              static_cast<unsigned long long>(state.program.shader_hash));
+	return std::strstr(hashes, hash_text) != nullptr;
+}
 
 uint32_t TypeVoid(EmitterState& state) {
 	if (state.void_type == 0) {
@@ -295,7 +311,7 @@ void DefineDescriptors(EmitterState& state) {
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (info.coherent_buffers) {
+					if (info.coherent_buffers || DebugCoherentBuffers(state)) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
 					}
 				}
@@ -582,14 +598,32 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (const char* guard = std::getenv("KYTY_DEBUG_LOOP_GUARD");
-	    guard != nullptr &&
-	    (std::getenv("KYTY_DEBUG_LOOP_GUARD_HASH") == nullptr ||
-	     std::strtoull(std::getenv("KYTY_DEBUG_LOOP_GUARD_HASH"), nullptr, 16) ==
-	         state.program.shader_hash)) {
+	// KYTY_DEBUG_LOOP_GUARD_HASH=<hash>[,<hash>...] (lowercase hex) and
+	// KYTY_DEBUG_LOOP_GUARD_STAGE=<letters: vertex v, pixel p, compute c, other o> narrow the
+	// guard down.
+	const auto guarded = [&] {
+		char hash_text[17];
+		std::snprintf(hash_text, sizeof(hash_text), "%016llx",
+		              static_cast<unsigned long long>(state.program.shader_hash));
+		const char* hashes = std::getenv("KYTY_DEBUG_LOOP_GUARD_HASH");
+		const char* stages = std::getenv("KYTY_DEBUG_LOOP_GUARD_STAGE");
+		const char  letter = state.program.stage == ShaderType::Vertex    ? 'v'
+		                     : state.program.stage == ShaderType::Pixel   ? 'p'
+		                     : state.program.stage == ShaderType::Compute ? 'c'
+		                                                                  : 'o';
+		return (hashes == nullptr || std::strstr(hashes, hash_text) != nullptr) &&
+		       (stages == nullptr || std::strchr(stages, letter) != nullptr);
+	};
+	if (const char* guard = std::getenv("KYTY_DEBUG_LOOP_GUARD"); guard != nullptr && guarded()) {
 		state.loop_guard_limit    = static_cast<uint32_t>(std::strtoul(guard, nullptr, 10));
 		state.loop_guard_variable = DefineInterfaceVariable(state, TypeU32(state),
 		                                                    spv::StorageClassPrivate, "loop_guard");
+		if (std::getenv("KYTY_DEBUG_LOOP_GUARD_RESET") != nullptr) {
+			state.loop_guard_max_variable = DefineInterfaceVariable(
+			    state, TypeU32(state), spv::StorageClassPrivate, "loop_guard_max");
+			state.loop_guard_trips_variable = DefineInterfaceVariable(
+			    state, TypeU32(state), spv::StorageClassPrivate, "loop_guard_trips");
+		}
 	}
 	if (state.program.info.subgroup_local_invocation_id || ShuffleByReduction(state)) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
@@ -808,7 +842,7 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
-	if (ShuffleByReduction(state)) {
+	if (ShuffleByReduction(state) || DebugShuffleByReduction(state)) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {

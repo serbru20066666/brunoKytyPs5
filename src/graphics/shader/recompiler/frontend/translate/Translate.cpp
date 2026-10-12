@@ -11,7 +11,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
+static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand,
+                                 IR::DppCombine          combine = IR::DppCombine::None) {
 	return {
 	    .control        = operand.dpp_ctrl,
 	    .row_mask       = operand.dpp_row_mask,
@@ -19,7 +20,44 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	    .fetch_inactive = operand.dpp_fetch_inactive,
 	    .bound_control  = operand.dpp_bound_ctrl,
 	    .dpp8           = operand.dpp8,
+	    .combine        = combine,
 	};
+}
+
+static bool HasValueModifiers(const Decoder::Operand& operand) {
+	return operand.negate || operand.absolute || operand.clamp || operand.omod != 0u ||
+	       operand.sdwa_sel != 6u;
+}
+
+// A step of the wave reductions the PS5 compiler emits (row_shr 1, 2, 4, 8 on one register, then
+// V_PERMLANEX16 and V_READLANE of lanes 31 and 63): V_<op> vN, vN.dpp(row_shr:n), vN with all rows
+// and banks written and out-of-row sources left unwritten.
+IR::DppCombine Translator::DppScanCombine(const Decoder::Operand& operand) const {
+	const auto* inst = current_instruction;
+	if (inst == nullptr || inst->family != Decoder::Family::VOP2 || !inst->src0.dpp ||
+	    operand.kind != Decoder::OperandKind::Vgpr || operand.reg != inst->src0.reg ||
+	    operand.dpp8 || operand.dpp_ctrl < 0x111u || operand.dpp_ctrl > 0x11fu ||
+	    operand.dpp_row_mask != 0xfu || operand.dpp_bank_mask != 0xfu || operand.dpp_bound_ctrl ||
+	    operand.dpp_fetch_inactive || HasValueModifiers(operand)) {
+		return IR::DppCombine::None;
+	}
+	if (inst->dst.kind != Decoder::OperandKind::Vgpr ||
+	    inst->src1.kind != Decoder::OperandKind::Vgpr || inst->dst.reg != operand.reg ||
+	    inst->src1.reg != operand.reg || HasValueModifiers(inst->src1) ||
+	    HasValueModifiers(inst->dst)) {
+		return IR::DppCombine::None;
+	}
+	switch (inst->opcode) {
+		case Decoder::Opcode::V_MIN_U32: return IR::DppCombine::UMin;
+		case Decoder::Opcode::V_MAX_U32: return IR::DppCombine::UMax;
+		case Decoder::Opcode::V_MIN_I32: return IR::DppCombine::SMin;
+		case Decoder::Opcode::V_MAX_I32: return IR::DppCombine::SMax;
+		case Decoder::Opcode::V_MIN_F32: return IR::DppCombine::FMin;
+		case Decoder::Opcode::V_MAX_F32: return IR::DppCombine::FMax;
+		case Decoder::Opcode::V_AND_B32: return IR::DppCombine::And;
+		case Decoder::Opcode::V_OR_B32: return IR::DppCombine::Or;
+		default: return IR::DppCombine::None;
+	}
 }
 
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
@@ -267,8 +305,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 
 IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value) {
 	if (operand.dpp) {
-		value =
-		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
+		value = IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()},
+		                        DppFlags(operand, DppScanCombine(operand))));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;

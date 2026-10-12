@@ -31,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -195,6 +196,51 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
 	return true;
+}
+
+// KYTY_DEBUG_CS_BUFFERS=<hash list>: the guest buffer descriptors and host ranges of the
+// listed compute shaders' first dispatches.
+static void DebugPrintComputeBuffers(const ShaderComputeInputInfo& input,
+                                     const PreparedBindings& bindings, const char* kind) {
+	static const char* wanted = std::getenv("KYTY_DEBUG_CS_BUFFERS");
+	if (wanted == nullptr) [[likely]] {
+		return;
+	}
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	char        hash[17];
+	std::snprintf(hash, sizeof(hash), "%016" PRIx64, program.shader_hash);
+	static std::atomic<uint32_t> printed {0};
+	if (std::strstr(wanted, hash) == nullptr ||
+	    printed.fetch_add(1, std::memory_order_relaxed) >= 16) {
+		return;
+	}
+	std::printf("cs-buffers: hash=%s %s groups=%ux%ux%u lds_dwords=%u\n", hash, kind,
+	            input.workgroup_counts[0], input.workgroup_counts[1], input.workgroup_counts[2],
+	            input.lds_size_dwords);
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		const auto source = i < bindings.buffer_sources.size() ? bindings.buffer_sources[i]
+		                                                       : PreparedBindings::BufferSource {};
+		const uint64_t offset = i < bindings.buffers.size() ? bindings.buffers[i].offset : 0;
+		const uint64_t range  = i < bindings.buffers.size() ? bindings.buffers[i].range : 0;
+		std::printf("  buffer[%u] src=%u %s base=0x%012" PRIx64 " stride=%u records=%u fmt=%u "
+		            "swz=%u addtid=%u size=0x%" PRIx64 " bound=0x%012" PRIx64 "+0x%" PRIx64
+		            " host_off=0x%" PRIx64 " range=0x%" PRIx64 "\n",
+		            i, program.info.buffers[i].source,
+		            program.info.buffers[i].written ? "rw" : "ro", r.Base48(), r.Stride(),
+		            r.NumRecords(), r.RawFormat(), r.SwizzleEnabled() ? 1u : 0u,
+		            r.AddTid() ? 1u : 0u, r.GetSize(), source.address, source.size, offset, range);
+		if (!program.info.buffers[i].written && r.GetSize() <= 256 && r.Base48() != 0) {
+			const auto* words = reinterpret_cast<const uint32_t*>(r.Base48());
+			std::printf("   ");
+			for (uint64_t w = 0; w < r.GetSize() / 4; w++) {
+				std::printf(" %u:%08x", static_cast<uint32_t>(w * 4), words[w]);
+			}
+			std::printf("\n");
+		}
+	}
+	std::fflush(stdout);
 }
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
@@ -399,6 +445,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	DebugPrintComputeBuffers(input_info, bindings, "direct");
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -538,6 +585,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (has_storage_writes) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	DebugPrintComputeBuffers(input_info, bindings, "indirect");
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;

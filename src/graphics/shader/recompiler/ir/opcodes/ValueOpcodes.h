@@ -33,13 +33,18 @@ struct ImageOpcodeInfo {
 	bool               needs_sampler  = false;
 };
 
+// The operation of a wave reduction step V_<op> vN, vN.dpp(row_shr:n), vN that reads the DPP
+// source; None for any other use.
+enum class DppCombine : uint8_t { None, UMin, UMax, SMin, SMax, FMin, FMax, And, Or };
+
 struct DppMoveFlags {
-	uint32_t control   : 24 = 0;
-	uint32_t row_mask  : 4  = 0xf;
-	uint32_t bank_mask : 4  = 0xf;
-	bool     fetch_inactive = false;
-	bool     bound_control  = false;
-	bool     dpp8           = false;
+	uint32_t   control   : 24 = 0;
+	uint32_t   row_mask  : 4  = 0xf;
+	uint32_t   bank_mask : 4  = 0xf;
+	bool       fetch_inactive = false;
+	bool       bound_control  = false;
+	bool       dpp8           = false;
+	DppCombine combine        = DppCombine::None;
 };
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);

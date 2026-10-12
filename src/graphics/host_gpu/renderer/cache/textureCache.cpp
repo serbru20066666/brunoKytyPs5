@@ -1712,6 +1712,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 		// The images over the request's range, and the first of them.
 		size_t  candidate_count = 0;
 		ImageId first_candidate {};
+		// Vulkan renders no color into a stencil aspect: a color target over a depth image's
+		// stencil plane (PPSA34015 draws R8 targets there) gets an image of its own.
+		const bool color_target =
+		    desc.type == BindingType::RenderTarget || desc.type == BindingType::VideoOut;
+		const auto stencil_plane = [&](ImageId id) {
+			return color_target && m_slot_images[id].depth_id;
+		};
 		const auto       lookup     = [&] {
 			result          = {};
 			view_mip        = -1;
@@ -1723,6 +1730,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			first_candidate = candidates.empty() ? ImageId {} : candidates.front();
 			for (const auto id: candidates) {
 				const auto& image = m_slot_images[id];
+				if (stencil_plane(id)) {
+					continue;
+				}
 				// Stencil descriptors name the associated plane; its depth owner supplies
 				// the native image and the canonical guest tiling. Not a backing match: the
 				// rule depends on the binding type, which ImageLookup does not key.
@@ -1745,6 +1755,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			}
 			if (!result) {
 				for (const auto candidate: candidates) {
+					if (stencil_plane(candidate)) {
+						continue;
+					}
 					view_mip                = -1;
 					view_layer              = -1;
 					const auto& merged_info = result ? m_slot_images[result].info : desc.info;
@@ -1777,7 +1790,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 		ImageLookup* remembered       = nullptr;
 		for (size_t way = 0; memo_enabled && way < ImageLookupWays; way++) {
 			if (lookups[way].generation == range_generation &&
-			    lookups[way].Matches(desc.info, exact_format)) {
+			    lookups[way].Matches(desc.info, exact_format) && !stencil_plane(lookups[way].id)) {
 				remembered = &lookups[way];
 				break;
 			}
