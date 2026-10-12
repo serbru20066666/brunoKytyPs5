@@ -298,6 +298,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	if (static const bool trace = std::getenv("KYTY_DEBUG_DISPATCH_MODE") != nullptr; trace) {
+		static uint32_t last_mode = ~0u;
+		static uint32_t last_wave = ~0u;
+		if (mode != last_mode || cs_regs.cs_regs.wave_size != last_wave) {
+			last_mode = mode;
+			last_wave = cs_regs.cs_regs.wave_size;
+			std::printf("dispatch-mode: mode=0x%08x wave=%u cs=0x%016" PRIx64 "\n", mode, last_wave,
+			            cs_regs.cs_regs.data_addr);
+			std::fflush(stdout);
+		}
+	}
 	const auto compute_program = [&] {
 		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);

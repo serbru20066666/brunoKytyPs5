@@ -501,8 +501,9 @@ private:
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
-		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
-		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} wave={} pc=0x{:08x} {}",
+		                m_program.shader_hash, StageName(m_program.stage), m_program.wave_size, pc,
+		                reason);
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
