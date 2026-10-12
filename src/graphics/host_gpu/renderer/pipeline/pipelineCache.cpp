@@ -2542,7 +2542,10 @@ uint32_t PipelineCache::PrefetchComputePipeline(const HW::Context& ctx, const HW
 	if (m_libraries == nullptr || !Config::PipelineLibrariesEnabled()) {
 		return 0;
 	}
-	const auto& cs = sh.GetCs();
+	// The wave size is the dispatch's own (CommandProcessor::DispatchDirect sets it only when the
+	// dispatch runs): the registers still hold the previous dispatch's.
+	auto cs              = sh.GetCs();
+	cs.cs_regs.wave_size = Pm4::ComputeWaveSize(dispatch_initiator);
 	if (cs.cs_regs.data_addr == 0) {
 		return 0;
 	}
