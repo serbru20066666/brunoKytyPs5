@@ -305,6 +305,11 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+// Whether the program reads other lanes by a subgroup reduction instead of
+// OpGroupNonUniformShuffle (see EmitSubgroupShuffle).
+bool ShuffleByReduction(const EmitterState& state);
+// The value that host subgroup invocation `lane` holds.
+uint32_t EmitSubgroupShuffle(EmitterState& state, uint32_t type, uint32_t value, uint32_t lane);
 // Whether a wave32 guest program may run in a 64-lane host subgroup (vertex stages: drivers need
 // not take a required subgroup size there). Host lanes 32-63 are then a second guest wave, so
 // lane choices and ballots stay within the invocation's own 32 lanes.
