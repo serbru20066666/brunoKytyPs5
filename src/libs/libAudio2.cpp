@@ -411,6 +411,37 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	if (context == nullptr) {
 		return;
 	}
+	// KYTY_DEBUG_AUDIO2=1: every 500 pushes, each port's format, first gains and PCM peak.
+	if (static const bool trace = std::getenv("KYTY_DEBUG_AUDIO2") != nullptr; trace) {
+		static uint32_t pushes = 0;
+		if (pushes++ % 500 == 0) {
+			std::printf("audio2: push %u ctx=%" PRIu64 "\n", pushes, static_cast<uint64_t>(ctx));
+			for (const auto& state: g_audioout2_ports) {
+				if (!state.used || state.context != ctx) {
+					continue;
+				}
+				int32_t peak16 = 0;
+				float   peakf  = 0.0f;
+				for (size_t i = 0; i + 4 <= state.pcm_data.size(); i += 4) {
+					int16_t s = 0;
+					float   f = 0.0f;
+					std::memcpy(&s, state.pcm_data.data() + i, 2);
+					std::memcpy(&f, state.pcm_data.data() + i, 4);
+					peak16 = std::max<int32_t>(peak16, s < 0 ? -s : s);
+					if (std::isfinite(f)) {
+						peakf = std::max(peakf, f < 0 ? -f : f);
+					}
+				}
+				std::printf("audio2:  port=%" PRIu64 " type=%u fmt=0x%x handle=%d bytes=%zu "
+				            "gain0=%g gain1=%g peak16=%d peakf=%g\n",
+				            static_cast<uint64_t>(state.handle),
+				            static_cast<uint32_t>(state.port_type), state.data_format,
+				            state.audio_handle, state.pcm_data.size(), state.gains[0], state.gains[1],
+				            peak16, peakf);
+			}
+			std::fflush(stdout);
+		}
+	}
 	context->object_mix.clear();
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);

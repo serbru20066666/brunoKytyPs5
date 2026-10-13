@@ -383,6 +383,36 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
+	// KYTY_DEBUG_AUDIO2=1: every 500 buffers of a port, its SDL queue and per-channel peaks;
+	// KYTY_DEBUG_AUDIO_RAW=<file>: appends what the 8-channel float ports hand to SDL.
+	if (static const bool trace = std::getenv("KYTY_DEBUG_AUDIO2") != nullptr; trace) {
+		static std::atomic<uint32_t> calls {0};
+		const bool is_float = BytesPerSample(port->format) == 4;
+		if (calls.fetch_add(1) % 500 < 6 && is_float) {
+			float peaks[8] {};
+			const auto* samples = static_cast<const float*>(prepared_data);
+			for (uint32_t i = 0; i < port->samples_num * output_channels; i++) {
+				const float v = samples[i] < 0 ? -samples[i] : samples[i];
+				if (v > peaks[i % output_channels]) {
+					peaks[i % output_channels] = v;
+				}
+			}
+			std::printf("audio-sdl: ch=%u blocking=%d size=%u queued=%d peaks=%.3f %.3f %.3f %.3f "
+			            "%.3f %.3f %.3f %.3f\n",
+			            output_channels, static_cast<int>(blocking),
+			            static_cast<uint32_t>(prepared_size), SDL_GetAudioStreamQueued(port->stream),
+			            peaks[0], peaks[1], peaks[2], peaks[3], peaks[4], peaks[5], peaks[6], peaks[7]);
+			std::fflush(stdout);
+		}
+		static const char* raw_path = std::getenv("KYTY_DEBUG_AUDIO_RAW");
+		if (raw_path != nullptr && is_float && output_channels == 8) {
+			static std::FILE* raw = std::fopen(raw_path, "wb");
+			if (raw != nullptr) {
+				std::fwrite(prepared_data, 1, prepared_size, raw);
+			}
+		}
+	}
+
 	uint32_t min_queued_size = 0;
 	if (blocking) {
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
