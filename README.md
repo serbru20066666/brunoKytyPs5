@@ -21,9 +21,22 @@ Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.4.1**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
+Versión **0.5.0**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
-**Nuevo en 0.4.1 — el launcher.** Su lista muestra solo títulos de PS5 (antes aparecían como
+**Nuevo en 0.5.0 — al día con el emulador oficial, y EA SPORTS FC 27 arranca.** Esta versión
+incorpora los 284 cambios del KytyPS5 oficial que faltaban (mando DualSense, recompilador de
+sombreadores, audio, trofeos) sin perder las mejoras de rendimiento del fork: la plaza de ASTRO's
+PLAYROOM a 1440p sigue a 60 fps y la entrada de GPU Jungle a 46 en la parte lenta, como en la
+0.4.x. La primera vez recompila los sombreadores (unos minutos de tirones).
+
+EA SPORTS FC 27 llega a los menús en 3D y se puede jugar un partido, **de forma experimental**:
+va a 15–30 fps en una RX 6800 XT, el sonido sale muy bajo y la primera ejecución, con la caché
+de sombreadores vacía, puede cerrarse al llegar al menú (se vuelve a abrir). Para llegar ahí se
+corrigieron, entre otras cosas, las barreras de memoria que el recompilador ponía tras cada
+operación atómica (dejaban sin sincronizar los grupos de cómputo en tarjetas AMD) y un fallo del
+compilador de sombreadores de AMD con `OpGroupNonUniformShuffle` en sombreadores de píxeles.
+
+**De la 0.4.1 — el launcher.** Su lista muestra solo títulos de PS5 (antes aparecían como
 juegos los volcados de PS4, con sus parches y contenidos adicionales) y ya no recorre el disco
 entero para buscarlos: con una carpeta de juegos que era un disco completo abre en 1,3 s en vez
 de 8,3. «Apply recommended settings» fija también la resolución de la ventana y la generación de
