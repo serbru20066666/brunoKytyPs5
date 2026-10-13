@@ -645,11 +645,19 @@ void EmitBarrier(EmitterState& state) {
 	// the others wrote to buffers and images: the barriers after atomics order memory within a
 	// subgroup only (see EmitAtomicMemoryBarrier). Without the buffer and image memory here the
 	// light lists of EA SPORTS FC 27 came out broken again (GPU timeout).
-	const auto memory = spv::MemorySemanticsUniformMemoryMask |
-	                    spv::MemorySemanticsImageMemoryMask |
-	                    (state.lds_storage_class == spv::StorageClassStorageBuffer
-	                         ? 0u
-	                         : spv::MemorySemanticsWorkgroupMemoryMask);
+	// KYTY_DEBUG_BARRIER_NARROW=<hash>: that program's barriers order workgroup memory only.
+	static const uint64_t narrow_hash = std::getenv("KYTY_DEBUG_BARRIER_NARROW") != nullptr
+	                                        ? std::strtoull(std::getenv("KYTY_DEBUG_BARRIER_NARROW"), nullptr, 16)
+	                                        : 0;
+	const bool narrow = narrow_hash != 0 && narrow_hash == state.program.shader_hash;
+	const auto memory = narrow ? (state.lds_storage_class == spv::StorageClassStorageBuffer
+	                                  ? spv::MemorySemanticsUniformMemoryMask
+	                                  : spv::MemorySemanticsWorkgroupMemoryMask)
+	                           : spv::MemorySemanticsUniformMemoryMask |
+	                                 spv::MemorySemanticsImageMemoryMask |
+	                                 (state.lds_storage_class == spv::StorageClassStorageBuffer
+	                                      ? 0u
+	                                      : spv::MemorySemanticsWorkgroupMemoryMask);
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
