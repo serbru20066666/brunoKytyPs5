@@ -2219,7 +2219,15 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}
-		default: EXIT("unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id);
+		default: {
+			// The command processor skips every NOP; only the emulator reads these.
+			static std::array<std::atomic_bool, 0x1000> warned {};
+			if (!warned[id].exchange(true, std::memory_order_relaxed)) {
+				std::printf("Warning: unknown marker at %05" PRIx32 ": 0x%" PRIx32 "; skipped\n",
+				            num_dw - dw, id);
+			}
+			break;
+		}
 	}
 
 	return len_dw + 1;
