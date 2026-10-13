@@ -21,9 +21,18 @@ Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.5.0**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
+Versión **0.5.1**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
-**Nuevo en 0.5.0 — al día con el emulador oficial, y EA SPORTS FC 27 arranca.** Esta versión
+**Nuevo en 0.5.1 — menos tirones en EA SPORTS FC 27.** La precarga de sombreadores guardaba
+cada sombreador sin cinco datos de su configuración, y al reproducirlo no coincidía con el que
+pedía el juego: se volvía a traducir y compilar jugando. Ahora se reutilizan y, en el recorrido
+de prueba hasta el partido, los tirones de 100 ms o más pasan de 57 (28 s en total) a unos 15
+(2–3 s), a partir de la segunda partida. Además, los dibujos indirectos sin índices cuyos
+argumentos escribe la GPU ya no obligan a vaciar la cola gráfica para leerlos en la CPU. La
+plaza de ASTRO's PLAYROOM a 1440p sigue a 60 fps. Los diarios de precarga de la 0.5.0 se
+descartan y se vuelven a grabar.
+
+**De la 0.5.0 — al día con el emulador oficial, y EA SPORTS FC 27 arranca.** Esta versión
 incorpora los 284 cambios del KytyPS5 oficial que faltaban (mando DualSense, recompilador de
 sombreadores, audio, trofeos) sin perder las mejoras de rendimiento del fork: la plaza de ASTRO's
 PLAYROOM a 1440p sigue a 60 fps y la entrada de GPU Jungle a 46 en la parte lenta, como en la
