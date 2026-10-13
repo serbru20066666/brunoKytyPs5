@@ -1755,28 +1755,6 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 	return 0;
 }
 
-// Development option: KYTY_ENTITLEMENTS=<label>,<label>,... lists additional-content entitlements
-// the emulated console reports as installed, as a console with that content would. Empty by
-// default; KYTY_DEBUG_ENTITLEMENTS=1 prints the labels a game asks for.
-static bool LocalEntitlement(const char* label) {
-	static const std::vector<std::string> labels = [] {
-		std::vector<std::string> list;
-		if (const char* value = std::getenv("KYTY_ENTITLEMENTS"); value != nullptr) {
-			const std::string text = value;
-			for (size_t begin = 0; begin <= text.size();) {
-				const auto end = std::min(text.find(',', begin), text.size());
-				if (end > begin) {
-					list.push_back(text.substr(begin, end - begin));
-				}
-				begin = end + 1;
-			}
-		}
-		return list;
-	}();
-	const std::string wanted(label, strnlen(label, sizeof(NpUnifiedEntitlementLabel::data)));
-	return std::ranges::find(labels, wanted) != labels.end();
-}
-
 static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
     uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
     NpEntitlementAccessAddcontEntitlementInfo* info) {
@@ -1792,17 +1770,6 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	}
 
 	memset(info, 0, sizeof(*info));
-
-	if (std::getenv("KYTY_DEBUG_ENTITLEMENTS") != nullptr) {
-		std::printf("entitlement query: %.16s%c", entitlement_label->data, 10);
-		std::fflush(stdout);
-	}
-	if (LocalEntitlement(entitlement_label->data)) {
-		info->entitlement_label = *entitlement_label;
-		info->package_type      = 3;
-		info->download_status   = 4;
-		return 0;
-	}
 
 	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
