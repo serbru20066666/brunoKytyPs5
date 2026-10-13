@@ -763,6 +763,94 @@ void TestKnownZeroBitsFoldIndexedReads() {
         "known bits did not pass through ReadFirstLane");
 }
 
+void TestKnownZeroBitsThroughLoopPhis() {
+  // Loop header phis: an index the loop never changes (a waterfall loop's), a counter stepping
+  // by 4, and one stepping by 1. The first two keep their two low zero bits.
+  Fixture fixture(2);
+  auto &entry = fixture.BlockAt(0);
+  auto &loop = fixture.BlockAt(1);
+  entry.AddBranch(&loop);
+  loop.AddBranch(&loop);
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto shifted =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {user, Value(2u)});
+  auto &invariant = loop.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto &counter = loop.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto &odd = loop.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto &loop_exec = loop.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+  const auto next = fixture.Emit(ValueOpcode::IAdd32, {Value(&counter), Value(4u)}, 0, 1);
+  const auto next_odd = fixture.Emit(ValueOpcode::IAdd32, {Value(&odd), Value(1u)}, 0, 1);
+  invariant.AddPhiOperand(&entry, shifted);
+  invariant.AddPhiOperand(&loop, Value(&invariant));
+  counter.AddPhiOperand(&entry, Value(0u));
+  counter.AddPhiOperand(&loop, next);
+  odd.AddPhiOperand(&entry, shifted);
+  odd.AddPhiOperand(&loop, next_odd);
+  const auto compare = [&](Value index, uint32_t constant) {
+    return fixture.Emit(
+        ValueOpcode::ReferenceU32,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {fixture.Emit(ValueOpcode::IEqual32, {index, Value(constant)}, 0, 1),
+                       Value(1u), Value(2u)},
+                      0, 1)},
+        0, 1);
+  };
+  const auto lane = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::ReadFirstLane, {Value(&invariant), Value(true)}, 0, 1),
+       Value(0xffu)},
+      0, 1);
+  const auto lane_eight = compare(lane, 8u);
+  const auto lane_five = compare(lane, 5u);
+  const auto counter_eight = compare(Value(&counter), 8u);
+  const auto counter_six = compare(Value(&counter), 6u);
+  const auto odd_five = compare(Value(&odd), 5u);
+  // A waterfall loop: the index register was written under the EXEC before the loop, and the
+  // loop's EXEC only loses lanes; the lane it reads holds the written value.
+  const auto entry_exec = fixture.Emit(ValueOpcode::IEqual32, {user, Value(3u)});
+  const auto other = fixture.Emit(ValueOpcode::GetUserData,
+                                  {Value(static_cast<ScalarReg>(3))});
+  const auto masked = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {entry_exec, fixture.Emit(ValueOpcode::BitwiseAnd32, {other, Value(0xfffffffcu)}), user});
+  const auto done = fixture.Emit(
+      ValueOpcode::LogicalNot, {fixture.Emit(ValueOpcode::IEqual32, {other, Value(9u)}, 0, 1)},
+      0, 1);
+  loop_exec.AddPhiOperand(&entry, entry_exec);
+  loop_exec.AddPhiOperand(
+      &loop, fixture.Emit(ValueOpcode::LogicalAnd, {Value(&loop_exec), done}, 0, 1));
+  const auto waterfall = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::ReadFirstLane, {masked, Value(&loop_exec)}, 0, 1), Value(0xffu)},
+      0, 1);
+  const auto waterfall_eight = compare(waterfall, 8u);
+  const auto waterfall_five = compare(waterfall, 5u);
+  // Without the mask, the inactive lanes' value (any) could be read.
+  const auto unmasked = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::ReadFirstLane,
+                    {masked, fixture.Emit(ValueOpcode::IEqual32, {other, Value(7u)}, 0, 1)}, 0,
+                    1),
+       Value(0xffu)},
+      0, 1);
+  const auto unmasked_five = compare(unmasked, 5u);
+
+  ConstantPropagationPass(fixture.program.blocks);
+
+  const auto folded = [](Value reference) {
+    return reference.ResolveInstruction()->Arg(0).Resolve() == Value(2u);
+  };
+  Check(!folded(lane_eight) && folded(lane_five),
+        "known bits did not pass through a loop-invariant phi");
+  Check(!folded(counter_eight) && folded(counter_six),
+        "known bits did not hold across a counter stepping by 4");
+  Check(!folded(odd_five), "a compare a loop can satisfy was folded");
+  Check(!folded(waterfall_eight) && folded(waterfall_five),
+        "a waterfall loop's index lost the bits of its masked write");
+  Check(!folded(unmasked_five), "a lane outside the write mask was taken to hold the write");
+}
+
 void TestMaskedWriteChainsCollapse() {
   // Two EXEC-masked writes to one register: s1 = select(e, f, old) and
   // s2 = select(e, g(s1), s1). s2 only needs f where e holds and old elsewhere.
@@ -978,6 +1066,7 @@ int main() {
     TestOptimizationPipeline();
     TestImpossibleEqualitiesFold();
     TestKnownZeroBitsFoldIndexedReads();
+    TestKnownZeroBitsThroughLoopPhis();
     TestMaskedWriteChainsCollapse();
     TestIndexedSelectRunsCollapse();
     TestControlFlowValueSurvivesReadLaneFolding();

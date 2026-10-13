@@ -198,6 +198,63 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
+// Whether every lane where `lanes` holds also has `predicate`: `lanes` is the predicate, a
+// conjunction with a term that implies it, or a phi whose incoming values all do. A phi met
+// again through a loop is taken to imply it, which holds by induction once its other incoming
+// values do: a waterfall loop's EXEC starts as the EXEC before the loop and only loses lanes.
+bool LanesImply(Value lanes, Value predicate, std::vector<const Inst*>& phis, uint32_t& budget) {
+	lanes = lanes.Resolve();
+	if (lanes == predicate) {
+		return true;
+	}
+	const auto* inst = lanes.TryInstruction();
+	if (inst == nullptr || budget == 0) {
+		return false;
+	}
+	budget--;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LogicalAnd:
+			return LanesImply(inst->Arg(0), predicate, phis, budget) ||
+			       LanesImply(inst->Arg(1), predicate, phis, budget);
+		case ValueOpcode::Phi: {
+			if (std::ranges::find(phis, inst) != phis.end()) {
+				return true;
+			}
+			phis.push_back(inst);
+			bool all = inst->NumArgs() != 0;
+			for (size_t index = 0; index < inst->NumArgs() && all; index++) {
+				all = LanesImply(inst->Arg(index), predicate, phis, budget);
+			}
+			phis.pop_back();
+			return all;
+		}
+		default: return false;
+	}
+}
+
+// The value ReadFirstLane reads: in an active lane, a register written under a mask that lane
+// has holds the written value, whatever the inactive lanes kept.
+Value ActiveLaneValue(const Inst& read_first_lane) {
+	auto       value = read_first_lane.Arg(0).Resolve();
+	const auto exec  = read_first_lane.Arg(1);
+	if (exec.IsEmpty()) {
+		return value;
+	}
+	std::vector<const Inst*> phis;
+	for (uint32_t depth = 0; depth < 32; depth++) {
+		const auto* select = value.TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32) {
+			break;
+		}
+		uint32_t budget = 256;
+		if (!LanesImply(exec, select->Arg(0).Resolve(), phis, budget)) {
+			break;
+		}
+		value = select->Arg(1).Resolve();
+	}
+	return value;
+}
+
 // Every value a U32 can take, when that set is small: small bit fields and masks, arithmetic on
 // such sets, selects and phis. V_MOVRELS/V_MOVRELD compare M0 against every register index, but
 // M0 is usually a small field times a stride, so most of those compares are always false.
@@ -348,8 +405,10 @@ private:
 
 public:
 	// Bits that are zero in every value the U32 can take, when its value set is unknown or too
-	// large: a loop counter times 4 still has two low zero bits. Under-approximated: a
-	// loop-carried value is taken to have none.
+	// large: a loop counter times 4 still has two low zero bits. A loop-carried phi starts out
+	// assumed to have every bit zero, and the assumption weakens until the loop agrees with it:
+	// a waterfall loop's index register reaches its header phi from before the loop and from
+	// the phi itself.
 	uint32_t KnownZeros(Value value, uint32_t depth = 0) {
 		value = value.Resolve();
 		if (IsImmediate(value, Type::U32)) {
@@ -362,13 +421,46 @@ public:
 		if (const auto found = m_zeros.find(inst); found != m_zeros.end()) {
 			return found->second;
 		}
+		if (const auto assumed = m_zeros_assumed.find(inst); assumed != m_zeros_assumed.end()) {
+			return assumed->second;
+		}
 		if (std::ranges::find(m_zeros_visiting, inst) != m_zeros_visiting.end()) {
 			return 0;
 		}
+		// Results that depend on an assumption are not final; past the budget, give up on the
+		// assumptions (no known zeros is always correct).
+		if (!m_zeros_assumed.empty()) {
+			if (m_zeros_budget == 0) {
+				return 0;
+			}
+			m_zeros_budget--;
+		}
 		m_zeros_visiting.push_back(inst);
-		const auto zeros = ComputeZeros(*inst, depth + 1);
+		uint32_t zeros = 0;
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			if (m_zeros_assumed.empty()) {
+				m_zeros_budget = 4096;
+			}
+			// Each round only clears bits, so this ends.
+			for (uint32_t assumed = UINT32_MAX;;) {
+				m_zeros_assumed[inst] = assumed;
+				zeros                 = ComputeZeros(*inst, depth + 1) & assumed;
+				if (zeros == assumed || m_zeros_budget == 0) {
+					break;
+				}
+				assumed = zeros;
+			}
+			m_zeros_assumed.erase(inst);
+			if (m_zeros_budget == 0) {
+				zeros = 0;
+			}
+		} else {
+			zeros = ComputeZeros(*inst, depth + 1);
+		}
 		m_zeros_visiting.pop_back();
-		m_zeros.emplace(inst, zeros);
+		if (m_zeros_assumed.empty()) {
+			m_zeros.emplace(inst, zeros);
+		}
 		return zeros;
 	}
 
@@ -417,7 +509,7 @@ private:
 				return ~field | (source & field);
 			}
 			// One lane's value (a waterfall loop's index): the source's known bits hold for it.
-			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadFirstLane: return KnownZeros(ActiveLaneValue(inst), depth);
 			case ValueOpcode::ReadLane: return KnownZeros(inst.Arg(0), depth);
 			case ValueOpcode::SelectU32:
 			case ValueOpcode::Phi: {
@@ -436,6 +528,9 @@ private:
 	std::vector<const Inst*>                               m_visiting;
 	std::unordered_map<const Inst*, uint32_t>              m_zeros;
 	std::vector<const Inst*>                               m_zeros_visiting;
+	// Loop-carried phis being solved, and the bits each is currently assumed to have zero.
+	std::unordered_map<const Inst*, uint32_t>              m_zeros_assumed;
+	uint32_t                                               m_zeros_budget = 0;
 };
 
 // Folds x == C (or x != C) when C is not among x's possible values, or is its only one.
