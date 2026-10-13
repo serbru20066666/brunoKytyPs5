@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -76,6 +77,9 @@ PipelineLibraryCache::Found PipelineLibraryCache::Find(const std::string& key) {
 	auto& entry = iter->second;
 	if (entry.pending.valid()) {
 		KYTY_PROFILER_BLOCK("PipelineLibraryCache::WaitForPrefetch");
+		if (entry.pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+			RunIfQueued(key);
+		}
 		entry.pipeline = entry.pending.get();
 		entry.pending  = {};
 		if (entry.pipeline == nullptr) {
@@ -143,6 +147,24 @@ void PipelineLibraryCache::EnqueueLocked(CompileJob&& job, bool urgent) {
 	}
 }
 
+void PipelineLibraryCache::RunIfQueued(const std::string& key) {
+	static const bool disabled = std::getenv("KYTY_DEBUG_NO_STEAL_PREFETCH") != nullptr;
+	if (disabled) {
+		return;
+	}
+	CompileJob job;
+	{
+		std::lock_guard lock(m_compile_mutex);
+		const auto      queued = std::ranges::find(m_compile_jobs, key, &CompileJob::key);
+		if (queued == m_compile_jobs.end()) {
+			return;
+		}
+		job = std::move(*queued);
+		m_compile_jobs.erase(queued);
+	}
+	job.result.set_value(job.compile());
+}
+
 void PipelineLibraryCache::Promote(const std::string& key) {
 	std::lock_guard lock(m_compile_mutex);
 	const auto      queued = std::ranges::find(m_compile_jobs, key, &CompileJob::key);
@@ -195,6 +217,49 @@ void PipelineLibraryCache::QueueOptimizedLink(const void*                   targ
 		m_link_jobs.push_back(job);
 	}
 	m_link_available.notify_one();
+}
+
+vk::PipelineCache PipelineLibraryCache::FastLinkCache() const {
+	static const bool disabled = std::getenv("KYTY_DEBUG_FAST_LINK_NO_CACHE") != nullptr;
+	return disabled ? nullptr : m_driver_cache;
+}
+
+std::shared_future<vk::Pipeline> PipelineLibraryCache::LinkLater(const void*                   target,
+                                                                 std::span<const vk::Pipeline> parts,
+                                                                 vk::PipelineLayout            layout) {
+	std::array<vk::Pipeline, 4> kept {};
+	EXIT_IF(parts.size() > kept.size());
+	std::ranges::copy(parts, kept.begin());
+	const auto count = static_cast<uint32_t>(parts.size());
+	CompileJob job;
+	job.compile = [this, target, kept, count, layout] {
+		vk::PipelineLibraryCreateInfoKHR libraries {};
+		libraries.libraryCount = count;
+		libraries.pLibraries   = kept.data();
+		vk::GraphicsPipelineCreateInfo info {};
+		info.pNext             = &libraries;
+		info.layout            = layout;
+		info.basePipelineIndex = -1;
+		vk::Pipeline linked    = nullptr;
+		if (m_graphics.device.createGraphicsPipelines(FastLinkCache(), 1, &info, nullptr,
+		                                              &linked) != vk::Result::eSuccess) {
+			LOGF("PipelineLibrary: fast link failed\n");
+			return vk::Pipeline {};
+		}
+		QueueOptimizedLink(target, std::span(kept).first(count), layout);
+		return linked;
+	};
+	auto result = job.result.get_future().share();
+	{
+		std::lock_guard lock(m_compile_mutex);
+		if (m_compile_stopped) {
+			job.result.set_value(nullptr);
+			return result;
+		}
+		EnqueueLocked(std::move(job), true);
+	}
+	m_compile_available.notify_one();
+	return result;
 }
 
 std::optional<vk::Pipeline> PipelineLibraryCache::TakeOptimized(const void* target) {
@@ -259,8 +324,10 @@ void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 		info.flags  = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT;
 		info.layout = job.layout;
 		vk::Pipeline optimized = nullptr;
-		const auto   result =
+		m_link_busy            = true;
+		const auto result =
 		    m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &info, nullptr, &optimized);
+		m_link_busy = false;
 		if (result != vk::Result::eSuccess) {
 			LOGF("PipelineLibrary: optimized link failed (%s); keeping the fast-linked pipeline\n",
 			     vk::to_string(result).c_str());
@@ -284,7 +351,10 @@ void PipelineLibraryCache::CompileThread(const std::stop_token& stop) {
 			job = std::move(m_compile_jobs.front());
 			m_compile_jobs.pop_front();
 		}
-		job.result.set_value(job.compile());
+		m_busy_compiles++;
+		auto pipeline = job.compile();
+		m_busy_compiles--;
+		job.result.set_value(pipeline);
 	}
 }
 

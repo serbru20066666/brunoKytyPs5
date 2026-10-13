@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <future>
@@ -71,12 +72,26 @@ public:
 	// `layout` must stay alive until the result is taken or the thread stops.
 	void QueueOptimizedLink(const void* target, std::span<const vk::Pipeline> parts,
 	                        vk::PipelineLayout layout);
+	// Fast-links `parts` with `layout` on a worker thread ahead of queued prefetches, then queues
+	// the optimized link under `target`. Cold, AMD's fast link of some pipelines takes seconds.
+	// The result is null when the link failed or the cache stopped first.
+	[[nodiscard]] std::shared_future<vk::Pipeline>
+	LinkLater(const void* target, std::span<const vk::Pipeline> parts, vk::PipelineLayout layout);
 	// Nothing while the link is queued or running; then the optimized pipeline, which the caller
 	// now owns, or null when the link failed and the fast-linked pipeline stays.
 	[[nodiscard]] std::optional<vk::Pipeline> TakeOptimized(const void* target);
 	// Stops the link and compile threads and drops queued work. Must run before the driver cache
 	// is destroyed.
 	void Stop();
+
+	// The cache for fast links. Cold, AMD's fast link of a large pixel shader compiles it for
+	// seconds, and the driver's own shader cache did not always keep the result for the next
+	// session; the pipeline cache file does. KYTY_DEBUG_FAST_LINK_NO_CACHE=1 links without it.
+	[[nodiscard]] vk::PipelineCache FastLinkCache() const;
+
+	// Diagnostics: worker jobs running now, and whether an optimized link is running.
+	[[nodiscard]] uint32_t BusyCompiles() const { return m_busy_compiles.load(); }
+	[[nodiscard]] bool     LinkBusy() const { return m_link_busy.load(); }
 
 private:
 	struct Entry {
@@ -104,6 +119,9 @@ private:
 	void CompileThread(const std::stop_token& stop);
 	// Queues a compile job; m_compile_mutex must be held.
 	void EnqueueLocked(CompileJob&& job, bool urgent);
+	// Runs the job of `key` on the calling thread if no worker has started it, instead of waiting
+	// for the jobs queued ahead of it. KYTY_DEBUG_NO_STEAL_PREFETCH=1 waits instead.
+	void RunIfQueued(const std::string& key);
 
 	GraphicContext&                        m_graphics;
 	vk::PipelineCache                      m_driver_cache = nullptr;
@@ -121,6 +139,9 @@ private:
 	std::condition_variable_any m_compile_available;
 	std::deque<CompileJob>      m_compile_jobs;
 	bool                        m_compile_stopped = false;
+
+	std::atomic_uint32_t m_busy_compiles = 0;
+	std::atomic_bool     m_link_busy     = false;
 
 	std::jthread              m_link_thread;
 	std::vector<std::jthread> m_compile_threads;
