@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1660,7 +1661,14 @@ bool MaterializeResourcesLogged(const ResourcePlan& program, const SrtRuntime& r
                                 ReadLog& log) {
 	log.Clear();
 	bool capture_reads = false;
-	if (!MaterializationAllowed(program, runtime, capture_reads) || capture_reads) {
+	// A plan that captures its reads is logged like any other: the capture reads through the
+	// logger's readers too, so an unchanged log still means this refresh is the one a refresh
+	// would produce now. Upstream's plan model marks about a quarter of ASTRO's PLAYROOM's stage
+	// refreshes as capturing; refusing them here left those to the GPU thread (2.0 to 2.6 us of
+	// its time per draw). KYTY_DEBUG_NO_CAPTURE_SPECULATION=1 refuses them again.
+	static const bool refuse_capture = std::getenv("KYTY_DEBUG_NO_CAPTURE_SPECULATION") != nullptr;
+	if (!MaterializationAllowed(program, runtime, capture_reads) ||
+	    (capture_reads && refuse_capture)) {
 		return false;
 	}
 	ReadLogger logger(runtime, log);
