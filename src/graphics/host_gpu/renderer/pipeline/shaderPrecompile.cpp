@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderPrecompile {
 namespace {
 
 constexpr std::array<uint8_t, 8> Magic {'K', 'Y', 'T', 'Y', 'S', 'H', 'D', 'R'};
-constexpr uint32_t               FormatVersion  = 5; // 5: compute async_compute.
+constexpr uint32_t               FormatVersion  = 6; // 6: every BuildStageStaticKey field.
 constexpr uint32_t               MaxCodeWords   = 256u * 1024u;
 constexpr uint32_t               MaxRecordBytes = 4u * 1024u * 1024u;
 constexpr uint64_t               MaxFileBytes   = 256u * 1024u * 1024u;
@@ -156,17 +156,20 @@ void Fields(Archive& a, ShaderVertexInputInfo& i) {
 	a(i.clip_space.scale, i.clip_space.offset, i.clip_space.half_extent, i.clip_space.enabled);
 	Fields(a, static_cast<ShaderWorkgroupInputInfo&>(i.mesh));
 	a(i.mesh.input_primitive, i.mesh.primitives_per_group, i.mesh.vertices_per_group,
-	  i.mesh.max_vertices, i.mesh.max_primitives, i.mesh.provoking_vertex);
+	  i.mesh.max_vertices, i.mesh.max_primitives, i.mesh.provoking_vertex, i.mesh.fast_launch);
 	a(i.tess.input_control_points, i.tess.output_control_points, i.tess.ls_stride, i.tess.hs_stride,
 	  i.tess.domain, i.tess.partitioning, i.tess.output_topology);
 	a(i.fetch_external, i.fetch_embedded);
 }
 
+// A replayed record must rebuild the static key a live lookup builds (BuildStageStaticKey), or the
+// live lookup misses it and compiles again.
 template <typename Archive>
 void Fields(Archive& a, ShaderPixelInputInfo& i) {
 	a(i.interpolator_settings, i.input_num, i.wave_size, i.ps_system_input_base,
-	  i.custom_interpolation_mask, i.ps_perspective_center_vgpr, i.ps_perspective_centroid_vgpr,
-	  i.target_output_mode);
+	  i.custom_interpolation_mask, i.ps_perspective_center_vgpr, i.ps_perspective_sample_vgpr,
+	  i.ps_perspective_centroid_vgpr, i.target_output_mode, i.target_shader_mask,
+	  i.parameter_mode);
 	for (auto& mapping: i.target_export_mapping)
 		a(mapping.packed);
 	a(i.scratch_size_dwords, i.ps_pos_x, i.ps_pos_y, i.ps_pos_z, i.ps_pos_w, i.ps_front_face,
@@ -180,7 +183,7 @@ void Fields(Archive& a, ShaderComputeInputInfo& i) {
 	Fields(a, static_cast<ShaderWorkgroupInputInfo&>(i));
 	// Dispatch sizes are runtime-only; the module uses declared threads_num.
 	a(i.group_id, i.dispatch_thread_dimensions, i.thread_ids_num, i.workgroup_register,
-	  i.tg_size_en, i.async_compute);
+	  i.tg_size_en, i.float_mode, i.async_compute);
 }
 
 template <typename Archive>
@@ -258,6 +261,7 @@ bool Valid(const PermutationRecord& r) {
 	if (const auto* i = std::get_if<ShaderPixelInputInfo>(&r.info)) {
 		return r.stage == ShaderType::Pixel && i->input_num <= 32u && i->wave_size == r.wave_size &&
 		       i->ps_system_input_base <= 255u &&
+		       i->parameter_mode <= ShaderPixelParameterMode::Rectangle &&
 		       (i->ps_perspective_center_vgpr == UINT32_MAX ||
 		        i->ps_perspective_center_vgpr < 255u) &&
 		       (i->ps_perspective_centroid_vgpr == UINT32_MAX ||

@@ -67,6 +67,9 @@ PermutationRecord MakeRecord(ShaderType stage) {
     i.ps_execute_on_noop = true;
     i.target_output_mode[3] = 7;
     i.target_export_mapping[3].packed = 0xc6;
+    i.target_shader_mask = 0x0000f00fu;
+    i.ps_perspective_sample_vgpr = 8;
+    i.parameter_mode = ShaderPixelParameterMode::Rectangle;
     r.info = i;
   } else if (stage == ShaderType::Compute) {
     ShaderComputeInputInfo i;
@@ -80,6 +83,7 @@ PermutationRecord MakeRecord(ShaderType stage) {
     i.scratch_size_dwords = 7;
     i.group_id[2] = true;
     i.tg_size_en = true;
+    i.float_mode = 0x30;
     i.dispatch_threads_num[0] = 12345;
     r.info = i;
   } else {
@@ -112,6 +116,7 @@ PermutationRecord MakeRecord(ShaderType stage) {
     i.mesh.host_subgroup_size = 32;
     i.mesh.max_vertices = 64;
     i.mesh.max_primitives = 32;
+    i.mesh.fast_launch = true;
     i.tess = {.input_control_points = 3,
               .output_control_points = 4,
               .ls_stride = 16,
@@ -160,7 +165,7 @@ void TestAllStagesRoundTrip() {
     if (const auto *i = std::get_if<ShaderVertexInputInfo>(&result.info)) {
       Check(i->logical_stage == stage && i->mesh.host_subgroup_size == 32 &&
                 i->mesh.threads_num[2] == 1 && i->mesh.wave_size == 32 &&
-                i->mesh.max_vertices == 64 &&
+                i->mesh.max_vertices == 64 && i->mesh.fast_launch &&
                 i->tess.output_control_points == 4 && i->tess.hs_stride == 32 &&
                 i->tess.output_topology == 3,
             "mesh and tessellation compilation metadata survives");
@@ -181,12 +186,17 @@ void TestAllStagesRoundTrip() {
                 i->ps_sample_shading &&
                 i->interpolator_settings[1] == 0x76543210,
             "centroid, dual-source and export mappings survive");
+      Check(i->target_shader_mask == 0x0000f00fu &&
+                i->ps_perspective_sample_vgpr == 8 &&
+                i->parameter_mode == ShaderPixelParameterMode::Rectangle,
+            "pixel static-key fields survive");
     } else {
       const auto &compute = std::get<ShaderComputeInputInfo>(result.info);
       Check(
           compute.host_subgroup_size == 32 && compute.threads_num[2] == 2 &&
               compute.group_id[2] && compute.lds_size_dwords == 1024 &&
-              compute.tg_size_en && compute.dispatch_threads_num[0] == 0,
+              compute.tg_size_en && compute.float_mode == 0x30 &&
+              compute.dispatch_threads_num[0] == 0,
           "compute module shape survives without runtime dispatch dimensions");
     }
   }

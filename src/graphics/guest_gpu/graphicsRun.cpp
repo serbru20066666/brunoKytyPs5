@@ -1569,9 +1569,14 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
 
+		// INDEX_BUFFER_SIZE bounds the fetch from the buffer base, so indices past it read as 0. A
+		// GPU-generated draw can start past the end, where the guest address may be unmapped.
+		const uint32_t start_index = args->start_index_location;
 		const uint32_t index_count =
 		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
+		         ? std::min(args->index_count_per_instance,
+		                    start_index < m_index_buffer_size ? m_index_buffer_size - start_index
+		                                                      : 0u)
 		         : args->index_count_per_instance);
 		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
