@@ -842,15 +842,29 @@ vk::Pipeline CreateFragmentPart(GraphicContext& graphics, const GraphicsPipeline
 uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                const GraphicsPipelineState&           state,
                                const PipelineCache::GraphicsPrograms& programs,
-                               PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
+                               PipelineLibraryCache& libraries, vk::PipelineCache driver_cache,
+                               bool link_later) {
 	using Part = vk::GraphicsPipelineLibraryFlagBitsEXT;
 	const vk::PipelineRenderingCreateInfo shader_rendering {};
 	vk::PipelineDynamicStateCreateInfo    shared_dynamic_state {};
 	shared_dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
 	shared_dynamic_state.pDynamicStates    = state.dynamic_states.data();
+	// KYTY_DEBUG_LINK_TIMES=<ms>: prints the steps of every library pipeline that takes that long.
+	static const double link_times_ms = [] {
+		const char* text = std::getenv("KYTY_DEBUG_LINK_TIMES");
+		return text != nullptr ? std::strtod(text, nullptr) : -1.0;
+	}();
+	using Clock               = std::chrono::steady_clock;
+	const auto     step_start = Clock::now();
+	const uint32_t busy_start = libraries.BusyCompiles();
+	const bool     lto_start  = libraries.LinkBusy();
+	const auto     elapsed_ms = [](Clock::time_point from) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - from).count();
+	};
 
 	const auto push_stages = LibraryPushStages(state);
 	CreateGraphicsLayouts(graphics, pipeline, state, push_stages);
+	const double layouts_ms = elapsed_ms(step_start);
 	pipeline.push_constant_stages = push_stages;
 	auto keys = BuildLibraryPartKeys(state, programs);
 
@@ -859,6 +873,8 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	const auto found_pre       = libraries.Find(keys.pre_raster);
 	const auto found_fragment  = libraries.Find(keys.fragment);
 	const auto found_output    = libraries.Find(keys.output);
+	const auto shaders_start   = Clock::now();
+	const double find_ms       = elapsed_ms(step_start) - layouts_ms;
 	auto       vertex_input    = found_input.pipeline;
 	auto       pre_raster      = found_pre.pipeline;
 	auto       fragment        = found_fragment.pipeline;
@@ -890,6 +906,8 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		fragment = libraries.Insert(keys.fragment, fragment_compile.get());
 		built |= 1u << 2u;
 	}
+	const double shaders_ms   = elapsed_ms(shaders_start);
+	const auto   fixed_start  = Clock::now();
 	if (vertex_input == nullptr && !state.mesh) {
 		vk::GraphicsPipelineCreateInfo info {};
 		info.pVertexInputState   = &state.vertex_input;
@@ -921,9 +939,27 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	link.layout            = layout;
 	link.basePipelineIndex = -1;
 	EXIT_IF(pipeline.pipeline != nullptr);
-	EXIT_NOT_IMPLEMENTED(graphics.device.createGraphicsPipelines(nullptr, 1, &link, nullptr,
-	                                                             &pipeline.pipeline) !=
+	if (link_later) {
+		pipeline.pending_link     = libraries.LinkLater(&pipeline, parts, layout);
+		pipeline.optimize_pending = true;
+		return built;
+	}
+	const double fixed_ms   = elapsed_ms(fixed_start);
+	const auto   link_start = Clock::now();
+	EXIT_NOT_IMPLEMENTED(graphics.device.createGraphicsPipelines(libraries.FastLinkCache(), 1, &link,
+	                                                             nullptr, &pipeline.pipeline) !=
 	                     vk::Result::eSuccess);
+	if (link_times_ms >= 0.0) [[unlikely]] {
+		const double link_ms  = elapsed_ms(link_start);
+		const double total_ms = elapsed_ms(step_start);
+		if (total_ms >= link_times_ms) {
+			std::printf("link-times: total=%.1f layouts=%.1f find=%.1f shaders=%.1f fixed=%.1f "
+			            "link=%.1f busy=%u->%u lto=%d->%d built=%x\n",
+			            total_ms, layouts_ms, find_ms, shaders_ms, fixed_ms, link_ms, busy_start,
+			            libraries.BusyCompiles(), lto_start ? 1 : 0, libraries.LinkBusy() ? 1 : 0,
+			            built);
+		}
+	}
 	libraries.QueueOptimizedLink(&pipeline, parts, layout);
 	pipeline.optimize_pending = true;
 	return built;
@@ -1026,6 +1062,10 @@ static const std::vector<uint64_t>& PipelineStatsHashes() {
 	return hashes;
 }
 
+static std::string WritePipelineExecutables(GraphicContext& graphics, vk::Pipeline pipeline,
+                                            const std::string&                    path,
+                                            std::chrono::steady_clock::time_point start);
+
 static void DumpPipelineStatistics(GraphicContext& graphics, const GraphicsPipelineState& state,
                             vk::PipelineLayout layout, uint64_t vertex_hash, uint64_t pixel_hash) {
 	vk::GraphicsPipelineCreateInfo info {};
@@ -1059,6 +1099,16 @@ static void DumpPipelineStatistics(GraphicContext& graphics, const GraphicsPipel
 	static std::atomic_uint32_t dumps = 0;
 	const auto path = fmt::format("pipeline-stats-{:016x}-{:016x}-{}.txt", vertex_hash, pixel_hash,
 	                              dumps++);
+	const auto summary = WritePipelineExecutables(graphics, pipeline, path, start);
+	std::printf("pipeline-stats: vs=%016llx ps=%016llx -> %s:%s\n",
+	            static_cast<unsigned long long>(vertex_hash),
+	            static_cast<unsigned long long>(pixel_hash), path.c_str(), summary.c_str());
+	graphics.device.destroyPipeline(pipeline, nullptr);
+}
+
+static std::string WritePipelineExecutables(GraphicContext& graphics, vk::Pipeline pipeline,
+                                            const std::string&                    path,
+                                            std::chrono::steady_clock::time_point start) {
 	FILE* file = std::fopen(path.c_str(), "w");
 	const vk::PipelineInfoKHR pipeline_info {.pipeline = pipeline};
 	uint32_t                  executables = 0;
@@ -1123,9 +1173,30 @@ static void DumpPipelineStatistics(GraphicContext& graphics, const GraphicsPipel
 	if (file != nullptr) {
 		std::fclose(file);
 	}
-	std::printf("pipeline-stats: vs=%016llx ps=%016llx -> %s:%s\n",
-	            static_cast<unsigned long long>(vertex_hash),
-	            static_cast<unsigned long long>(pixel_hash), path.c_str(), summary.c_str());
+	return summary;
+}
+
+// As DumpPipelineStatistics, for a compute pipeline: pipeline-stats-cs-<hash>-<n>.txt.
+static void DumpComputePipelineStatistics(GraphicContext&                     graphics,
+                                          const vk::ComputePipelineCreateInfo& create_info,
+                                          uint64_t                             hash) {
+	auto info = create_info;
+	info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR |
+	              vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	vk::Pipeline pipeline = nullptr;
+	const auto   start    = std::chrono::steady_clock::now();
+	if (graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline) !=
+	        vk::Result::eSuccess ||
+	    pipeline == nullptr) {
+		std::printf("pipeline-stats: capture failed cs=%016llx\n",
+		            static_cast<unsigned long long>(hash));
+		return;
+	}
+	static std::atomic_uint32_t dumps = 0;
+	const auto path    = fmt::format("pipeline-stats-cs-{:016x}-{}.txt", hash, dumps++);
+	const auto summary = WritePipelineExecutables(graphics, pipeline, path, start);
+	std::printf("pipeline-stats: cs=%016llx -> %s:%s\n", static_cast<unsigned long long>(hash),
+	            path.c_str(), summary.c_str());
 	graphics.device.destroyPipeline(pipeline, nullptr);
 }
 
@@ -1136,7 +1207,8 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
                            const ShaderPixelInputInfo*            ps_input_info,
                            const PipelineCache::GraphicsPrograms& programs,
                            const PipelineStaticParameters&        static_params,
-                           PipelineLibraryCache* libraries, vk::PipelineCache driver_cache) {
+                           PipelineLibraryCache* libraries, vk::PipelineCache driver_cache,
+                           bool link_later) {
 	GraphicsPipelineState state(graphics.device);
 	BuildGraphicsPipelineState(state, graphics, rendering, vertex_input, vertex_info, ps_input_info,
 	                           programs, static_params);
@@ -1153,7 +1225,8 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
 	int library_parts = -1;
 	if (libraries != nullptr && UsesLibraries(graphics, state)) {
 		library_parts = static_cast<int>(
-		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache));
+		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache,
+		                          link_later));
 	} else {
 		CreateMonolithicPipeline(graphics, pipeline, state, driver_cache);
 	}
@@ -1203,7 +1276,7 @@ Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&     
 	                               wave_size >= graphics.min_subgroup_size &&
 	                               wave_size <= graphics.max_subgroup_size;
 	return [&graphics, layout = pipeline.pipeline_layout, compute_module, driver_cache, wave_size,
-	        required_subgroup] {
+	        required_subgroup, hash = input_info.stage.program->shader_hash] {
 		vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size {};
 		vk::ComputePipelineCreateInfo                         info {};
 		info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -1220,6 +1293,11 @@ Common::UniqueFunction<vk::Pipeline> PrepareComputePipeline(GraphicContext&     
 		    vk::Result::eSuccess) {
 			LOGF("PipelineCache: compute pipeline creation failed\n");
 			return vk::Pipeline {};
+		}
+		if (const auto& hashes = PipelineStatsHashes();
+		    !hashes.empty() && graphics.pipeline_executable_info_enabled &&
+		    std::ranges::find(hashes, hash) != hashes.end()) [[unlikely]] {
+			DumpComputePipelineStatistics(graphics, info, hash);
 		}
 		return pipeline;
 	};

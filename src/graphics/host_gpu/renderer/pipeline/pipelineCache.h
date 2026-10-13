@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -157,6 +158,9 @@ public:
 		vk::ShaderStageFlags    push_constant_stages {};
 		// Fast-linked from pipeline libraries, with a link-time-optimized link still to swap in.
 		bool                    optimize_pending      = false;
+		// Asynchronous pipelines: the fast link still running on a worker thread, while
+		// `pipeline` is null (optimize_pending is set too).
+		std::shared_future<vk::Pipeline> pending_link;
 	};
 
 	struct GraphicsPrograms {
@@ -310,7 +314,8 @@ private:
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 // Creates a graphics pipeline, from pipeline-library parts when `libraries` is given and the
 // pipeline qualifies. Returns -1 for a monolithic pipeline, otherwise a bit per library part it
-// compiled (vertex input, pre-rasterization, fragment shader, fragment output).
+// compiled (vertex input, pre-rasterization, fragment shader, fragment output). With
+// `link_later`, a library pipeline is linked on a worker thread (see Pipeline::pending_link).
 int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                            const PipelineRenderingState&          rendering,
                            const PipelineVertexInputState&        vertex_input,
@@ -318,7 +323,8 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
                            const ShaderPixelInputInfo*            ps_input_info,
                            const PipelineCache::GraphicsPrograms& programs,
                            const PipelineStaticParameters&        static_params,
-                           PipelineLibraryCache* libraries, vk::PipelineCache driver_cache);
+                           PipelineLibraryCache* libraries, vk::PipelineCache driver_cache,
+                           bool link_later = false);
 // Compiles the missing shader library parts of a graphics pipeline on the library cache's worker
 // threads. Returns the number of parts queued. `ready`, when given, receives whether the
 // pipeline can be created without waiting for a shader part to compile.

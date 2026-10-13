@@ -1385,6 +1385,13 @@ PipelineCache::~PipelineCache() {
 			}
 		}
 	};
+	for (const auto& [key, pipeline]: m_graphics_pipelines) {
+		(void)key;
+		// Save stopped the library cache, which resolved every link.
+		if (pipeline->pending_link.valid()) {
+			pipeline->pipeline = pipeline->pending_link.get();
+		}
+	}
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	// Prefetched compute pipelines no dispatch took: their pipelines belong to the library cache.
@@ -2002,6 +2009,13 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// Asynchronous pipelines also skip a draw while its pipeline links on a worker thread.
+// KYTY_DEBUG_NO_LINK_LATER=1 links on the draw's thread instead.
+static bool LinkLaterEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_NO_LINK_LATER") == nullptr;
+	return enabled;
+}
+
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -2245,6 +2259,27 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	                          .sample_shading = ps_active && ps_input_info->ps_sample_shading,
 	                          .valid          = found != nullptr && found == m_last_graphics_pipeline};
 	if (found != nullptr) {
+		if (found->pending_link.valid()) [[unlikely]] {
+			if (may_defer && found->pending_link.wait_for(std::chrono::seconds(0)) !=
+			                     std::future_status::ready) {
+				m_deferred_draws[key]++;
+				return nullptr;
+			}
+			const auto linked = found->pending_link.get();
+			if (linked == nullptr) {
+				// The library cache stopped (shutdown) before linking it.
+				return nullptr;
+			}
+			found->pipeline     = linked;
+			found->pending_link = {};
+			if (PermutationLogEnabled()) [[unlikely]] {
+				const auto deferred = m_deferred_draws.find(key);
+				std::printf("pipeline: linked later deferred=%u%s\n",
+				            deferred != m_deferred_draws.end() ? deferred->second : 0u,
+				            may_defer ? "" : " sync");
+			}
+			m_deferred_draws.erase(key);
+		}
 		if (found->optimize_pending) [[unlikely]] {
 			InstallOptimizedPipeline(*found, command);
 		}
@@ -2284,7 +2319,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	const int library_parts =
 	    CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                           ps_input_info, programs, static_params, m_libraries.get(),
-	                           m_driver_cache);
+	                           m_driver_cache, may_defer && LinkLaterEnabled());
 	m_graphics_pipelines_created++;
 	if (PermutationLogEnabled()) [[unlikely]] {
 		// "libs=" lists the library parts compiled: vertex input, pre-rasterization, fragment
@@ -2319,15 +2354,19 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	const bool link_pending = cached->pending_link.valid();
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr && !link_pending);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
+	if (link_pending) {
+		m_deferred_draws[key]++;
+	}
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 	m_last_graphics_key      = iter->first;
 	m_last_graphics_pipeline = iter->second.get();
 
-	return iter->second.get();
+	return link_pending ? nullptr : iter->second.get();
 }
 
 // Whether a draw with these registers looks its programs up (GetGraphicsPrograms), as the draw
