@@ -20,6 +20,8 @@ public:
 	static constexpr uint64_t CommandOffset = 32;
 	static constexpr uint64_t OutputSize    = 48;
 	static constexpr uint64_t ArgumentsSize = 20;
+	// A guest DRAW_INDIRECT argument block, laid out as a VkDrawIndirectCommand.
+	static constexpr uint64_t DrawArgumentsSize = 16;
 
 	struct Params {
 		uint32_t index_bytes          = 0;
@@ -44,6 +46,12 @@ public:
 	// arguments and before the indirect mesh draw. Must be recorded outside a rendering instance.
 	void Record(vk::CommandBuffer command, const Buffer& arguments, uint64_t arguments_offset,
 	            const Buffer& output, uint64_t output_offset, const Params& params);
+
+	// Copies a GPU-written guest DRAW_INDIRECT argument block to `output` as the command of a
+	// non-indexed indirect draw, with the first vertex and instance cleared unless
+	// `keep_offsets`, and the barriers around it. Must be recorded outside a rendering instance.
+	void RecordDraw(vk::CommandBuffer command, const Buffer& arguments, uint64_t arguments_offset,
+	                const Buffer& output, uint64_t output_offset, bool keep_offsets);
 
 private:
 	GraphicContext&         m_graphics;

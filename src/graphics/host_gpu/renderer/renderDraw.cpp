@@ -783,8 +783,9 @@ struct DrawCallInfo {
 	uint32_t             index_count    = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
-	// Guest address of GPU-written DrawIndexedIndirectArgs. When set, the counts above are
-	// placeholders and the mesh draw is built on the GPU (see MeshIndirectArgs).
+	// Guest address of GPU-written DrawIndexedIndirectArgs, or DrawIndirectArgs for a non-indexed
+	// draw. When set, the counts above are placeholders and the draw is built on the GPU (see
+	// MeshIndirectArgs).
 	uint64_t             indirect_args  = 0;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
@@ -1083,6 +1084,9 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// A non-indexed GPU-args draw takes its first vertex and instance from the arguments (a
+	// rewritten fetch needs them in Vulkan's); a native fetch draws with both 0.
+	bool     indirect_offsets = false;
 };
 
 struct DrawIndexBufferSource {
@@ -2050,9 +2054,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	// The command processor sends GPU-args draws here when the stages select mesh emulation (the
-	// same merged-stage bit PrepareProgram checks), or for indexed list draws, which draw from the
-	// arguments directly.
-	EXIT_IF(gpu_args && !draw.IsIndexed());
+	// same merged-stage bit PrepareProgram checks), or for indexed list draws and non-indexed
+	// draws, which draw from the arguments directly.
+	EXIT_IF(gpu_args && mesh_active && !draw.IsIndexed());
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
@@ -2155,7 +2159,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		gpu_output        = offset;
 		gpu_output_mapped = mapped;
 		gpu_arguments = m_context.GetBufferCache().ObtainBuffer(
-		    draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false);
+		    draw.indirect_args,
+		    draw.IsIndexed() ? MeshIndirectArgs::ArgumentsSize : MeshIndirectArgs::DrawArgumentsSize,
+		    false);
 	} else if (mesh_active) {
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		const auto& mesh   = state.vertex_info[0].mesh;
@@ -2275,8 +2281,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_mesh_indirect = std::make_unique<MeshIndirectArgs>(m_context.GetGraphics());
 		}
 		const auto index_limit =
-		    static_cast<uint32_t>(index_source.size / index_source.guest_element_size);
-		if (mesh_active) {
+		    draw.IsIndexed()
+		        ? static_cast<uint32_t>(index_source.size / index_source.guest_element_size)
+		        : 0u;
+		if (!draw.IsIndexed()) {
+			m_mesh_indirect->RecordDraw(vk_buffer, *gpu_arguments.first, gpu_arguments.second,
+			                            records, gpu_output, emit.indirect_offsets);
+		} else if (mesh_active) {
 			const auto& mesh      = state.vertex_info[0].mesh;
 			const auto& limits    = m_context.GetGraphics().mesh_shader_properties;
 			const auto  max_total = std::max(1u, limits.maxMeshWorkGroupTotalCount);
@@ -2399,7 +2410,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			vk_buffer.drawMeshTasksEXT(slice.group_count, slice.instance_count, 1);
 		}
 	} else {
-		if (gpu_args) {
+		if (gpu_args && !draw.IsIndexed()) {
+			vk_buffer.drawIndirect(records.Handle(), gpu_output, 1, sizeof(vk::DrawIndirectCommand));
+		} else if (gpu_args) {
 			vk_buffer.drawIndexedIndirect(records.Handle(), gpu_output + MeshIndirectArgs::RecordOffset, 1,
 			                              sizeof(vk::DrawIndexedIndirectCommand));
 		} else {
@@ -2692,8 +2705,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	CheckRegistersOnce(buffer);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
+	                         args.instance_count, args.first_instance, args.indirect_args};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
@@ -2734,6 +2747,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_vertex = native_indirect ? 0 :
 	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = native_indirect ? 0 : instance_offset;
+	emit.indirect_offsets = !native_indirect;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

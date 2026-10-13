@@ -1474,8 +1474,15 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+	if (DrawIndirectFromGpuArgs(m_draw_indirect_args_base_addr + data_offset, registers, indexed)) {
+		return;
+	}
+	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
+}
 
-	const auto address  = m_draw_indirect_args_base_addr + data_offset;
+bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawRegisters registers,
+                                               bool indexed) {
 	const auto size     = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	const bool gpu_args = m_renderer.GetBufferCache().IsRegionGpuModified(address, size);
 	const bool mesh     = (m_ctx.GetShaderStages() & 0x20u) != 0; // As in PrepareProgram.
@@ -1506,10 +1513,20 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 		           .offset_source  = DrawOffsetSource::IndirectArgs,
 		           .indirect_args  = address,
 		           .index_limit    = m_index_buffer_size});
-		return;
+		return true;
 	}
-	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
+	// A non-indexed draw draws from them directly too: the guest layout is
+	// VkDrawIndirectCommand's. (Legacy quad lists are drawn in pieces of 4 vertices.)
+	if (!indexed && gpu_args && !patches && !mesh &&
+	    prim_type != Prospero::PrimitiveType::kQuadListLegacy && Config::GpuMeshIndirectEnabled()) {
+		m_num_instances_address = address + offsetof(DrawIndirectArgs, instance_count);
+		DrawIndexAuto({.vertex_count   = 1,
+		               .instance_count = 1,
+		               .offset_source  = DrawOffsetSource::IndirectArgs,
+		               .indirect_args  = address});
+		return true;
+	}
+	return false;
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
