@@ -1481,17 +1481,18 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::InitializeShaderPrecompile() {
-	// Reuse the Release/source-key/driver gate: records from different recompiler or pipeline
-	// sources carry a different key and are discarded.
+	// Reuse the Release/source-key/driver gate. Records are guest code and metadata, not
+	// translations, so they outlive recompiler, pipeline and driver changes: the first session
+	// after an update replays them too. Only the game's version and the record format (in the
+	// journal header) invalidate them.
 	if (!Config::ShaderPrecompileEnabled() || m_driver_cache == nullptr ||
 	    m_driver_cache_path.empty())
 		return;
 	auto path = m_driver_cache_path;
 	path.replace_extension(".shaders");
-	auto        key = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::string app_version;
 	(void)Loader::SystemContentParamSfoGetString("APP_VER", &app_version);
-	key += app_version;
+	const auto key = "KytyPJ:" + app_version;
 	auto records = m_program_cache->recording.Open(path, key);
 	if (records.empty()) return;
 	PipelineCacheLog("Shader precompile: replaying {} recorded permutations", records.size());
@@ -1566,6 +1567,23 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			    ProgramCache::CompileModule(m_graphics.device, params.code, options, std::move(translated),
 			                                record.specialization, record.push_data_start_dword);
 			result.valid = true;
+			// Compiles the compute pipeline once into the driver's caches, so the dispatch that
+			// creates it finds it there: with a new build every pipeline is new to the driver,
+			// and a compute pipeline cannot be skipped like a draw. Graphics pipelines depend on
+			// state the records do not keep. KYTY_DEBUG_NO_WARM_COMPUTE=1 skips this.
+			static const bool warm = std::getenv("KYTY_DEBUG_NO_WARM_COMPUTE") == nullptr;
+			if (const auto* compute = std::get_if<ShaderComputeInputInfo>(&record.info);
+			    warm && compute != nullptr) {
+				// The layouts depend on the program only, not on the resources.
+				static const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
+				auto info            = *compute;
+				info.stage.program   = &result.compiled.program;
+				info.stage.resources = &no_resources;
+				Pipeline objects;
+				objects.pipeline = PrepareComputePipeline(m_graphics, objects, info,
+				                                          result.compiled.module, m_driver_cache)();
+				DestroyPipelineObjects(m_graphics, objects);
+			}
 		}
 	};
 	const auto threads = std::clamp(std::thread::hardware_concurrency(), 2u, 8u) - 1u;
