@@ -11,15 +11,56 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+
+#if defined(_WIN32)
+// Declared here rather than through windows.h, whose min/max macros break this file.
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long frames_to_skip, unsigned long frames_to_capture, void** back_trace,
+    unsigned long* back_trace_hash);
+#endif
 
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
+
+// KYTY_DEBUG_DRAIN_STACK=<ms> (Windows): prints the return addresses of every full drain that
+// took at least that long. pruebas_bruno/kyty/pilas_drenaje.py groups and symbolizes them.
+class DrainStackTrace final {
+public:
+	DrainStackTrace(): m_start(std::chrono::steady_clock::now()) {}
+	~DrainStackTrace() {
+#if defined(_WIN32)
+		static const int threshold_ms = [] {
+			const char* value = std::getenv("KYTY_DEBUG_DRAIN_STACK");
+			return value != nullptr ? std::atoi(value) : -1;
+		}();
+		if (threshold_ms < 0) return;
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                    std::chrono::steady_clock::now() - m_start)
+		                    .count();
+		static std::atomic<uint32_t> printed {0};
+		if (ms < threshold_ms || printed.fetch_add(1) >= 20000) return;
+		void*      frames[24] {};
+		const auto count = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+		std::printf("drain-stack: %lld ms:", static_cast<long long>(ms));
+		for (unsigned short i = 0; i < count; i++) {
+			std::printf(" %p", frames[i]);
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+#endif
+	}
+
+private:
+	std::chrono::steady_clock::time_point m_start;
+};
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
@@ -234,6 +275,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	DrainStackTrace       trace;
 	DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
 	const auto            tick = Submit();
 	m_master.Wait(tick);
@@ -243,6 +285,7 @@ void CommandScheduler::FlushAndWait() {
 void CommandScheduler::Finish() {
 	CheckActive();
 	{
+		DrainStackTrace       trace;
 		DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
 		if (!m_command.IsInvalid()) {
 			Submit();
@@ -257,6 +300,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
+		DrainStackTrace       trace;
 		DrainStats::WaitTimer timer(DrainStats::Kind::FullDrain);
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
