@@ -186,6 +186,10 @@ public:
 private:
 	friend class DrawSpeculator;
 
+	// Draws one indirect draw from GPU-written arguments without reading them on the CPU, when
+	// the draw allows it. False when the arguments must be read.
+	bool DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawRegisters registers, bool indexed);
+
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,

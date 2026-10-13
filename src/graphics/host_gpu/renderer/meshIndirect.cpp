@@ -155,4 +155,42 @@ void MeshIndirectArgs::Record(vk::CommandBuffer command, const Buffer& arguments
 	command.pipelineBarrier2(dependency);
 }
 
+void MeshIndirectArgs::RecordDraw(vk::CommandBuffer command, const Buffer& arguments,
+                                  uint64_t arguments_offset, const Buffer& output,
+                                  uint64_t output_offset, bool keep_offsets) {
+	GpuZones::Mark(command, DrainStats::Zone::MeshArgs);
+	EXIT_IF(output_offset % sizeof(uint32_t) != 0 || arguments_offset > arguments.Size() ||
+	        DrawArgumentsSize > arguments.Size() - arguments_offset ||
+	        output_offset > output.Size() || DrawArgumentsSize > output.Size() - output_offset);
+
+	vk::MemoryBarrier2 before {};
+	before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	before.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	before.dstStageMask  = vk::PipelineStageFlagBits2::eAllTransfer;
+	before.dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &before;
+	command.pipelineBarrier2(dependency);
+
+	// Vertex and instance count, then first vertex and first instance. The two writes do not
+	// overlap, so they need no barrier between them.
+	constexpr uint64_t counts_size = 2 * sizeof(uint32_t);
+	command.copyBuffer(arguments.Handle(), output.Handle(),
+	                   vk::BufferCopy {arguments_offset, output_offset,
+	                                   keep_offsets ? DrawArgumentsSize : counts_size});
+	if (!keep_offsets) {
+		command.fillBuffer(output.Handle(), output_offset + counts_size,
+		                   DrawArgumentsSize - counts_size, 0);
+	}
+
+	vk::MemoryBarrier2 after {};
+	after.srcStageMask         = vk::PipelineStageFlagBits2::eAllTransfer;
+	after.srcAccessMask        = vk::AccessFlagBits2::eTransferWrite;
+	after.dstStageMask         = vk::PipelineStageFlagBits2::eDrawIndirect;
+	after.dstAccessMask        = vk::AccessFlagBits2::eIndirectCommandRead;
+	dependency.pMemoryBarriers = &after;
+	command.pipelineBarrier2(dependency);
+}
+
 } // namespace Libs::Graphics
