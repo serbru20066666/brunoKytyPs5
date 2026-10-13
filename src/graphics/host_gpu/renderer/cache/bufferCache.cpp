@@ -1031,7 +1031,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	if (!m_texture_cache.ClearMeta(vaddr)) {
+		m_texture_cache.NoteUnclaimedFill(vaddr, size);
+	}
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images. A page
 		// that is already CPU-dirty does not fault: start a BDA epoch either way.

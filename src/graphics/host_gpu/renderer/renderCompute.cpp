@@ -375,12 +375,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (resources.specialization_reads.empty() &&
-	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                 thread_group_z, mode))) {
-		ResetBindings();
-		return;
+	if (resources.specialization_reads.empty()) {
+		bool consumed = TryConsumeComputeMetaClear(input_info, buffer);
+		if (!consumed) {
+			ShaderBufferResource fill_descriptor;
+			uint32_t             fill_value = 0;
+			uint64_t             fill_size  = 0;
+			if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y,
+			                             thread_group_z, mode, fill_descriptor, fill_value,
+			                             fill_size)) {
+				buffer.GetContext().GetTextureCache().NoteUnclaimedFill(fill_descriptor.Base48(),
+				                                                        fill_size);
+			}
+			consumed = TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+			                                       thread_group_y, thread_group_z, mode);
+		}
+		if (consumed) {
+			ResetBindings();
+			return;
+		}
 	}
 
 	if (use_thread_dimensions) {

@@ -157,6 +157,10 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// A uniform compute fill of memory that holds no known surface metadata. A game that resizes
+	// its depth targets (dynamic resolution) clears the new HTile before the first draw binds it:
+	// when a depth target registers HTile at a recently filled address, it starts cleared.
+	void NoteUnclaimedFill(uint64_t address, uint64_t size);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -285,6 +289,13 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// NoteUnclaimedFill's fills, oldest first, with the tick each was recorded at.
+	struct UnclaimedFill {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t tick    = 0;
+	};
+	std::vector<UnclaimedFill> m_unclaimed_fills;
 	// Bumped when a surface's clear state changes (ClearMeta, TouchMeta). With
 	// m_surface_meta_generation it validates m_meta_clear_memo.
 	std::atomic<uint64_t> m_meta_clear_generation {0};

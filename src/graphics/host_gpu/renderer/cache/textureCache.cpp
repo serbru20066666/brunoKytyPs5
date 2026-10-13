@@ -41,6 +41,14 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// A fill counts for a depth target registered within this many submissions: about two frames.
+constexpr uint64_t UnclaimedFillTicks = 64;
+constexpr size_t   UnclaimedFillsMax  = 64;
+
+static bool InPlaceResizeEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_NO_INPLACE_RESIZE") == nullptr;
+	return enabled;
+}
 
 // KYTY_GPU_ZONES: describe an image the first time it is refreshed for each cause, so the guest
 // addresses that key its zone rows can be matched to a size, format, and writer.
@@ -433,10 +441,25 @@ void TextureCache::DeleteImage(ImageId id, std::vector<ImageId>* retired) {
 	}
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
-		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
+		const auto meta_address = image->info.metadata.range.address;
+		const auto metadata     = m_surface_metas.find(meta_address);
+		// A depth target resized in place at the same allocation keeps the HTile address: the
+		// entry, and its clear state, belong to the replacement too.
+		const auto shares_htile = [&] {
+			for (const auto other_id:
+			     FindImagesInRegion(image->info.data.address, image->info.data.size, false)) {
+				const auto* other = m_slot_images.try_get(other_id);
+				if (other_id != id && other != nullptr && other->registered &&
+				    other->info.metadata.kind == ImageMetadataKind::Htile &&
+				    other->info.metadata.range.address == meta_address) {
+					return true;
+				}
+			}
+			return false;
+		};
 		if (metadata != m_surface_metas.end() &&
 		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
+		    metadata->second.type == MetaDataInfo::Type::HTile && !shares_htile()) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
 			m_surface_meta_generation.fetch_add(1, std::memory_order_release);
@@ -1050,6 +1073,27 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
 		     static_cast<uint32_t>(cached.info.tile_mode));
+	}
+
+	// A surface regrown in place (dynamic resolution) at an unchanged row pitch keeps every texel
+	// at its guest address, so the game can read back what it wrote at the smaller extent.
+	if (!merged_id && InPlaceResizeEnabled() && requested.data == cached.info.data &&
+	    requested.extent != cached.info.extent &&
+	    requested.extent.width >= cached.info.extent.width &&
+	    requested.extent.height >= cached.info.extent.height &&
+	    requested.extent.depth == cached.info.extent.depth && requested_block == cached_block &&
+	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
+	    requested.type == cached.info.type && !requested.IsVolume() &&
+	    requested.resources == cached.info.resources && requested.resources.levels == 1 &&
+	    requested.resources.layers == 1 && requested.tile_mode == cached.info.tile_mode &&
+	    !requested.IsDepth() && !cached.info.IsDepth() && !requested.HasMetadata() &&
+	    !cached.info.HasMetadata() &&
+	    requested.GetColorTransform() == cached.info.GetColorTransform() &&
+	    requested.mip_layout[0].offset == cached.info.mip_layout[0].offset &&
+	    requested.mip_layout[0].pitch == cached.info.mip_layout[0].pitch &&
+	    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+	    cached.IsGpuModified()) {
+		return {ExpandImage(requested, cached_id)};
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
@@ -2216,11 +2260,24 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		if (m_surface_metas
-		        .emplace(desc.info.metadata.range.address,
-		                 MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                               .clear_mask = image.info.htile_clear_mask})
-		        .second) {
+		const auto& range = desc.info.metadata.range;
+		// Rendered contents are not a clear: an image whose entry went away (an aliasing image
+		// freed it) only starts cleared again through a recognized clear of the HTile.
+		const auto [meta, inserted] = m_surface_metas.emplace(
+		    range.address,
+		    MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
+		                  .clear_mask = image.IsGpuModified() ? 0 : image.info.htile_clear_mask});
+		if (inserted) {
+			const auto tick = m_scheduler.CurrentTick();
+			const auto fill = std::ranges::find_if(m_unclaimed_fills, [&](const UnclaimedFill& f) {
+				return f.address == range.address && f.size >= range.size &&
+				       tick - std::min(tick, f.tick) <= UnclaimedFillTicks;
+			});
+			if (fill != m_unclaimed_fills.end()) {
+				meta->second.clear_mask = UINT32_MAX;
+				m_meta_clear_generation.fetch_add(1, std::memory_order_release);
+				m_unclaimed_fills.erase(fill);
+			}
 			m_surface_meta_generation.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
@@ -2818,6 +2875,26 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	found->second.clear_mask = UINT32_MAX;
 	m_meta_clear_generation.fetch_add(1, std::memory_order_release);
 	return true;
+}
+
+static bool UnclaimedFillsEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_NO_UNCLAIMED_FILLS") == nullptr;
+	return enabled;
+}
+
+void TextureCache::NoteUnclaimedFill(uint64_t address, uint64_t size) {
+	if (!UnclaimedFillsEnabled() || address == 0 || size == 0) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       tick = m_scheduler.CurrentTick();
+	std::erase_if(m_unclaimed_fills, [&](const UnclaimedFill& fill) {
+		return fill.address == address || tick - std::min(tick, fill.tick) > UnclaimedFillTicks;
+	});
+	if (m_unclaimed_fills.size() >= UnclaimedFillsMax) {
+		m_unclaimed_fills.erase(m_unclaimed_fills.begin());
+	}
+	m_unclaimed_fills.push_back({.address = address, .size = size, .tick = tick});
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
