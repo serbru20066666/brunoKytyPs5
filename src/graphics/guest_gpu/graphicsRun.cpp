@@ -1582,74 +1582,6 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	return false;
 }
 
-// KYTY_DEBUG_MULTI_DRAW=1: after each multi-draw packet reads its count and arguments, waits for
-// the GPU and compares them with the bytes in the GPU buffer, printing the packets that read
-// something else, and prints each frame's packets and draws.
-static bool DebugMultiDrawEnabled() {
-	static const bool enabled = std::getenv("KYTY_DEBUG_MULTI_DRAW") != nullptr;
-	return enabled;
-}
-
-static void DebugCheckMultiDraw(RenderContext& renderer, uint64_t args_addr, uint32_t max_count,
-                                const volatile uint32_t* count_addr, uint32_t draw_count,
-                                uint32_t stride, uint64_t args_size, bool indexed) {
-	static uint32_t frame_seen = 0;
-	static uint32_t packets    = 0;
-	static uint64_t draws      = 0;
-	static uint32_t mismatches = 0;
-	static uint32_t printed    = 0;
-	const uint32_t  frame      = renderer.GetGpu().GetFrameNum();
-	if (frame != frame_seen) {
-		std::printf("multi-draw-frame: frame=%u packets=%u draws=%" PRIu64 " mismatches=%u\n",
-		            frame_seen, packets, draws, mismatches);
-		frame_seen = frame;
-		packets    = 0;
-		draws      = 0;
-		mismatches = 0;
-	}
-	packets++;
-	draws += draw_count;
-
-	auto&    buffers   = renderer.GetBufferCache();
-	uint32_t gpu_count = max_count;
-	bool     count_buf = false;
-	if (count_addr != nullptr) {
-		const auto address = reinterpret_cast<uint64_t>(count_addr);
-		count_buf          = buffers.DebugReadGpuCopy(address, &gpu_count, sizeof(gpu_count));
-		gpu_count          = std::min(gpu_count, max_count);
-	}
-	const uint32_t entries = std::min(std::max(draw_count, gpu_count), std::min(max_count, 4096u));
-	uint32_t       args_differ = 0;
-	uint32_t       first_differ = UINT32_MAX;
-	bool           args_buf     = false;
-	if (entries != 0) {
-		const uint64_t        bytes = static_cast<uint64_t>(entries - 1) * stride + args_size;
-		std::vector<uint8_t>  gpu(bytes);
-		std::vector<uint8_t>  cpu(bytes);
-		args_buf = buffers.DebugReadGpuCopy(args_addr, gpu.data(), bytes);
-		std::memcpy(cpu.data(), reinterpret_cast<const void*>(args_addr), bytes);
-		for (uint32_t i = 0; args_buf && i < entries; i++) {
-			const uint64_t offset = static_cast<uint64_t>(i) * stride;
-			if (std::memcmp(cpu.data() + offset, gpu.data() + offset, args_size) != 0) {
-				args_differ++;
-				first_differ = std::min(first_differ, i);
-			}
-		}
-	}
-	const bool count_differs = count_buf && gpu_count != draw_count;
-	if (count_differs || args_differ != 0) {
-		mismatches++;
-		if (printed++ < 2000) {
-			std::printf("multi-draw: frame=%u %s args=%016" PRIx64 " count_addr=%016" PRIx64
-			            " max=%u count cpu=%u gpu=%u (buf %d) args differ=%u of %u first=%u (buf %d)\n",
-			            frame, indexed ? "indexed" : "plain", args_addr,
-			            reinterpret_cast<uint64_t>(count_addr), max_count, draw_count, gpu_count,
-			            count_buf ? 1 : 0, args_differ, entries, first_differ, args_buf ? 1 : 0);
-			std::fflush(stdout);
-		}
-	}
-}
-
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
@@ -1667,12 +1599,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	if (DebugMultiDrawEnabled()) [[unlikely]] {
-		DebugCheckMultiDraw(m_renderer, m_draw_indirect_args_base_addr + data_offset,
-		                    max_count_or_count, count_addr, draw_count, stride_in_bytes,
-		                    args_size, indexed);
-	}
-
 	if (draw_count == 0) {
 		return;
 	}
