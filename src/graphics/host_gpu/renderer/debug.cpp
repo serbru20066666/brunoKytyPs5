@@ -13,7 +13,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -748,6 +750,74 @@ void RecordFullBarrier(vk::CommandBuffer command) noexcept {
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);
+}
+
+bool DebugFrameDrawsEnabled() noexcept {
+	static const bool enabled = std::getenv("KYTY_DEBUG_FRAME_DRAWS") != nullptr;
+	return enabled;
+}
+
+void DebugFrameDrawsNote(uint32_t frame, bool dispatch, uint64_t shader_hash, uint64_t other_hash,
+                         uint32_t count) noexcept {
+	static std::mutex mutex;
+	static uint32_t   current    = 0;
+	static uint32_t   draws      = 0;
+	static uint32_t   dispatches = 0;
+	static uint64_t   draw_sig   = 1469598103934665603ull;
+	static uint64_t   cs_sig     = 1469598103934665603ull;
+	static uint64_t   count_sig  = 1469598103934665603ull;
+	static uint32_t   skipped    = 0;
+	// Per shader (draws: vertex and pixel shader pair), how often this frame and the previous one.
+	static std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> shader_counts;
+	static std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> pixel_counts;
+	const auto        mix        = [](uint64_t hash, uint64_t value) {
+        return (hash ^ value) * 1099511628211ull;
+	};
+	std::lock_guard lock(mutex);
+	if (frame != current) {
+		std::printf("frame-draws: frame=%u draws=%u sig=%016" PRIx64 " counts=%016" PRIx64
+		            " dispatches=%u csig=%016" PRIx64 " skipped=%u\n",
+		            current, draws, draw_sig, count_sig, dispatches, cs_sig, skipped);
+		std::string changes;
+		const auto  compare = [&](auto& counts, const char* kind) {
+			for (auto it = counts.begin(); it != counts.end();) {
+				auto& [previous, now] = it->second;
+				if (previous != now && changes.size() < 3000) {
+					changes += fmt::format(" {}{:016x}:{}->{}", kind, it->first, previous, now);
+				}
+				previous = now;
+				now      = 0;
+				it       = previous == 0 ? counts.erase(it) : std::next(it);
+			}
+		};
+		compare(shader_counts, "c");
+		compare(pixel_counts, "p");
+		if (!changes.empty()) {
+			std::printf("frame-draws: frame=%u changed%s\n", current, changes.c_str());
+		}
+		current    = frame;
+		draws      = 0;
+		dispatches = 0;
+		skipped    = 0;
+		draw_sig   = 1469598103934665603ull;
+		cs_sig     = 1469598103934665603ull;
+		count_sig  = 1469598103934665603ull;
+	}
+	if (shader_hash == 0) {
+		skipped++;
+		std::printf("frame-draws: frame=%u skipped %s\n", frame, dispatch ? "dispatch" : "draw");
+		return;
+	}
+	if (dispatch) {
+		dispatches++;
+		cs_sig = mix(mix(cs_sig, shader_hash), count);
+		shader_counts[shader_hash].second++;
+		return;
+	}
+	pixel_counts[other_hash].second++;
+	draws++;
+	draw_sig  = mix(mix(draw_sig, shader_hash), other_hash);
+	count_sig = mix(count_sig, count);
 }
 
 static std::atomic<bool> g_ab_off {false};
