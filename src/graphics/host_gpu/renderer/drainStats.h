@@ -59,6 +59,7 @@ enum class Kind : uint8_t {
 	Lookahead,          // A pipeline look-ahead walk, including the shaders it translated, in ns.
 	GpuThreadIdle,      // Thread_Gpu waiting for a submission or command, in ns.
 	StaleRead,          // A guest read answered with previous bytes (relaxed readback).
+	KnownRead,          // GPU-thread bytes on a GPU-written page read without waiting.
 	Count,
 };
 

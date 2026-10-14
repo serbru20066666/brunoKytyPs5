@@ -106,6 +106,11 @@ public:
 	// recorded. A CPU store there would wait for that work to finish first. False when the
 	// range is not GPU-dirty, or KYTY_DEBUG_EOP_CPU_WRITE is set: the caller stores itself.
 	[[nodiscard]] bool WriteGpuDirty(uint64_t vaddr, const void* bytes, uint64_t size);
+	// GPU thread, for bytes on a page the GPU wrote: copies them without waiting for that work
+	// when they are known anyway. Either WriteGpuDirty stored them and nothing has written them
+	// since, or no buffer or image holds GPU-written bytes there (the backing is current). False:
+	// read the guest mapping, which waits. KYTY_DEBUG_NO_CLEAN_READS=1 always says false.
+	[[nodiscard]] bool TryReadKnownBytes(uint64_t vaddr, void* out, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -230,6 +235,13 @@ private:
 	};
 	std::array<CleanPage, 64> m_clean_pages {};
 	uint64_t                  m_gpu_dirty_generation = 1;
+	// Values WriteGpuDirty recorded, newest last. Any other GPU write to their bytes drops them.
+	struct StoredValue {
+		uint64_t vaddr = 0;
+		uint64_t size  = 0;
+		uint64_t value = 0;
+	};
+	std::vector<StoredValue> m_stored_values;
 	// ObtainBuffer's stream-ring copies of the current BDA epoch, by range (see there).
 	struct StreamCopy {
 		uint64_t vaddr        = 0;

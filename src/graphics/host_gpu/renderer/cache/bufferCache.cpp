@@ -963,6 +963,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		(void)SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	if (is_written) {
+		if (!m_stored_values.empty()) {
+			std::erase_if(m_stored_values, [vaddr, size](const StoredValue& stored) {
+				return stored.vaddr < vaddr + size && vaddr < stored.vaddr + stored.size;
+			});
+		}
 		if (m_gpu_modified_ranges.Add(vaddr, size)) {
 			m_gpu_dirty_generation++;
 		}
@@ -1081,7 +1086,40 @@ bool BufferCache::WriteGpuDirty(uint64_t vaddr, const void* bytes, uint64_t size
 	(void)dst_offset;
 	WriteDataBuffer(*dst, vaddr, bytes, size);
 	OnCommandRecorded();
+	constexpr size_t MaxStoredValues = 64;
+	if (m_stored_values.size() == MaxStoredValues) {
+		m_stored_values.erase(m_stored_values.begin());
+	}
+	StoredValue stored {.vaddr = vaddr, .size = size};
+	std::memcpy(&stored.value, bytes, size);
+	m_stored_values.push_back(stored);
 	return true;
+}
+
+bool BufferCache::TryReadKnownBytes(uint64_t vaddr, void* out, uint64_t size) {
+	static const bool disabled = std::getenv("KYTY_DEBUG_NO_CLEAN_READS") != nullptr;
+	if (disabled || size == 0 || vaddr > UINT64_MAX - size || !GuestGpu::IsGpuThread() ||
+	    (!IsPageGpuDirtyHint(vaddr) && !IsPageGpuDirtyHint(vaddr + size - 1))) {
+		return false;
+	}
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (!HasGpuDirtyBytes(vaddr, size)) {
+		if (!LibKernel::Memory::TryReadBacking(vaddr, out, size)) {
+			return false;
+		}
+		DrainStats::Record(DrainStats::Kind::KnownRead, 1);
+		return true;
+	}
+	for (auto it = m_stored_values.rbegin(); it != m_stored_values.rend(); ++it) {
+		if (it->vaddr == vaddr && it->size == size) {
+			std::memcpy(out, &it->value, size);
+			DrainStats::Record(DrainStats::Kind::KnownRead, 2);
+			return true;
+		}
+	}
+	return false;
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

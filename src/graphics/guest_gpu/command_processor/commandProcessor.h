@@ -157,6 +157,9 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	// A label the GPU may own; see BufferCache::TryReadKnownBytes.
+	template <typename T>
+	[[nodiscard]] T ReadLabel(const T* addr);
 	// A packet decides on guest memory the CPU may have just written: later draws reading memory
 	// through addresses must see the CPU's writes (RenderContext::PrepareBda).
 	void AdvanceBdaEpoch();
@@ -197,6 +200,9 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
+	// The packet itself, or a copy of it when its page holds GPU-written bytes elsewhere: then
+	// reading the guest mapping would wait for that work. Valid until the thread's next call.
+	[[nodiscard]] const uint32_t* ReadablePacket(const uint32_t* packet, uint32_t remaining_dw);
 	// After a draw that created a pipeline: walks the rest of the command stream without
 	// executing it, replaying only register writes into a copy of the register state, and asks
 	// the pipeline cache to prefetch the shader library parts of the draws it finds, so a loading

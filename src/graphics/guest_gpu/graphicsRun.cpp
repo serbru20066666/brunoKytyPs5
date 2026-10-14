@@ -482,7 +482,17 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	// The CPU may have written the data this wait guards just before its flag.
 	AdvanceBdaEpoch();
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	T value {};
+	if (!m_renderer.GetBufferCache().TryReadKnownBytes(reinterpret_cast<uint64_t>(addr), &value,
+	                                                   sizeof(T))) {
+		value = *static_cast<const volatile T*>(addr);
+	} else if (TestWaitRegMemValue(value, ref, mask, func)) {
+		// Passed without waiting for the GPU, which is what used to order the work before the
+		// write (often another queue's) against the work after the wait.
+		EmitGlobalBarrier();
+		return;
+	}
+	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -491,6 +501,19 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
                                                      uint32_t, uint32_t);
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
+
+template <typename T>
+T CommandProcessor::ReadLabel(const T* addr) {
+	T value {};
+	if (!m_renderer.GetBufferCache().TryReadKnownBytes(reinterpret_cast<uint64_t>(addr), &value,
+	                                                   sizeof(T))) {
+		value = *static_cast<const volatile T*>(addr);
+	}
+	return value;
+}
+
+template uint32_t CommandProcessor::ReadLabel<uint32_t>(const uint32_t*);
+template uint64_t CommandProcessor::ReadLabel<uint64_t>(const uint64_t*);
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
@@ -990,6 +1013,38 @@ static bool PassesGuestCopies(uint32_t opcode, uint32_t header) {
 	}
 }
 
+const uint32_t* CommandProcessor::ReadablePacket(const uint32_t* packet, uint32_t remaining_dw) {
+	auto&      buffers     = m_renderer.GetBufferCache();
+	const auto address     = reinterpret_cast<uint64_t>(packet);
+	const bool first_dirty = buffers.IsPageGpuDirtyHint(address);
+	uint32_t   header      = 0;
+	if (!first_dirty) {
+		header = packet[0];
+	} else if (!buffers.TryReadKnownBytes(address, &header, sizeof(header))) {
+		return packet;
+	}
+	const uint32_t size_dw = std::min(
+	    header == 0x80000000u || Pm4::PacketSizeDw(header) == 1u ? 1u
+	                                                             : std::max(KYTY_PM4_LEN(header), 1u),
+	    remaining_dw);
+	const auto end   = address + uint64_t {size_dw} * sizeof(uint32_t);
+	bool       dirty = first_dirty;
+	for (auto page = (address & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE; !dirty && page < end;
+	     page += TRACKER_PAGE_SIZE) {
+		dirty = buffers.IsPageGpuDirtyHint(page);
+	}
+	if (!dirty) {
+		return packet;
+	}
+	// Handlers only read their own packet; the spare dwords keep a wrong length harmless.
+	thread_local std::vector<uint32_t> copy;
+	copy.assign(std::max<size_t>(size_dw, 64), 0);
+	if (!buffers.TryReadKnownBytes(address, copy.data(), uint64_t {size_dw} * sizeof(uint32_t))) {
+		return packet;
+	}
+	return copy.data();
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	// KYTY_DEBUG_DRAW_PHASES: the time in each handler and between them (see Pm4OpTimer).
 	static const bool timed       = DrawPhaseTimer::Hash() != 0;
@@ -1008,7 +1063,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
+		const auto* const data          = ReadablePacket(packet, remaining_dw);
+		const auto        packet_header = data[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
@@ -1040,12 +1096,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			    packet_dw >= 7) {
 				static std::atomic<uint32_t> log_count {0};
 				if (log_count.fetch_add(1) < 128) {
-					const auto dst = packet[3] | (static_cast<uint64_t>(packet[4]) << 32u);
-					const auto val = packet[5] | (static_cast<uint64_t>(packet[6]) << 32u);
+					const auto dst = data[3] | (static_cast<uint64_t>(data[4]) << 32u);
+					const auto val = data[5] | (static_cast<uint64_t>(data[6]) << 32u);
 					LOGF("\t predicated skip: R_RELEASE_MEM dst=0x%016" PRIx64
 					     ", value=0x%016" PRIx64 ", action=0x%08" PRIx32
 					     ", gcr/data/int=0x%08" PRIx32 "\n",
-					     dst, val, packet[1], packet[2]);
+					     dst, val, data[1], data[2]);
 				}
 			}
 			cursor.offset_dw += packet_dw;
@@ -1108,7 +1164,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			g_pm4_ops.outcome = Pm4OpTimer::Drawn;
 		}
 		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		    handler(*this, packet_header & ~1u, data + 1, remaining_dw, total_dw) + 1;
 		if (timed) [[unlikely]] {
 			handler_end       = DrawPhaseTimer::Now();
 			const auto ticks = handler_end - handler_start;

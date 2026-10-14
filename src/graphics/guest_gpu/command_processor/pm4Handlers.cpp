@@ -1477,7 +1477,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
 	cp.AdvanceBdaEpoch();
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(
+	    cp.ReadLabel(const_cast<const uint64_t*>(compare_addr)), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
