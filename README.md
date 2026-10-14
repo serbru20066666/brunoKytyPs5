@@ -21,9 +21,11 @@ Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.5.1**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
+Versión **0.5.2**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
-**Nuevo en 0.5.1 — menos tirones en EA SPORTS FC 27.** La precarga de sombreadores guardaba
+**Nuevo en 0.5.2 — más fps en el partido de EA SPORTS FC 27.** El cómputo de la tela dejaba el resto de la GPU parada: había una barrera detrás de cada despacho, y el juego ya ordena ese trabajo con sus propias esperas. Ahora esos despachos se solapan. Los dibujos indirectos múltiples cuyos argumentos escribe la GPU se lanzan desde esa copia, sin leerlos en la CPU. En un partido completo el título marcó entre 28 y 41 fps (antes, 21–29). El sonido sigue muy bajo y no llega a 60.
+
+**De la 0.5.1 — menos tirones en EA SPORTS FC 27.** La precarga de sombreadores guardaba
 cada sombreador sin cinco datos de su configuración, y al reproducirlo no coincidía con el que
 pedía el juego: se volvía a traducir y compilar jugando. Ahora se reutilizan y, en el recorrido
 de prueba hasta el partido, los tirones de 100 ms o más pasan de 57 (28 s en total) a unos 15
