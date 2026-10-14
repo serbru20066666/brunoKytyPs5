@@ -118,6 +118,13 @@ static QString PathKey(const QString& path) {
 #endif
 }
 
+// Games kept next to the program, one folder up. A portable copy still finds them when the
+// saved drive letter does not exist on this computer.
+static QString PortableGamesRoot() {
+	return QDir::cleanPath(
+	    QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(QStringLiteral("..")));
+}
+
 static QStringList NormalizeGameDirectories(const QStringList& dirs) {
 	QStringList   dirs_ret;
 	QSet<QString> seen;
@@ -636,16 +643,42 @@ static Configuration* FindCustomInfo(QMap<QString, Configuration*>* custom_infos
 	}
 
 	custom = custom_infos->find(legacy_game_path);
-	if (custom == custom_infos->end()) {
-		return nullptr;
+	if (custom != custom_infos->end()) {
+		auto* info = custom.value();
+		custom_infos->erase(custom);
+		info->game_path = game_path;
+		custom_infos->insert(game_path, info);
+		return info;
 	}
 
-	auto* info = custom.value();
-	custom_infos->erase(custom);
-	info->game_path = game_path;
-	custom_infos->insert(game_path, info);
-
-	return info;
+	// A portable copy keeps the old drive letter in its settings. The game folder name still
+	// matches, so the saved adjustments follow the game to the new letter.
+	const auto folder_name = QFileInfo(QDir::cleanPath(game_path)).fileName();
+#ifdef __linux__
+	const auto want = folder_name;
+#else
+	const auto want = folder_name.toCaseFolded();
+#endif
+	if (want.isEmpty()) {
+		return nullptr;
+	}
+	for (auto it = custom_infos->begin(); it != custom_infos->end(); ++it) {
+		const auto saved = QFileInfo(QDir::cleanPath(it.key())).fileName();
+#ifdef __linux__
+		const auto saved_key = saved;
+#else
+		const auto saved_key = saved.toCaseFolded();
+#endif
+		if (saved_key != want) {
+			continue;
+		}
+		auto* info = it.value();
+		custom_infos->erase(it);
+		info->game_path = game_path;
+		custom_infos->insert(game_path, info);
+		return info;
+	}
+	return nullptr;
 }
 
 bool ConfigurationListWidget::EnsureGameDirectory() {
@@ -667,7 +700,8 @@ bool ConfigurationListWidget::HasValidGameDirectory() const {
 		}
 	}
 
-	return false;
+	const auto beside = PortableGamesRoot();
+	return !beside.isEmpty() && QDir(beside).exists();
 }
 
 void ConfigurationListWidget::ScanGameDirectory() {
@@ -808,7 +842,24 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		}
 	};
 
-	for (const auto& root_path: m_game_dirs) {
+	// The folder beside the launcher is where a portable copy keeps its games. Scanning it
+	// as well means the list still fills in when the drive letter is no longer the one saved.
+	QStringList roots = m_game_dirs;
+	const auto  beside = PortableGamesRoot();
+	if (!beside.isEmpty() && QDir(beside).exists()) {
+		bool listed = false;
+		for (const auto& dir: roots) {
+			if (PathKey(dir) == PathKey(beside)) {
+				listed = true;
+				break;
+			}
+		}
+		if (!listed) {
+			roots.append(beside);
+		}
+	}
+
+	for (const auto& root_path: roots) {
 		QDir root(root_path);
 		if (root_path.isEmpty() || !root.exists()) {
 			continue;
