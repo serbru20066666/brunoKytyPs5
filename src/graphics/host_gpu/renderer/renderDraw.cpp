@@ -787,6 +787,8 @@ struct DrawCallInfo {
 	// draw. When set, the counts above are placeholders and the draw is built on the GPU (see
 	// MeshIndirectArgs).
 	uint64_t             indirect_args  = 0;
+	uint32_t             indirect_count = 1;
+	uint32_t             indirect_stride = 0;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -951,6 +953,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		if (DebugFrameDrawsEnabled() && depth.desc.info.extent.width > 2400 &&
+		    depth.depth_load_clear_enable) [[unlikely]] {
+			std::printf("frame-draws: frame=%d depth-load-clear img=%u 0x%016" PRIx64
+			            " %ux%u htile=0x%016" PRIx64 " db=%d meta=%d\n",
+			            m_context.GetGpu().GetFrameNum(), depth.image_id.index,
+			            depth.desc.info.data.address, depth.desc.info.extent.width,
+			            depth.desc.info.extent.height, metadata.range.address,
+			            depth.depth_clear_enable ? 1 : 0, meta_clear ? 1 : 0);
+		}
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -1552,6 +1563,17 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (DebugFrameDrawsEnabled()) [[unlikely]] {
+		const auto frame = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+		if (state.programs.pending) {
+			DebugFrameDrawsNote(frame, false, 0, 0, 0);
+		} else {
+			DebugFrameDrawsNote(
+			    frame, false, state.vertex_info[0].stage.program->shader_hash,
+			    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+			    draw.indirect_args != 0 ? 0xffffffffu : draw.index_count * 65537u ^ draw.instance_count);
+		}
+	}
 	if (state.programs.pending) {
 		// Asynchronous pipelines: a shader is still translating; skip the draw until it is ready.
 		return false;
@@ -2152,16 +2174,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const uint8_t*               gpu_output_mapped = nullptr;
 	std::pair<Buffer*, uint64_t> gpu_arguments = {nullptr, 0};
 	if (gpu_args) {
-		// The GPU writes this slot; the CPU only reserves it.
-		const auto [mapped, offset] = records.Map(MeshIndirectArgs::OutputSize, 64);
-		EXIT_IF(mapped == nullptr);
-		records.Commit();
-		gpu_output        = offset;
-		gpu_output_mapped = mapped;
-		gpu_arguments = m_context.GetBufferCache().ObtainBuffer(
-		    draw.indirect_args,
-		    draw.IsIndexed() ? MeshIndirectArgs::ArgumentsSize : MeshIndirectArgs::DrawArgumentsSize,
-		    false);
+		const auto command_size = draw.IsIndexed() ? MeshIndirectArgs::ArgumentsSize
+		                                           : MeshIndirectArgs::DrawArgumentsSize;
+		const auto stride = draw.indirect_stride != 0 ? draw.indirect_stride : command_size;
+		const auto count  = std::max(draw.indirect_count, 1u);
+		gpu_arguments     = m_context.GetBufferCache().ObtainBuffer(
+		    draw.indirect_args, uint64_t {stride} * (count - 1u) + command_size, false);
+		// One converted slot is enough for a single draw; a multi-draw reads the guest
+		// commands in place (see the drawIndirect below).
+		if (count == 1) {
+			const auto [mapped, offset] = records.Map(MeshIndirectArgs::OutputSize, 64);
+			EXIT_IF(mapped == nullptr);
+			records.Commit();
+			gpu_output        = offset;
+			gpu_output_mapped = mapped;
+		}
 	} else if (mesh_active) {
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		const auto& mesh   = state.vertex_info[0].mesh;
@@ -2275,36 +2302,48 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (gpu_args) {
 		// Build the draw's command (and for mesh emulation its record) from the GPU-written
 		// arguments. This compute pass and its barriers must precede rendering and the
-		// graphics bindings below.
+		// graphics bindings below. A multi-draw reads the guest commands in place.
 		m_context.GetCommandScheduler().EndRendering();
-		if (m_mesh_indirect == nullptr) {
+		if (draw.indirect_count > 1) {
+			vk::MemoryBarrier2 before {};
+			before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+			before.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+			before.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+			before.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
+			vk::DependencyInfo dependency {};
+			dependency.memoryBarrierCount = 1;
+			dependency.pMemoryBarriers    = &before;
+			vk_buffer.pipelineBarrier2(dependency);
+		} else if (m_mesh_indirect == nullptr) {
 			m_mesh_indirect = std::make_unique<MeshIndirectArgs>(m_context.GetGraphics());
 		}
-		const auto index_limit =
-		    draw.IsIndexed()
-		        ? static_cast<uint32_t>(index_source.size / index_source.guest_element_size)
-		        : 0u;
-		if (!draw.IsIndexed()) {
-			m_mesh_indirect->RecordDraw(vk_buffer, *gpu_arguments.first, gpu_arguments.second,
-			                            records, gpu_output, emit.indirect_offsets);
-		} else if (mesh_active) {
-			const auto& mesh      = state.vertex_info[0].mesh;
-			const auto& limits    = m_context.GetGraphics().mesh_shader_properties;
-			const auto  max_total = std::max(1u, limits.maxMeshWorkGroupTotalCount);
-			m_mesh_indirect->Record(
-			    vk_buffer, *gpu_arguments.first, gpu_arguments.second, records, gpu_output,
-			    {.index_bytes          = index_source.guest_element_size,
-			     .index_address        = index_source.address,
-			     .index_limit          = index_limit,
-			     .primitive_size       = mesh.InputPrimitiveSize(),
-			     .primitive_step       = mesh.InputPrimitiveStep(),
-			     .primitives_per_group = mesh.primitives_per_group,
-			     .max_groups = std::min(std::max(1u, limits.maxMeshWorkGroupCount[0]), max_total),
-			     .max_instances = std::max(1u, limits.maxMeshWorkGroupCount[1]),
-			     .max_total     = max_total});
-		} else {
-			m_mesh_indirect->Record(vk_buffer, *gpu_arguments.first, gpu_arguments.second, records,
-			                        gpu_output, {.index_limit = index_limit, .plain = true});
+		if (draw.indirect_count <= 1) {
+			const auto index_limit =
+			    draw.IsIndexed()
+			        ? static_cast<uint32_t>(index_source.size / index_source.guest_element_size)
+			        : 0u;
+			if (!draw.IsIndexed()) {
+				m_mesh_indirect->RecordDraw(vk_buffer, *gpu_arguments.first, gpu_arguments.second,
+				                            records, gpu_output, emit.indirect_offsets);
+			} else if (mesh_active) {
+				const auto& mesh      = state.vertex_info[0].mesh;
+				const auto& limits    = m_context.GetGraphics().mesh_shader_properties;
+				const auto  max_total = std::max(1u, limits.maxMeshWorkGroupTotalCount);
+				m_mesh_indirect->Record(
+				    vk_buffer, *gpu_arguments.first, gpu_arguments.second, records, gpu_output,
+				    {.index_bytes          = index_source.guest_element_size,
+				     .index_address        = index_source.address,
+				     .index_limit          = index_limit,
+				     .primitive_size       = mesh.InputPrimitiveSize(),
+				     .primitive_step       = mesh.InputPrimitiveStep(),
+				     .primitives_per_group = mesh.primitives_per_group,
+				     .max_groups = std::min(std::max(1u, limits.maxMeshWorkGroupCount[0]), max_total),
+				     .max_instances = std::max(1u, limits.maxMeshWorkGroupCount[1]),
+				     .max_total     = max_total});
+			} else {
+				m_mesh_indirect->Record(vk_buffer, *gpu_arguments.first, gpu_arguments.second,
+				                        records, gpu_output, {.index_limit = index_limit, .plain = true});
+			}
 		}
 	}
 	if (!mesh_active) {
@@ -2410,7 +2449,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			vk_buffer.drawMeshTasksEXT(slice.group_count, slice.instance_count, 1);
 		}
 	} else {
-		if (gpu_args && !draw.IsIndexed()) {
+		if (gpu_args && draw.indirect_count > 1) {
+			const auto command_size = draw.IsIndexed() ? MeshIndirectArgs::ArgumentsSize
+			                                           : MeshIndirectArgs::DrawArgumentsSize;
+			const auto stride = draw.indirect_stride != 0 ? draw.indirect_stride : command_size;
+			const auto buffer_handle = gpu_arguments.first->Handle();
+			for (uint32_t i = 0; i < draw.indirect_count; i++) {
+				const auto offset = gpu_arguments.second + uint64_t {stride} * i;
+				if (draw.IsIndexed()) {
+					vk_buffer.drawIndexedIndirect(buffer_handle, offset, 1, stride);
+				} else {
+					vk_buffer.drawIndirect(buffer_handle, offset, 1, stride);
+				}
+			}
+		} else if (gpu_args && !draw.IsIndexed()) {
 			vk_buffer.drawIndirect(records.Handle(), gpu_output, 1, sizeof(vk::DrawIndirectCommand));
 		} else if (gpu_args) {
 			vk_buffer.drawIndexedIndirect(records.Handle(), gpu_output + MeshIndirectArgs::RecordOffset, 1,
@@ -2619,7 +2671,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance, args.indirect_args};
+	                        args.instance_count, args.first_instance, args.indirect_args,
+	                        args.indirect_count, args.indirect_stride};
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
@@ -2706,7 +2759,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	CheckRegistersOnce(buffer);
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
-	                         args.instance_count, args.first_instance, args.indirect_args};
+	                         args.instance_count, args.first_instance, args.indirect_args,
+	                         args.indirect_count, args.indirect_stride};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
