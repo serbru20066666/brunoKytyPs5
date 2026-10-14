@@ -68,6 +68,9 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Debugging: waits for the GPU and copies the range straight from the buffer holding it,
+	// whatever the readback tracking says. False when no buffer holds the whole range.
+	[[nodiscard]] bool     DebugReadGpuCopy(uint64_t vaddr, void* out, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// FindBuffer, keeping `id` while it is a live buffer covering the range (as ObtainBuffer does):
@@ -99,6 +102,10 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Stores 4 or 8 bytes into a range the GPU already owns, in the command buffer being
+	// recorded. A CPU store there would wait for that work to finish first. False when the
+	// range is not GPU-dirty, or KYTY_DEBUG_EOP_CPU_WRITE is set: the caller stores itself.
+	[[nodiscard]] bool WriteGpuDirty(uint64_t vaddr, const void* bytes, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

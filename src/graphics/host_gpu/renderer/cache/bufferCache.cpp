@@ -378,6 +378,25 @@ void BufferCache::RecordReadback(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 }
 
+bool BufferCache::DebugReadGpuCopy(uint64_t vaddr, void* out, uint64_t size) {
+	if (size == 0 || !IsRegionRegistered(vaddr, size)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	if (!buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	Buffer staging(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	               vk::BufferUsageFlagBits::eTransferDst, size);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	staging.CopyFrom(command, buffer, buffer.Offset(vaddr), 0, size);
+	m_scheduler.Finish();
+	staging.Invalidate(0, size);
+	std::memcpy(out, staging.Mapped().data(), size);
+	return true;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1047,6 +1066,22 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 	OnCommandRecorded();
+}
+
+bool BufferCache::WriteGpuDirty(uint64_t vaddr, const void* bytes, uint64_t size) {
+	static const bool force_cpu = std::getenv("KYTY_DEBUG_EOP_CPU_WRITE") != nullptr;
+	if (force_cpu || bytes == nullptr || (size != 4 && size != 8) || (vaddr & 3u) != 0 ||
+	    vaddr > UINT64_MAX - size || !IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	// The guest mapping keeps the previous bytes. A later CPU read faults and downloads this
+	// store; shaders read the buffer, which is where the write lands.
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, TextureCache::GpuWriteSource::Copy);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true);
+	(void)dst_offset;
+	WriteDataBuffer(*dst, vaddr, bytes, size);
+	OnCommandRecorded();
+	return true;
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

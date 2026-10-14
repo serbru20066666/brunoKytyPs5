@@ -15,6 +15,27 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+thread_local bool t_evaluating_condition = false;
+
+class ConditionScope {
+public:
+	ConditionScope(): m_previous(t_evaluating_condition) { t_evaluating_condition = true; }
+	~ConditionScope() { t_evaluating_condition = m_previous; }
+	ConditionScope(const ConditionScope&)            = delete;
+	ConditionScope& operator=(const ConditionScope&) = delete;
+
+private:
+	bool m_previous;
+};
+
+} // namespace
+
+bool EvaluatingCondition() noexcept {
+	return t_evaluating_condition;
+}
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
@@ -1007,6 +1028,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		}
 		uint32_t condition = 0;
 		auto&    evaluator = index < direct.size() && direct[index] != 0u ? *this : strict;
+		ConditionScope condition_scope;
 		if (!block.condition.IsEmpty() &&
 		    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
 		    evaluator.Evaluate(block.condition, condition)) {
@@ -2133,8 +2155,9 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	const bool evaluates = m_runtime.read_specialization_memory != nullptr ||
 	                       !m_program.capture_specialization_reads;
 	const auto outcome   = [&](uint32_t index) -> uint8_t {
-		uint32_t condition = 0;
-		auto&    evaluator = m_compiled.direct_conditions[index] != 0u ? *this : strict;
+		uint32_t       condition = 0;
+		auto&          evaluator = m_compiled.direct_conditions[index] != 0u ? *this : strict;
+		ConditionScope condition_scope;
 		if (!evaluator.Evaluate(m_compiled.conditions[index], condition)) {
 			return 2u;
 		}

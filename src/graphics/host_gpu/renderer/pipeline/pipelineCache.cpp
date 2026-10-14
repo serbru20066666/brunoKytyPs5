@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -136,9 +137,53 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// KYTY_DEBUG_SPEC_GPU_READ=1: prints the specialization reads that wait for the GPU, with the
+// shader, the address and whether the bytes the backing held before the wait were already right.
+thread_local uint64_t t_spec_read_hash = 0;
+
+bool DebugSpecGpuRead() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_SPEC_GPU_READ") != nullptr;
+	return enabled;
+}
+
+// KYTY_DEBUG_STRICT_CONDITIONS=1: a condition read waits for the GPU like any other strict read.
+bool StrictConditionReads() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_STRICT_CONDITIONS") != nullptr;
+	return enabled;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+	// A branch on data the GPU is still writing is left to the shader rather than waited for.
+	if (ShaderRecompiler::IR::EvaluatingCondition() && !StrictConditionReads()) {
+		return !values.empty() && Libs::LibKernel::Memory::TryReadBufferBackingNoWait(
+		                              address, values.data(), values.size_bytes());
+	}
+	if (DebugSpecGpuRead() && !values.empty()) [[unlikely]] {
+		std::vector<uint32_t> stale(values.size());
+		const bool had   = Libs::LibKernel::Memory::TryReadBacking(address, stale.data(),
+		                                                           values.size_bytes());
+		const auto start = std::chrono::steady_clock::now();
+		const bool ok    = Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+		                                                                 values.size_bytes());
+		const double ms  = std::chrono::duration<double, std::milli>(
+		                      std::chrono::steady_clock::now() - start)
+		                      .count();
+		static std::atomic<uint32_t> printed {0};
+		if (ok && ms >= 0.5 && printed.fetch_add(1) < 4000) {
+			uint32_t changed = 0;
+			for (size_t i = 0; i < values.size(); i++) {
+				changed += had && stale[i] != values[i] ? 1u : 0u;
+			}
+			std::printf("spec-gpu-read: hash=%016llx addr=%016llx dwords=%zu ms=%.2f changed=%u "
+			            "first=%08x\n",
+			            static_cast<unsigned long long>(t_spec_read_hash),
+			            static_cast<unsigned long long>(address), values.size(), ms,
+			            had ? changed : 0xffffffffu, values[0]);
+		}
+		return ok;
+	}
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
@@ -799,6 +844,7 @@ struct PipelineCache::ProgramCache {
 		const bool urgent     = wait == ProgramWait::Defer;
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		t_spec_read_hash     = params.hash;
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),

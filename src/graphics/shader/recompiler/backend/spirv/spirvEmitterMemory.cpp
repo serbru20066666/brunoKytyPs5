@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -37,6 +38,29 @@ uint32_t LoadElementOrZero(EmitterState& state, const MemoryResourceAccess& reso
 		return load(index);
 	}
 	return Select(state, TypeU32(state), in_bounds, load(index), ConstantU32(state, 0));
+}
+
+// LDS and scratch accesses are guarded once, by "lane active and element in bounds". A load is
+// then issued without a branch: an invalid lane loads element 0, which always exists, and gets
+// zero. Two nested branches around every load cost AMD's compiler about ten instructions each and
+// kept neighbouring loads apart; EA SPORTS FC 27's cloth solver makes dozens per loop iteration.
+// KYTY_DEBUG_BRANCHY_LOCAL_LOADS=1 restores the nested branches.
+bool GuardLocalAccessOnce(const EmitterState& state, const MemoryResourceAccess& resource) {
+	static const bool keep_branches = std::getenv("KYTY_DEBUG_BRANCHY_LOCAL_LOADS") != nullptr;
+	if (keep_branches) return false;
+	if (resource.kind == IR::ResourceKind::Lds) return LdsDwordCount(state) > 0u;
+	if (resource.kind == IR::ResourceKind::Scratch) return state.program.scratch_dwords > 0u;
+	return false;
+}
+
+bool IsLocalMemory(IR::ResourceKind kind) {
+	return kind == IR::ResourceKind::Lds || kind == IR::ResourceKind::Scratch;
+}
+
+template <typename Fn>
+uint32_t LoadLocalElementOrZero(EmitterState& state, uint32_t valid, uint32_t index, Fn&& load) {
+	const auto element = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0));
+	return Select(state, TypeU32(state), valid, load(element), ConstantU32(state, 0));
 }
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
@@ -322,7 +346,19 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	const auto active = ctx.Arg(inst, inst.NumArgs() - 1);
+	if (IsLocalMemory(mem.kind)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (GuardLocalAccessOnce(ctx.state, resource)) {
+			const auto index = DwordIndex(ctx, inst, mem);
+			const auto valid = AndCondition(ctx.state, active,
+			                                EmitMemoryElementInBounds(ctx.state, resource, index));
+			return LoadLocalElementOrZero(ctx.state, valid, index, [&](uint32_t element) {
+				return LoadWordInBounds(ctx, resource, element);
+			});
+		}
+	}
+	return EmitValueOrZeroIfCondition(ctx.state, active, [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
 	});
@@ -380,7 +416,21 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	const auto active = ctx.Arg(inst, inst.NumArgs() - 1);
+	if (IsLocalMemory(mem.kind)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (GuardLocalAccessOnce(ctx.state, resource) && resource.element_bits == 32u) {
+			const auto address = ByteAddress(ctx, inst, mem);
+			const auto index   = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
+			                            address, ConstantU32(ctx.state, 2));
+			const auto valid   = AndCondition(ctx.state, active,
+			                                  EmitMemoryElementInBounds(ctx.state, resource, index));
+			return LoadLocalElementOrZero(ctx.state, valid, index, [&](uint32_t element) {
+				return LoadSubwordInBounds(ctx, resource, address, element, bits, sign_extend);
+			});
+		}
+	}
+	return EmitValueOrZeroIfCondition(ctx.state, active, [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
 	});
@@ -572,6 +622,18 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	auto& state = ctx.state;
+	if (IsLocalMemory(mem.kind)) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		if (GuardLocalAccessOnce(state, resource)) {
+			const auto index = DwordIndex(ctx, inst, mem);
+			const auto valid = AndCondition(state, ctx.Arg(inst, inst.NumArgs() - 1),
+			                                EmitMemoryElementInBounds(state, resource, index));
+			EmitIfCondition(state, valid, [&]() {
+				StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, inst.NumArgs() - 2));
+			});
+			return;
+		}
+	}
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto store = [&](uint32_t resource) {
@@ -1115,6 +1177,28 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	if (const auto mem = ctx.Memory(inst); IsLocalMemory(mem.kind)) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		if (GuardLocalAccessOnce(state, resource)) {
+			const auto              active = ctx.Arg(inst, inst.NumArgs() - 1);
+			const auto              base   = ByteAddress(ctx, inst, mem);
+			std::array<uint32_t, 4> values {};
+			for (uint32_t component = 0; component < components; component++) {
+				const auto address = component == 0u
+				                         ? base
+				                         : Binary(state, spv::OpIAdd, TypeU32(state), base,
+				                                  ConstantU32(state, component * 4u));
+				const auto index   = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+				                            address, ConstantU32(state, 2));
+				const auto valid   = AndCondition(state, active,
+				                                  EmitMemoryElementInBounds(state, resource, index));
+				values[component]  = LoadLocalElementOrZero(state, valid, index, [&](uint32_t element) {
+					return LoadWordInBounds(ctx, resource, element);
+				});
+			}
+			return ConstructU32Composite(state, components, values);
+		}
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
@@ -1139,6 +1223,29 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 
 void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	if (const auto mem = ctx.Memory(inst); IsLocalMemory(mem.kind)) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		if (GuardLocalAccessOnce(state, resource)) {
+			const auto active = ctx.Arg(inst, inst.NumArgs() - 1);
+			const auto base   = ByteAddress(ctx, inst, mem);
+			for (uint32_t component = 0; component < components; component++) {
+				const auto address = component == 0u
+				                         ? base
+				                         : Binary(state, spv::OpIAdd, TypeU32(state), base,
+				                                  ConstantU32(state, component * 4u));
+				const auto index   = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+				                            address, ConstantU32(state, 2));
+				EmitIfCondition(state,
+				                AndCondition(state, active,
+				                             EmitMemoryElementInBounds(state, resource, index)),
+				                [&]() {
+					                StoreWordInBounds(ctx, resource, index,
+					                                  ctx.Arg(inst, component + 1u));
+				                });
+			}
+			return;
+		}
+	}
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto mem      = ctx.Memory(inst);
 		const auto resource = PrepareMemoryResourceAccess(state, mem);
