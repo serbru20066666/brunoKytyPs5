@@ -117,6 +117,8 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 // Whether TryReadBacking can read the whole range now.
 bool                   BackingContains(uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// As TryReadBufferBacking, but fails instead of waiting for the GPU when a byte is GPU-dirty.
+bool                   TryReadBufferBackingNoWait(uint64_t vaddr, void* data, uint64_t size);
 // Reads guest memory for Thread_Gpu's own use. Bytes the GPU has not written are read without
 // faulting even when GPU writes elsewhere protect their page; GPU-written bytes still read back.
 void                   ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size);

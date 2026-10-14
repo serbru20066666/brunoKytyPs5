@@ -1532,7 +1532,12 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	}
 	const auto size =
 	    uint64_t {stride} * (draw_count - 1u) + command_size;
-	const bool gpu_args = m_renderer.GetBufferCache().IsRegionGpuModified(address, size);
+	// The page tracker can miss a compute write that the buffer cache already owns. Drawing
+	// from an unregistered buffer reads undefined device memory and hangs the GPU. A draw that
+	// patches shader registers still has to read the arguments on the CPU.
+	auto&      buffers  = m_renderer.GetBufferCache();
+	const bool gpu_args = buffers.IsRegionGpuModified(address, size) ||
+	                      buffers.HasGpuDirtyBytes(address, size);
 	const bool mesh     = (m_ctx.GetShaderStages() & 0x20u) != 0; // As in PrepareProgram.
 	if (DrainStats::Enabled()) {
 		DrainStats::Record(gpu_args ? DrainStats::Kind::IndirectArgsGpu
@@ -1856,7 +1861,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		if (!m_renderer.GetBufferCache().WriteGpuDirty(reinterpret_cast<uint64_t>(dst), &data,
+		                                               sizeof(data))) {
+			std::memcpy(dst, &data, sizeof(data));
+		}
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1913,7 +1921,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					if (!m_renderer.GetBufferCache().WriteGpuDirty(reinterpret_cast<uint64_t>(dst),
+					                                               &value, sizeof(value))) {
+						std::memcpy(dst, &value, sizeof(value));
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {

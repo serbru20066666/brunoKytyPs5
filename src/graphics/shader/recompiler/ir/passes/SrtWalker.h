@@ -55,6 +55,11 @@ struct SrtReadFlags {
 	                                                  : runtime.userdata;
 }
 
+// True while an activity walk evaluates a control-flow condition. A specialization reader may
+// then fail instead of waiting for the GPU: the walk follows every successor, and the shader,
+// which makes the same loads, takes the branch itself.
+[[nodiscard]] bool EvaluatingCondition() noexcept;
+
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,

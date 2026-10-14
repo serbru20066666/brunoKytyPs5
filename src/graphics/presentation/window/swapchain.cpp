@@ -9,6 +9,7 @@
 #include "gpu_blit_shaders/gpu_video_out_fsr_easu_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_fsr_rcas_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -24,13 +25,18 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <atomic>
+#include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -1334,6 +1340,210 @@ Swapchain::Status Swapchain::Present() {
 	return Status::Success;
 }
 
+// KYTY_DEBUG_FRAME_WATCH=<folder>: shrinks every presented frame, measures its brightness once
+// the GPU has finished it, and saves (as PPM, with the frame before) the frames whose brightness
+// or share of near-white pixels jumps away from the frames around them.
+class FrameWatch final {
+public:
+	static FrameWatch* Get() {
+		static FrameWatch* watch = [] () -> FrameWatch* {
+			const char* folder = std::getenv("KYTY_DEBUG_FRAME_WATCH");
+			return folder != nullptr && folder[0] != '\0' ? new FrameWatch(folder) : nullptr;
+		}();
+		return watch;
+	}
+
+	void Record(GraphicContext& graphics, CommandScheduler& scheduler, vk::CommandBuffer command,
+	            const VulkanImage& source, uint64_t frame_num) {
+		const auto index = m_next;
+		auto&      slot  = m_slots[index];
+		if (slot.busy.load(std::memory_order_acquire)) {
+			return;
+		}
+		m_next = (m_next + 1u) % Slots;
+		if (slot.image.image == nullptr && !Create(graphics, slot)) {
+			return;
+		}
+		vk::ImageMemoryBarrier2 to_dst {};
+		to_dst.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		to_dst.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		to_dst.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		to_dst.oldLayout           = vk::ImageLayout::eUndefined;
+		to_dst.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_dst.image               = slot.image.image;
+		to_dst.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &to_dst;
+		command.pipelineBarrier2(dependency);
+
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(source.extent.width),
+		                                      static_cast<int>(source.extent.height), 1};
+		region.dstSubresource = region.srcSubresource;
+		region.dstOffsets[1]  = vk::Offset3D {static_cast<int>(Width), static_cast<int>(Height), 1};
+		command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal, slot.image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+
+		auto to_src          = to_dst;
+		to_src.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		to_src.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		to_src.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		to_src.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		dependency.pImageMemoryBarriers = &to_src;
+		command.pipelineBarrier2(dependency);
+
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent      = vk::Extent3D {Width, Height, 1};
+		command.copyImageToBuffer(slot.image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          slot.buffer, 1, &copy);
+		vk::MemoryBarrier2 to_host {};
+		to_host.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		to_host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+		to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+		vk::DependencyInfo host_dependency {};
+		host_dependency.memoryBarrierCount = 1;
+		host_dependency.pMemoryBarriers    = &to_host;
+		command.pipelineBarrier2(host_dependency);
+
+		slot.busy.store(true, std::memory_order_release);
+		scheduler.DeferOperation([this, index, frame_num, &graphics] {
+			auto& done = m_slots[index];
+			vmaInvalidateAllocation(graphics.allocator, done.allocation, 0, VK_WHOLE_SIZE);
+			Analyze(static_cast<const uint8_t*>(done.mapped), frame_num);
+			done.busy.store(false, std::memory_order_release);
+		});
+	}
+
+private:
+	static constexpr uint32_t Width  = 480;
+	static constexpr uint32_t Height = 270;
+	static constexpr uint32_t Slots  = 8;
+	static constexpr size_t   Bytes  = size_t {Width} * Height * 4u;
+	static constexpr size_t   Window = 12;
+
+	struct Slot {
+		VulkanImage       image;
+		VkBuffer          buffer     = VK_NULL_HANDLE;
+		VmaAllocation     allocation = nullptr;
+		void*             mapped     = nullptr;
+		std::atomic<bool> busy {false};
+	};
+
+	explicit FrameWatch(std::string folder): m_folder(std::move(folder)) {
+		std::error_code error;
+		std::filesystem::create_directories(m_folder, error);
+		std::printf("frame-watch: saving outlying frames to %s\n", m_folder.c_str());
+	}
+
+	static bool Create(GraphicContext& graphics, Slot& slot) {
+		vk::ImageCreateInfo image {};
+		image.imageType   = vk::ImageType::e2D;
+		image.extent      = vk::Extent3D {Width, Height, 1};
+		image.mipLevels   = 1;
+		image.arrayLayers = 1;
+		image.format      = vk::Format::eR8G8B8A8Unorm;
+		image.tiling      = vk::ImageTiling::eOptimal;
+		image.usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+		image.samples = vk::SampleCountFlagBits::e1;
+		if (!graphics.CreateImage(image, slot.image)) {
+			return false;
+		}
+		vk::BufferCreateInfo buffer {};
+		buffer.size  = Bytes;
+		buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
+		VmaAllocationCreateInfo allocation {};
+		allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+		                   VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer),
+		                    &allocation, &slot.buffer, &slot.allocation, &mapped) != VK_SUCCESS) {
+			return false;
+		}
+		slot.mapped = mapped.pMappedData;
+		return slot.mapped != nullptr;
+	}
+
+	static double Median(std::deque<double> values) {
+		std::sort(values.begin(), values.end());
+		return values[values.size() / 2];
+	}
+
+	void Save(const std::vector<uint8_t>& pixels, uint64_t frame_num, const char* kind) {
+		const auto path = m_folder + "/frame_" + std::to_string(frame_num) + "_" + kind + ".ppm";
+		std::FILE* file = std::fopen(path.c_str(), "wb");
+		if (file == nullptr) {
+			return;
+		}
+		std::fprintf(file, "P6\n%u %u\n255\n", Width, Height);
+		std::vector<uint8_t> rgb(size_t {Width} * Height * 3u);
+		for (size_t i = 0; i < size_t {Width} * Height; i++) {
+			rgb[i * 3]     = pixels[i * 4];
+			rgb[i * 3 + 1] = pixels[i * 4 + 1];
+			rgb[i * 3 + 2] = pixels[i * 4 + 2];
+		}
+		std::fwrite(rgb.data(), 1, rgb.size(), file);
+		std::fclose(file);
+	}
+
+	void Analyze(const uint8_t* data, uint64_t frame_num) {
+		std::vector<uint8_t> pixels(data, data + Bytes);
+		uint64_t             sum   = 0;
+		uint64_t             white = 0;
+		for (size_t i = 0; i < size_t {Width} * Height; i++) {
+			const uint32_t r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
+			sum += r + g + b;
+			white += r > 215 && g > 215 && b > 215 ? 1u : 0u;
+		}
+		const double mean      = static_cast<double>(sum) / (3.0 * 255.0 * Width * Height);
+		const double whiteness = static_cast<double>(white) / (static_cast<double>(Width) * Height);
+		std::lock_guard lock(m_mutex);
+		if (m_means.size() >= 4) {
+			const double usual_mean  = Median(m_means);
+			const double usual_white = Median(m_whites);
+			if ((std::abs(mean - usual_mean) > 0.10 || whiteness - usual_white > 0.20) &&
+			    m_saved < 400) {
+				m_saved += 2;
+				std::printf("frame-watch: frame=%llu mean=%.3f usual=%.3f white=%.3f usual=%.3f\n",
+				            static_cast<unsigned long long>(frame_num), mean, usual_mean,
+				            whiteness, usual_white);
+				Save(pixels, frame_num, "salto");
+				if (!m_previous.empty()) {
+					Save(m_previous, m_previous_frame, "antes");
+				}
+			}
+		}
+		if (frame_num % 300u == 0u) {
+			std::printf("frame-watch: frame=%llu mean=%.3f white=%.3f\n",
+			            static_cast<unsigned long long>(frame_num), mean, whiteness);
+		}
+		m_means.push_back(mean);
+		m_whites.push_back(whiteness);
+		if (m_means.size() > Window) {
+			m_means.pop_front();
+			m_whites.pop_front();
+		}
+		m_previous       = std::move(pixels);
+		m_previous_frame = frame_num;
+	}
+
+	std::string             m_folder;
+	std::array<Slot, Slots> m_slots;
+	uint32_t                m_next = 0;
+	std::mutex              m_mutex;
+	std::deque<double>      m_means;
+	std::deque<double>      m_whites;
+	std::vector<uint8_t>    m_previous;
+	uint64_t                m_previous_frame = 0;
+	uint32_t                m_saved          = 0;
+};
+
 Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
 
 Presenter::~Presenter() = default;
@@ -1356,6 +1566,13 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (auto* watch = FrameWatch::Get()) [[unlikely]] {
+		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		               vk::AccessFlagBits2::eTransferRead);
+		watch->Record(m_impl->window.graphic_ctx, m_impl->renderer.GetCommandScheduler(),
+		              buffer.Handle(), frame->image,
+		              static_cast<uint64_t>(m_impl->renderer.GetGpu().GetFrameNum()));
+	}
 	return *frame;
 }
 

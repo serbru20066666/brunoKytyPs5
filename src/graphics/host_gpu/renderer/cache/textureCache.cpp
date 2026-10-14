@@ -1930,10 +1930,24 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 			if (!result) {
 				ChurnReason reason("find-miss");
 				result         = InsertImage(desc.info);
-				auto& inserted = m_slot_images[result];
-				if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-				                                    inserted.info.data.size)) {
+				auto&      inserted  = m_slot_images[result];
+				const bool gpu_dirty = m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
+				                                                       inserted.info.data.size);
+				if (gpu_dirty) {
 					inserted.MarkBufferModified();
+				}
+				static const bool log_misses = std::getenv("KYTY_DEBUG_MISS_LOOKUPS") != nullptr;
+				if (log_misses) [[unlikely]] {
+					std::printf("miss-lookup: frame=%d type=%u 0x%016" PRIx64 " size=0x%" PRIx64
+					            " %ux%ux%u fmt=%u tile=%u mips=%u gpu_dirty=%d tick=%" PRIu64 "\n",
+					            m_scheduler.Context().GetGpu().GetFrameNum(),
+					            static_cast<uint32_t>(desc.type), inserted.info.data.address,
+					            inserted.info.data.size, inserted.info.extent.width,
+					            inserted.info.extent.height, inserted.info.resources.layers,
+					            static_cast<uint32_t>(inserted.info.pixel_format),
+					            static_cast<uint32_t>(inserted.info.tile_mode),
+					            inserted.info.resources.levels, gpu_dirty ? 1 : 0,
+					            m_scheduler.CurrentTick());
 				}
 			} else if (backing_matches == 1 && view_mip < 0 && view_layer < 0) {
 				// The lookup can have registered or freed images: take the range's generation now.
@@ -1985,8 +1999,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, uint64_t* un
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
+		static const bool log_mismatch = std::getenv("KYTY_DEBUG_MISS_LOOKUPS") != nullptr;
+		if (log_mismatch && view_mip < 0 && view_layer < 0 &&
+		    (image.info.extent.width != desc.info.extent.width ||
+		     image.info.extent.height != desc.info.extent.height)) [[unlikely]] {
+			std::printf("mismatch-lookup: frame=%d type=%u req=0x%016" PRIx64 " %ux%u fmt=%u "
+			            "tile=%u -> 0x%016" PRIx64 " %ux%u fmt=%u tile=%u gpu=%d\n",
+			            m_scheduler.Context().GetGpu().GetFrameNum(),
+			            static_cast<uint32_t>(desc.type), desc.info.data.address,
+			            desc.info.extent.width, desc.info.extent.height,
+			            static_cast<uint32_t>(desc.info.pixel_format),
+			            static_cast<uint32_t>(desc.info.tile_mode), image.info.data.address,
+			            image.info.extent.width, image.info.extent.height,
+			            static_cast<uint32_t>(image.info.pixel_format),
+			            static_cast<uint32_t>(image.info.tile_mode), image.IsGpuModified() ? 1 : 0);
+		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		static const bool log_depth = std::getenv("KYTY_DEBUG_DEPTH_LOOKUPS") != nullptr;
+		static std::unordered_map<uint64_t, uint64_t> last_depth_result;
+		const uint64_t depth_key = desc.info.data.address ^
+		                           (uint64_t {desc.info.extent.width} << 48u) ^
+		                           (uint64_t {desc.info.extent.height} << 32u) ^
+		                           (uint64_t {static_cast<uint32_t>(desc.type)} << 62u);
+		const uint64_t depth_value =
+		    (uint64_t {result.index} << 32u) | result.generation;
+		if (log_depth && (desc.info.IsDepth() || image.info.IsDepth()) &&
+		    std::exchange(last_depth_result[depth_key], depth_value) != depth_value) [[unlikely]] {
+			std::printf("depth-lookup: frame=%d type=%u req=0x%016" PRIx64 " %ux%u fmt=%u -> "
+			            "img=%u 0x%016" PRIx64 " %ux%u fmt=%u gpu=%d mip=%d layer=%d tick=%" PRIu64
+			            "\n",
+			            m_scheduler.Context().GetGpu().GetFrameNum(),
+			            static_cast<uint32_t>(desc.type), desc.info.data.address,
+			            desc.info.extent.width, desc.info.extent.height,
+			            static_cast<uint32_t>(desc.info.pixel_format), result.index,
+			            image.info.data.address, image.info.extent.width, image.info.extent.height,
+			            static_cast<uint32_t>(image.info.pixel_format), image.IsGpuModified() ? 1 : 0,
+			            static_cast<int>(desc.view_info.base_level),
+			            static_cast<int>(desc.view_info.base_layer), m_scheduler.CurrentTick());
+		}
 	}
 	FinishFind(result, desc, metadata_base_layer);
 	return result;
@@ -2277,6 +2328,23 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 				meta->second.clear_mask = UINT32_MAX;
 				m_meta_clear_generation.fetch_add(1, std::memory_order_release);
 				m_unclaimed_fills.erase(fill);
+				if (DebugFrameDrawsEnabled()) [[unlikely]] {
+					std::printf("frame-draws: frame=%d htile-claim 0x%016" PRIx64 " size=0x%" PRIx64
+					            "\n",
+					            m_scheduler.Context().GetGpu().GetFrameNum(), range.address,
+					            range.size);
+				}
+			} else if (DebugFrameDrawsEnabled()) [[unlikely]] {
+				std::printf("frame-draws: frame=%d htile-unclaimed 0x%016" PRIx64 " size=0x%" PRIx64
+				            " depth=0x%016" PRIx64 " %ux%u mask=%x fills:",
+				            m_scheduler.Context().GetGpu().GetFrameNum(), range.address, range.size,
+				            desc.info.data.address, desc.info.extent.width,
+				            desc.info.extent.height, image.info.htile_clear_mask);
+				for (const auto& f: m_unclaimed_fills) {
+					std::printf(" 0x%" PRIx64 "+0x%" PRIx64 "@%" PRIu64, f.address, f.size,
+					            tick - std::min(tick, f.tick));
+				}
+				std::printf("\n");
 			}
 			m_surface_meta_generation.fetch_add(1, std::memory_order_relaxed);
 		}

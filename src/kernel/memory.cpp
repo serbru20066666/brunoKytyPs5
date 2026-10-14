@@ -944,6 +944,15 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadBufferBackingNoWait(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    (!Graphics::GuestGpu::IsGpuThread() ||
+	     GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size))) {
+		return false;
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 void ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size) {
 	// A page holding GPU-written bytes is protected as a whole. Clean bytes on it come from the
 	// backing, so reading a game table that merely shares the page does not wait for a readback.

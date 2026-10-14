@@ -864,6 +864,11 @@ void DefineModule(EmitterState& state) {
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
+	// KYTY_DEBUG_SPIRV_SALT=<n> adds an unused constant to every module, so the driver compiles
+	// each pipeline as new: a cold start without deleting any cache.
+	if (static const char* salt = std::getenv("KYTY_DEBUG_SPIRV_SALT"); salt != nullptr) {
+		(void)ConstantU32(state, 0x5a170000u + static_cast<uint32_t>(std::strtoul(salt, nullptr, 10)));
+	}
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
