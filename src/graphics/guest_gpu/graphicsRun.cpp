@@ -273,6 +273,7 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	auto& processor = m_compute_cp[queue_id - 1];
 	if (processor == nullptr) {
 		processor = std::make_unique<CommandProcessor>(m_renderer, ComputeQueueBase + queue_id - 1);
+		processor->Reset();
 	}
 	return *processor;
 }
