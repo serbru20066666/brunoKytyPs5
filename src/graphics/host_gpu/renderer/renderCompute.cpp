@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -40,6 +41,14 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// Direct dispatches are ordered only by the guest's own synchronization (CS_PARTIAL_FLUSH and
+// cache events). A host barrier after every dispatch kept the GPU on one cloth workgroup of
+// EA SPORTS FC 27 for tens of milliseconds. KYTY_DEBUG_NO_DISPATCH_OVERLAP=1 restores that.
+static bool DispatchOverlap() {
+	static const bool disabled = std::getenv("KYTY_DEBUG_NO_DISPATCH_OVERLAP") != nullptr;
+	return !disabled;
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -59,6 +68,10 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
+	static const bool disabled = std::getenv("KYTY_DEBUG_NO_META_CLEAR") != nullptr;
+	if (disabled) {
+		return false;
+	}
 	auto& cache = buffer.GetContext().GetTextureCache();
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
@@ -77,6 +90,11 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				if (cache.ClearMeta(descriptor.Base48())) {
+					if (DebugFrameDrawsEnabled()) [[unlikely]] {
+						std::printf("frame-draws: frame=%d meta-clear-at 0x%016" PRIx64 "\n",
+						            buffer.GetContext().GetGpu().GetFrameNum(),
+						            descriptor.Base48());
+					}
 					return true;
 				}
 			}
@@ -215,9 +233,12 @@ static void DebugPrintComputeBuffers(const ShaderComputeInputInfo& input,
 	    printed.fetch_add(1, std::memory_order_relaxed) >= 16) {
 		return;
 	}
-	std::printf("cs-buffers: hash=%s %s groups=%ux%ux%u lds_dwords=%u\n", hash, kind,
-	            input.workgroup_counts[0], input.workgroup_counts[1], input.workgroup_counts[2],
-	            input.lds_size_dwords);
+	std::printf("cs-buffers: hash=%s %s groups=%ux%ux%u local=%ux%ux%u lds_dwords=%u "
+	            "lds_ssbo=%d wave=%u\n",
+	            hash, kind, input.workgroup_counts[0], input.workgroup_counts[1],
+	            input.workgroup_counts[2], input.threads_num[0], input.threads_num[1],
+	            input.threads_num[2], input.lds_size_dwords, input.lds_storage ? 1 : 0,
+	            input.wave_size);
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		const auto source = i < bindings.buffer_sources.size() ? bindings.buffer_sources[i]
@@ -359,6 +380,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
+	if (DebugFrameDrawsEnabled()) [[unlikely]] {
+		DebugFrameDrawsNote(static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum()), true,
+		                    compute_program ? input_info.stage.program->shader_hash : 0, 0,
+		                    input_info.workgroup_counts[0] * input_info.workgroup_counts[1] *
+		                        input_info.workgroup_counts[2]);
+	}
 	if (!compute_program) {
 		// No program to run yet.
 		return;
@@ -376,8 +403,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
 	if (resources.specialization_reads.empty()) {
-		bool consumed = TryConsumeComputeMetaClear(input_info, buffer);
-		if (!consumed) {
+		const bool meta_clear = TryConsumeComputeMetaClear(input_info, buffer);
+		if (!meta_clear) {
 			ShaderBufferResource fill_descriptor;
 			uint32_t             fill_value = 0;
 			uint64_t             fill_size  = 0;
@@ -387,10 +414,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				buffer.GetContext().GetTextureCache().NoteUnclaimedFill(fill_descriptor.Base48(),
 				                                                        fill_size);
 			}
-			consumed = TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
-			                                       thread_group_y, thread_group_z, mode);
 		}
-		if (consumed) {
+		const bool image_clear =
+		    !meta_clear && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+		                                               thread_group_y, thread_group_z, mode);
+		if (DebugFrameDrawsEnabled() && (meta_clear || image_clear)) [[unlikely]] {
+			std::printf("frame-draws: frame=%d %s cs=%016" PRIx64 " groups=%ux%ux%u\n",
+			            buffer.GetContext().GetGpu().GetFrameNum(),
+			            meta_clear ? "meta-clear" : "image-clear", program.shader_hash,
+			            thread_group_x, thread_group_y, thread_group_z);
+		}
+		if (meta_clear || image_clear) {
 			ResetBindings();
 			return;
 		}
@@ -453,7 +487,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	// The guest orders its dispatches itself (CS_PARTIAL_FLUSH and cache events become global
+	// barriers), and the emulator's own copies and image transitions carry their own barriers.
+	// Without the per-dispatch barriers, a run of small dispatches spreads over the GPU as on the
+	// console: EA SPORTS FC 27 issues dozens of single-group cloth dispatches back to back. LDS
+	// emulated in one shared buffer cannot overlap.
+	const bool overlap = DispatchOverlap() && bindings.shared_memory.buffer == nullptr;
+	if (has_storage_writes && !overlap) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -528,7 +568,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!overlap) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	m_context.GetBufferCache().OnCommandRecorded();
 	ResetBindings();
 }
@@ -553,6 +595,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
+	if (DebugFrameDrawsEnabled()) [[unlikely]] {
+		DebugFrameDrawsNote(static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum()), true,
+		                    compute_program ? input_info.stage.program->shader_hash : 0, 0,
+		                    0xffffffffu);
+	}
 	if (!compute_program) {
 		// No program to run yet.
 		return;

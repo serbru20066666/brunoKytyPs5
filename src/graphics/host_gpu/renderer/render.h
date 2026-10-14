@@ -82,6 +82,10 @@ struct DrawIndexArgs {
 	// placeholders, index_addr is the index buffer base, and index_limit its size in elements.
 	uint64_t         indirect_args              = 0;
 	uint32_t         index_limit                = 0;
+	// A DRAW_INDIRECT_MULTI packet: draw `indirect_count` commands starting at `indirect_args`,
+	// `indirect_stride` bytes apart. 0 stride means the native command size.
+	uint32_t         indirect_count             = 1;
+	uint32_t         indirect_stride            = 0;
 };
 
 struct DrawAutoArgs {
@@ -93,6 +97,8 @@ struct DrawAutoArgs {
 	uint32_t         render_target_slice_offset = 0;
 	// GPU-written DrawIndirectArgs, drawn from on the GPU: the counts above are placeholders.
 	uint64_t         indirect_args              = 0;
+	uint32_t         indirect_count             = 1;
+	uint32_t         indirect_stride            = 0;
 };
 
 struct SubmitInfo {

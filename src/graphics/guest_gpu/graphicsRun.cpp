@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -433,10 +434,46 @@ void CommandProcessor::ReportMipStats(void* dst, uint32_t size, bool reset) {
 	m_renderer.ReportMipStats(dst, size, reset);
 }
 
+// KYTY_DEBUG_SYNC_TRACE=<n>: every n-th frame, prints that frame's dispatches and synchronization
+// points in submission order, each with the number of draws recorded since the previous line.
+static uint32_t SyncTracePeriod() {
+	static const uint32_t period = [] {
+		const char* text = std::getenv("KYTY_DEBUG_SYNC_TRACE");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+	}();
+	return period;
+}
+
+static thread_local uint32_t t_sync_trace_draws = 0;
+
+static void SyncTraceDraw(uint32_t frame) {
+	if (const auto period = SyncTracePeriod(); period != 0 && frame % period == 0) [[unlikely]] {
+		t_sync_trace_draws++;
+	}
+}
+
+static void SyncTracePoint(uint32_t frame, bool async, const char* format, ...) {
+	const auto period = SyncTracePeriod();
+	if (period == 0 || frame % period != 0) [[likely]] {
+		return;
+	}
+	char    text[160];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	std::printf("sync-trace: frame=%u queue=%s draws=%u %s\n", frame, async ? "async" : "gfx",
+	            t_sync_trace_draws, text);
+	t_sync_trace_draws = 0;
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
+	SyncTracePoint(m_renderer.GetGpu().GetFrameNum(), IsAsyncComputeQueue(),
+	               "wait-reg-mem addr=%p ref=0x%llx", static_cast<const void*>(addr),
+	               static_cast<unsigned long long>(ref));
 	if ((wait_op & ~1u) != 0) {
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
@@ -1437,6 +1474,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
+	SyncTraceDraw(m_renderer.GetGpu().GetFrameNum());
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
@@ -1475,6 +1513,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
                                     uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	if (DrawIndirectFromGpuArgs(m_draw_indirect_args_base_addr + data_offset, registers, indexed)) {
+		SyncTraceDraw(m_renderer.GetGpu().GetFrameNum());
 		return;
 	}
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
@@ -1482,8 +1521,17 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 }
 
 bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawRegisters registers,
-                                               bool indexed) {
-	const auto size     = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+                                               bool indexed, uint32_t draw_count, uint32_t stride) {
+	if (draw_count == 0) {
+		return true;
+	}
+	const auto command_size =
+	    indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	if (stride == 0) {
+		stride = static_cast<uint32_t>(command_size);
+	}
+	const auto size =
+	    uint64_t {stride} * (draw_count - 1u) + command_size;
 	const bool gpu_args = m_renderer.GetBufferCache().IsRegionGpuModified(address, size);
 	const bool mesh     = (m_ctx.GetShaderStages() & 0x20u) != 0; // As in PrepareProgram.
 	if (DrainStats::Enabled()) {
@@ -1505,14 +1553,17 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	                     registers.instance_offset != Pm4::SH_NOP ||
 	                     registers.index_offset != Pm4::SH_NOP;
 	if (indexed && gpu_args && !patches && (mesh || (list && m_index_type_and_size != 2u)) &&
-	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled()) {
+	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled() &&
+	    !(mesh && draw_count > 1)) {
 		m_num_instances_address = address + offsetof(DrawIndexedIndirectArgs, instance_count);
-		DrawIndex({.index_count    = 1,
-		           .index_addr     = reinterpret_cast<const void*>(m_index_base_addr),
-		           .instance_count = 1,
-		           .offset_source  = DrawOffsetSource::IndirectArgs,
-		           .indirect_args  = address,
-		           .index_limit    = m_index_buffer_size});
+		DrawIndex({.index_count     = 1,
+		           .index_addr      = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count  = 1,
+		           .offset_source   = DrawOffsetSource::IndirectArgs,
+		           .indirect_args   = address,
+		           .index_limit     = m_index_buffer_size,
+		           .indirect_count  = draw_count,
+		           .indirect_stride = stride});
 		return true;
 	}
 	// A non-indexed draw draws from them directly too: the guest layout is
@@ -1520,13 +1571,83 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	if (!indexed && gpu_args && !patches && !mesh &&
 	    prim_type != Prospero::PrimitiveType::kQuadListLegacy && Config::GpuMeshIndirectEnabled()) {
 		m_num_instances_address = address + offsetof(DrawIndirectArgs, instance_count);
-		DrawIndexAuto({.vertex_count   = 1,
-		               .instance_count = 1,
-		               .offset_source  = DrawOffsetSource::IndirectArgs,
-		               .indirect_args  = address});
+		DrawIndexAuto({.vertex_count    = 1,
+		               .instance_count  = 1,
+		               .offset_source   = DrawOffsetSource::IndirectArgs,
+		               .indirect_args   = address,
+		               .indirect_count  = draw_count,
+		               .indirect_stride = stride});
 		return true;
 	}
 	return false;
+}
+
+// KYTY_DEBUG_MULTI_DRAW=1: after each multi-draw packet reads its count and arguments, waits for
+// the GPU and compares them with the bytes in the GPU buffer, printing the packets that read
+// something else, and prints each frame's packets and draws.
+static bool DebugMultiDrawEnabled() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_MULTI_DRAW") != nullptr;
+	return enabled;
+}
+
+static void DebugCheckMultiDraw(RenderContext& renderer, uint64_t args_addr, uint32_t max_count,
+                                const volatile uint32_t* count_addr, uint32_t draw_count,
+                                uint32_t stride, uint64_t args_size, bool indexed) {
+	static uint32_t frame_seen = 0;
+	static uint32_t packets    = 0;
+	static uint64_t draws      = 0;
+	static uint32_t mismatches = 0;
+	static uint32_t printed    = 0;
+	const uint32_t  frame      = renderer.GetGpu().GetFrameNum();
+	if (frame != frame_seen) {
+		std::printf("multi-draw-frame: frame=%u packets=%u draws=%" PRIu64 " mismatches=%u\n",
+		            frame_seen, packets, draws, mismatches);
+		frame_seen = frame;
+		packets    = 0;
+		draws      = 0;
+		mismatches = 0;
+	}
+	packets++;
+	draws += draw_count;
+
+	auto&    buffers   = renderer.GetBufferCache();
+	uint32_t gpu_count = max_count;
+	bool     count_buf = false;
+	if (count_addr != nullptr) {
+		const auto address = reinterpret_cast<uint64_t>(count_addr);
+		count_buf          = buffers.DebugReadGpuCopy(address, &gpu_count, sizeof(gpu_count));
+		gpu_count          = std::min(gpu_count, max_count);
+	}
+	const uint32_t entries = std::min(std::max(draw_count, gpu_count), std::min(max_count, 4096u));
+	uint32_t       args_differ = 0;
+	uint32_t       first_differ = UINT32_MAX;
+	bool           args_buf     = false;
+	if (entries != 0) {
+		const uint64_t        bytes = static_cast<uint64_t>(entries - 1) * stride + args_size;
+		std::vector<uint8_t>  gpu(bytes);
+		std::vector<uint8_t>  cpu(bytes);
+		args_buf = buffers.DebugReadGpuCopy(args_addr, gpu.data(), bytes);
+		std::memcpy(cpu.data(), reinterpret_cast<const void*>(args_addr), bytes);
+		for (uint32_t i = 0; args_buf && i < entries; i++) {
+			const uint64_t offset = static_cast<uint64_t>(i) * stride;
+			if (std::memcmp(cpu.data() + offset, gpu.data() + offset, args_size) != 0) {
+				args_differ++;
+				first_differ = std::min(first_differ, i);
+			}
+		}
+	}
+	const bool count_differs = count_buf && gpu_count != draw_count;
+	if (count_differs || args_differ != 0) {
+		mismatches++;
+		if (printed++ < 2000) {
+			std::printf("multi-draw: frame=%u %s args=%016" PRIx64 " count_addr=%016" PRIx64
+			            " max=%u count cpu=%u gpu=%u (buf %d) args differ=%u of %u first=%u (buf %d)\n",
+			            frame, indexed ? "indexed" : "plain", args_addr,
+			            reinterpret_cast<uint64_t>(count_addr), max_count, draw_count, gpu_count,
+			            count_buf ? 1 : 0, args_differ, entries, first_differ, args_buf ? 1 : 0);
+			std::fflush(stdout);
+		}
+	}
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -1535,6 +1656,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+	SyncTraceDraw(m_renderer.GetGpu().GetFrameNum());
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
@@ -1544,11 +1666,22 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	if (DebugMultiDrawEnabled()) [[unlikely]] {
+		DebugCheckMultiDraw(m_renderer, m_draw_indirect_args_base_addr + data_offset,
+		                    max_count_or_count, count_addr, draw_count, stride_in_bytes,
+		                    args_size, indexed);
+	}
+
 	if (draw_count == 0) {
 		return;
 	}
 
-	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	if (DrawIndirectFromGpuArgs(m_draw_indirect_args_base_addr + data_offset, registers, indexed,
+	                            draw_count, stride_in_bytes)) {
+		return;
+	}
+
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
 
 	uint64_t index_size = 0;
@@ -1645,6 +1778,12 @@ static void DebugGdsDump(const Buffer& gds, uint64_t hash, const char* kind, uin
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	SyncTracePoint(m_renderer.GetGpu().GetFrameNum(), IsAsyncComputeQueue(),
+	               "dispatch cs=%016llx groups=%ux%ux%u local=%ux%ux%u",
+	               static_cast<unsigned long long>(ShaderHashAt(m_sh_ctx.GetCs().cs_regs.data_addr)),
+	               thread_group_x, thread_group_y, thread_group_z,
+	               m_sh_ctx.GetCs().cs_regs.num_thread_x, m_sh_ctx.GetCs().cs_regs.num_thread_y,
+	               m_sh_ctx.GetCs().cs_regs.num_thread_z);
 	if (uint64_t hash = 0; DebugGdsDumpWanted(m_sh_ctx.GetCs().cs_regs.data_addr, hash))
 	    [[unlikely]] {
 		SynchronizeGpu();
@@ -1653,6 +1792,25 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	}
 
 	uint32_t frame_num = 0;
+
+	// KYTY_DEBUG_DISPATCH_QUEUE=<hash>[,...]: prints the queue and sizes of those dispatches.
+	if (static const char* wanted = std::getenv("KYTY_DEBUG_DISPATCH_QUEUE"); wanted != nullptr)
+	    [[unlikely]] {
+		static std::atomic<uint32_t> printed {0};
+		const auto&                  cs   = m_sh_ctx.GetCs().cs_regs;
+		const auto                   hash = ShaderHashAt(cs.data_addr);
+		char                         text[17];
+		std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+		if (std::strstr(wanted, text) != nullptr && printed.fetch_add(1) < 200) {
+			std::printf("dispatch-queue: frame=%u cs=%s async=%d event=%d submit=%llu groups=%ux%ux%u "
+			            "local=%ux%ux%u mode=0x%x\n",
+			            m_renderer.GetGpu().GetFrameNum(), text, IsAsyncComputeQueue() ? 1 : 0,
+			            static_cast<int>(m_interrupt_event_id),
+			            static_cast<unsigned long long>(m_submit_id), thread_group_x,
+			            thread_group_y, thread_group_z,
+			            cs.num_thread_x, cs.num_thread_y, cs.num_thread_z, mode);
+		}
+	}
 
 	{
 		frame_num = m_renderer.GetGpu().GetFrameNum();
@@ -1687,6 +1845,9 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	SyncTracePoint(m_renderer.GetGpu().GetFrameNum(), IsAsyncComputeQueue(),
+	               "dispatch-indirect cs=%016llx",
+	               static_cast<unsigned long long>(ShaderHashAt(m_sh_ctx.GetCs().cs_regs.data_addr)));
 	if (uint64_t hash = 0; DebugGdsDumpWanted(m_sh_ctx.GetCs().cs_regs.data_addr, hash))
 	    [[unlikely]] {
 		SynchronizeGpu();
@@ -1702,6 +1863,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
+	SyncTraceDraw(m_renderer.GetGpu().GetFrameNum());
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
@@ -1719,6 +1881,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         void* dst_gpu_addr, T value, uint32_t interrupt_selector,
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
+	SyncTracePoint(m_renderer.GetGpu().GetFrameNum(), IsAsyncComputeQueue(),
+	               "release-mem eop=0x%x cache=0x%x dest=0x%x source=0x%x interrupt=0x%x addr=%p",
+	               eop_event_type, cache_action, event_write_dest, event_write_source,
+	               interrupt_selector, dst_gpu_addr);
 
 	auto& command = CurrentBuffer();
 
@@ -1965,6 +2131,8 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	SyncTracePoint(m_renderer.GetGpu().GetFrameNum(), IsAsyncComputeQueue(),
+	               "event type=0x%x index=0x%x", event_type, event_index);
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
