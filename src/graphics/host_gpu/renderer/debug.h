@@ -64,6 +64,12 @@ enum class DebugShaderKind { Pixel, Vertex, Compute };
 [[nodiscard]] bool DebugSkipShader(uint64_t shader_hash, DebugShaderKind kind,
                                    bool bisect = true) noexcept;
 void               RecordFullBarrier(vk::CommandBuffer command) noexcept;
+// KYTY_DEBUG_FRAME_DRAWS=1: prints, per frame, how many draws and dispatches were recorded and a
+// fingerprint of their shaders in order, to tell a frame the game built differently from one
+// the GPU drew differently.
+[[nodiscard]] bool DebugFrameDrawsEnabled() noexcept;
+void               DebugFrameDrawsNote(uint32_t frame, bool dispatch, uint64_t shader_hash,
+                                       uint64_t other_hash, uint32_t count) noexcept;
 [[nodiscard]] bool AbFeatureOff() noexcept;
 // GPU busy time as drain stats measure it (--drain-stats), for the draw-phases line's gpu-ms/s.
 inline std::atomic<uint64_t> g_gpu_busy_ns {0};
