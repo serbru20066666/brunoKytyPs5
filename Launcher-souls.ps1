@@ -69,8 +69,10 @@ function Start-Game {
 	}
 	Backup-Partidas
 	$config = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
-	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $root 'run-windows.ps1'),
-	          '-Exe', (Join-Path $root $exeName), '-Config', (Join-Path $root "config\$config"), '-Fullscreen')
+	# Rutas entre comillas: Start-Process une los argumentos con espacios, y una carpeta con espacios
+	# (C:\Users\Juan Perez\...) partia la ruta y PowerShell se cerraba sin arrancar nada.
+	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $root 'run-windows.ps1')`"",
+	          '-Exe', "`"$(Join-Path $root $exeName)`"", '-Config', "`"$(Join-Path $root "config\$config")`"", '-Fullscreen')
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
