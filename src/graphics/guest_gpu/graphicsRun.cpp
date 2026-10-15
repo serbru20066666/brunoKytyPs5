@@ -798,6 +798,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		gpu->m_processing = false;
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			gpu->GetProcessor(submission.queue_id).BufferFlush();
 			gpu->m_idle.SignalAll();
 		}
 	}
@@ -816,6 +817,28 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+
+	const auto FlushSubmissionIfNeeded = [&](CommandProcessor& cp_inst, bool is_complete) {
+		static const bool ab = AbSelected("batchsubmits");
+		if (ab && AbFeatureOff()) {
+			cp_inst.BufferFlush();
+			return;
+		}
+		if (!is_complete) {
+			cp_inst.BufferFlush();
+			return;
+		}
+		auto& scheduler = m_renderer.GetCommandScheduler();
+		if (scheduler.MicrosSinceSubmit() >= Config::GetLabelFlushIntervalUs() ||
+		    scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+			cp_inst.BufferFlush();
+			return;
+		}
+		Common::LockGuard queue_lock(m_queue_mutex);
+		if (m_submission_count == 0 && m_commands.empty()) {
+			cp_inst.BufferFlush();
+		}
+	};
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
@@ -848,7 +871,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				FlushSubmissionIfNeeded(cp, complete);
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -874,7 +897,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				FlushSubmissionIfNeeded(cp, complete);
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -1594,7 +1617,9 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	// patches shader registers still has to read the arguments on the CPU.
 	auto&      buffers  = m_renderer.GetBufferCache();
 	const bool gpu_args = buffers.IsRegionGpuModified(address, size) ||
-	                      buffers.HasGpuDirtyBytes(address, size);
+	                      buffers.HasGpuDirtyBytes(address, size) ||
+	                      buffers.IsPageGpuDirtyHint(address) ||
+	                      buffers.IsPageGpuDirtyHint(address + size - 1u);
 	const bool mesh     = (m_ctx.GetShaderStages() & 0x20u) != 0; // As in PrepareProgram.
 	if (DrainStats::Enabled()) {
 		DrainStats::Record(gpu_args ? DrainStats::Kind::IndirectArgsGpu
