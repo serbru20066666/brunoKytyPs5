@@ -218,12 +218,22 @@ private:
 		}
 	}
 
+	static float SoftLimit(float x) {
+		if (x > 0.8f) {
+			return 0.8f + 0.2f * std::tanh((x - 0.8f) / 0.2f);
+		}
+		if (x < -0.8f) {
+			return -(0.8f + 0.2f * std::tanh((-x - 0.8f) / 0.2f));
+		}
+		return x;
+	}
+
 	static float GetOpusGain() {
 		static const float gain = [] {
 			if (const char* env = std::getenv("KYTY_DEBUG_OPUS_GAIN"); env != nullptr && env[0] != '\0') {
 				return std::strtof(env, nullptr);
 			}
-			return 4.0f;
+			return 2.2f;
 		}();
 		return gain;
 	}
@@ -237,21 +247,21 @@ private:
 				} else {
 					auto* out = reinterpret_cast<float*>(dst);
 					for (size_t i = 0; i < count; i++) {
-						out[i] = std::clamp(src[i] * gain, -1.0f, 1.0f);
+						out[i] = SoftLimit(src[i] * gain);
 					}
 				}
 				break;
 			case AjmSampleEncoding::S16:
 				for (size_t i = 0; i < count; i++) {
 					const auto v = static_cast<int16_t>(
-					    std::lrint(std::clamp(src[i] * gain, -1.0f, 1.0f) * 32767.0f));
+					    std::lrint(SoftLimit(src[i] * gain) * 32767.0f));
 					std::memcpy(dst + i * sizeof(v), &v, sizeof(v));
 				}
 				break;
 			default:
 				for (size_t i = 0; i < count; i++) {
 					const auto v = static_cast<int32_t>(
-					    std::llrint(std::clamp(src[i] * gain, -1.0f, 1.0f) * 2147483647.0));
+					    std::llrint(SoftLimit(src[i] * gain) * 2147483647.0));
 					std::memcpy(dst + i * sizeof(v), &v, sizeof(v));
 				}
 				break;
