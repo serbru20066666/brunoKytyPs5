@@ -448,7 +448,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	context->object_mix.clear();
 	bool tapped = false;
 	for (auto& state: g_audioout2_ports) {
-		if (tapped || !state.used || state.context != ctx || state.pcm_data.empty() ||
+		if (!state.used || state.context != ctx || state.pcm_data.empty() ||
 		    audioout2_port_type_is_object(state.port_type) || (state.data_format & 0x7fu) == 1u) {
 			continue;
 		}
@@ -456,9 +456,24 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		if (channels < 2 || state.samples_num == 0) {
 			continue;
 		}
-		Ajm::MixTappedStereo(reinterpret_cast<float*>(state.pcm_data.data()), state.samples_num,
-		                     channels);
-		tapped = true;
+		if (!tapped) {
+			Ajm::MixTappedStereo(reinterpret_cast<float*>(state.pcm_data.data()), state.samples_num,
+			                     channels);
+			tapped = true;
+		}
+		if (channels >= 3) {
+			// Center channel (index 2) carries speech/dialogues in surround sound.
+			// Blend center onto front L/R so dialogue matches the effects level.
+			auto* pcm = reinterpret_cast<float*>(state.pcm_data.data());
+			for (uint32_t i = 0; i < state.samples_num; i++) {
+				const size_t idx    = static_cast<size_t>(i) * channels;
+				const float  center = pcm[idx + 2];
+				if (center != 0.0f) {
+					pcm[idx]     = std::clamp(pcm[idx] + center * 0.707f, -1.0f, 1.0f);
+					pcm[idx + 1] = std::clamp(pcm[idx + 1] + center * 0.707f, -1.0f, 1.0f);
+				}
+			}
+		}
 	}
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);

@@ -218,20 +218,40 @@ private:
 		}
 	}
 
+	static float GetOpusGain() {
+		static const float gain = [] {
+			if (const char* env = std::getenv("KYTY_DEBUG_OPUS_GAIN"); env != nullptr && env[0] != '\0') {
+				return std::strtof(env, nullptr);
+			}
+			return 2.5f;
+		}();
+		return gain;
+	}
+
 	void StorePcm(uint8_t* dst, const float* src, size_t count) const {
+		const float gain = GetOpusGain();
 		switch (m_sample_encoding) {
-			case AjmSampleEncoding::Float: std::memcpy(dst, src, count * sizeof(float)); break;
+			case AjmSampleEncoding::Float:
+				if (gain == 1.0f) {
+					std::memcpy(dst, src, count * sizeof(float));
+				} else {
+					auto* out = reinterpret_cast<float*>(dst);
+					for (size_t i = 0; i < count; i++) {
+						out[i] = std::clamp(src[i] * gain, -1.0f, 1.0f);
+					}
+				}
+				break;
 			case AjmSampleEncoding::S16:
 				for (size_t i = 0; i < count; i++) {
 					const auto v = static_cast<int16_t>(
-					    std::lrint(std::clamp(src[i], -1.0f, 1.0f) * 32767.0f));
+					    std::lrint(std::clamp(src[i] * gain, -1.0f, 1.0f) * 32767.0f));
 					std::memcpy(dst + i * sizeof(v), &v, sizeof(v));
 				}
 				break;
 			default:
 				for (size_t i = 0; i < count; i++) {
 					const auto v = static_cast<int32_t>(
-					    std::llrint(std::clamp(src[i], -1.0f, 1.0f) * 2147483647.0));
+					    std::llrint(std::clamp(src[i] * gain, -1.0f, 1.0f) * 2147483647.0));
 					std::memcpy(dst + i * sizeof(v), &v, sizeof(v));
 				}
 				break;
