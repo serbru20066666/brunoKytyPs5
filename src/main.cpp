@@ -10,8 +10,13 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <charconv>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -27,6 +32,112 @@
 
 #include <shellapi.h>
 #endif
+
+// KYTY_DEBUG_HEAP_FILL=<byte>: every operator new block starts filled with that byte, to tell
+// reads of uninitialized memory apart from timing. Defaults to 0 (zero-fill) to prevent uninitialized
+// garbage in Vulkan/graphics allocations (restoring pitch/menus). "=off" disables filling.
+struct HeapFill {
+	int         byte       = 0;
+	std::size_t min        = 0;
+	std::size_t max        = SIZE_MAX;
+	uintptr_t   caller_min = 0;
+	uintptr_t   caller_max = UINTPTR_MAX;
+	uintptr_t   base       = 0;
+	bool        sites      = false;
+};
+
+static void ParseRange(const char* name, uint64_t& min, uint64_t& max) {
+	if (const char* range = std::getenv(name); range != nullptr) {
+		char* end = nullptr;
+		min       = std::strtoull(range, &end, 0);
+		if (end != nullptr && *end == '-') {
+			max = std::strtoull(end + 1, nullptr, 0);
+		}
+	}
+}
+
+static const HeapFill& GetHeapFill() {
+	static const HeapFill fill = [] {
+		HeapFill    f;
+		f.byte = 0;
+		const char* value = std::getenv("KYTY_DEBUG_HEAP_FILL");
+		if (value != nullptr) {
+			f.byte = std::strcmp(value, "off") == 0
+			             ? -1
+			             : static_cast<int>(std::strtol(value, nullptr, 0) & 0xff);
+		}
+		uint64_t min = f.min, max = f.max, caller_min = f.caller_min, caller_max = f.caller_max;
+		ParseRange("KYTY_DEBUG_HEAP_FILL_RANGE", min, max);
+		ParseRange("KYTY_DEBUG_HEAP_FILL_CALLER", caller_min, caller_max);
+		f.min        = min;
+		f.max        = max;
+		f.caller_min = caller_min;
+		f.caller_max = caller_max;
+		f.sites      = std::getenv("KYTY_DEBUG_HEAP_SITES") != nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		f.base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+#endif
+		return f;
+	}();
+	return fill;
+}
+
+static void NoteHeapSite(uintptr_t offset, std::size_t size) {
+	static std::atomic<uintptr_t> sites[1u << 14u];
+	for (uintptr_t i = (offset * 0x9e3779b97f4a7c15ull) >> 50u;; i = (i + 1) % std::size(sites)) {
+		uintptr_t current = sites[i].load(std::memory_order_relaxed);
+		if (current == offset) {
+			return;
+		}
+		if (current == 0 && sites[i].compare_exchange_strong(current, offset)) {
+			std::printf("heap-site 0x%llx size %zu\n", static_cast<unsigned long long>(offset),
+			            size);
+			std::fflush(stdout);
+			return;
+		}
+		if (current == offset) {
+			return;
+		}
+	}
+}
+
+void* operator new(std::size_t size) {
+	void* block = std::malloc(size != 0 ? size : 1);
+	if (block == nullptr) {
+		throw std::bad_alloc();
+	}
+	if (const auto& fill = GetHeapFill(); fill.byte >= 0) {
+		const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - fill.base;
+		if (fill.sites && size >= 1024) {
+			NoteHeapSite(caller, size);
+		}
+		if (size >= fill.min && size < fill.max && caller >= fill.caller_min &&
+		    caller < fill.caller_max) {
+			std::memset(block, fill.byte, size);
+		}
+	}
+	return block;
+}
+
+void operator delete(void* p) noexcept {
+	std::free(p);
+}
+
+void operator delete(void* p, std::size_t) noexcept {
+	std::free(p);
+}
+
+void* operator new[](std::size_t size) {
+	return ::operator new(size);
+}
+
+void operator delete[](void* p) noexcept {
+	::operator delete(p);
+}
+
+void operator delete[](void* p, std::size_t) noexcept {
+	::operator delete(p);
+}
 
 using namespace Common;
 using namespace Emulator;

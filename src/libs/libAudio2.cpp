@@ -30,6 +30,16 @@ constexpr int AUDIO_OUT_PORT_TYPE_PADSPK    = 4;
 constexpr int AUDIO_OUT_PORT_TYPE_VIBRATION = 10;
 constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
 
+static float SoftLimit(float x) {
+	if (x > 0.8f) {
+		return 0.8f + 0.2f * std::tanh((x - 0.8f) / 0.2f);
+	}
+	if (x < -0.8f) {
+		return -(0.8f + 0.2f * std::tanh((-x - 0.8f) / 0.2f));
+	}
+	return x;
+}
+
 } // namespace
 
 namespace AudioOut2 {
@@ -460,6 +470,20 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 			Ajm::MixTappedStereo(reinterpret_cast<float*>(state.pcm_data.data()), state.samples_num,
 			                     channels);
 			tapped = true;
+		}
+		if (channels >= 3) {
+			// Center channel (index 2) carries speech/dialogues in surround sound.
+			// Blend center onto front L/R with SoftLimit so commentary is upfront and balanced
+			// with the stadium effects, without clipping on loud moments (like goals).
+			auto* pcm = reinterpret_cast<float*>(state.pcm_data.data());
+			for (uint32_t i = 0; i < state.samples_num; i++) {
+				const size_t idx    = static_cast<size_t>(i) * channels;
+				const float  center = pcm[idx + 2];
+				if (center != 0.0f) {
+					pcm[idx]     = SoftLimit(pcm[idx] + center * 0.5f);
+					pcm[idx + 1] = SoftLimit(pcm[idx + 1] + center * 0.5f);
+				}
+			}
 		}
 	}
 	std::vector<AudioInternal::OutputParam> params;
@@ -1254,7 +1278,7 @@ void MixTappedStereo(float* interleaved, uint32_t frames, uint32_t channels) {
 	}
 	std::sort(ranked.begin(), ranked.end(),
 	          [](const auto& a, const auto& b) { return a.first > b.first; });
-	constexpr float gain  = 0.7f;
+	constexpr float gain  = 0.22f;
 	uint32_t        mixed = 0;
 	for (const auto& [peak, id]: ranked) {
 		(void)peak;
@@ -1275,8 +1299,8 @@ void MixTappedStereo(float* interleaved, uint32_t frames, uint32_t channels) {
 			const float  left  = interleaved[dst] + tap.stereo[static_cast<size_t>(i) * 2u] * gain;
 			const float  right = interleaved[dst + 1u] +
 			                    tap.stereo[static_cast<size_t>(i) * 2u + 1u] * gain;
-			interleaved[dst]      = std::clamp(left, -1.0f, 1.0f);
-			interleaved[dst + 1u] = std::clamp(right, -1.0f, 1.0f);
+			interleaved[dst]      = SoftLimit(left);
+			interleaved[dst + 1u] = SoftLimit(right);
 		}
 		tap.stereo.clear();
 		mixed++;
