@@ -1332,6 +1332,10 @@ void DefineGetBdaPointer(EmitterState& state) {
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		// The operation itself must be atomic across the workgroup (LDS) or the device.
+		// Narrowing it to the subgroup drops updates from the other waves: the light lists
+		// of a match come out empty and the pitch is black. The barrier after it stays at
+		// subgroup scope so this driver does not turn it into s_barrier.
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);

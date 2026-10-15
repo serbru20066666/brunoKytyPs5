@@ -1876,12 +1876,12 @@ void TestNativeStoreCompletion() {
     Check(store < completion && completion < atomic && atomic != std::string::npos,
           "store completion moved outside its native publication order");
     const auto source = DisassembleSpirvBinary(result.spirv);
-    const auto barrier = source.find("OpControlBarrier %uint_3 %uint_1 %uint_2116");
+    const auto barrier = source.find("OpMemoryBarrier %uint_3 %uint_2116");
     Check(barrier != std::string::npos &&
               source.find("OpStore") < barrier &&
               barrier < source.find("OpAtomicIAdd") &&
-              source.find("OpControlBarrier", barrier + 1) == std::string::npos,
-          "store completion must synchronize the subgroup once after both wave halves");
+              source.find("OpControlBarrier") == std::string::npos,
+          "store completion must order the subgroup's stores once after both wave halves");
   }
 
   const std::array no_store_wait = {

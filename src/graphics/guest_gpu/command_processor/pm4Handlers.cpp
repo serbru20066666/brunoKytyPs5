@@ -1477,7 +1477,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
 	cp.AdvanceBdaEpoch();
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(
+	    cp.ReadLabel(const_cast<const uint64_t*>(compare_addr)), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -2048,6 +2049,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	// Shader tables share pages with GPU images. Wait only when these bytes are GPU-written.
+	// Context/UC tables stay on the guest pointer: a clean-read of those blanks Select Side.
+	{
+		const auto count = static_cast<size_t>(indirect_num_dw) * 2u;
+		thread_local std::vector<uint32_t> copy;
+		copy.resize(count);
+		if (cp.GetRenderer().GetBufferCache().TryReadKnownBytes(
+		        indirect_address, copy.data(), count * sizeof(uint32_t))) {
+			indirect_buffer = copy.data();
+		}
+	}
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];

@@ -191,6 +191,12 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
                                            AjmDecAt9ConfigDataInfo* config_info);
 const char* KYTY_SYSV_ABI AjmStrError(int error);
 
+// The game's mix keeps long ATRAC9 beds at about a tenth of the decoded level.
+// Add those beds onto the front channels of the port that is actually playing.
+void FeedAt9Tap(uint32_t instance, const float* interleaved, uint32_t channels, uint32_t frames);
+void DropAt9Tap(uint32_t instance);
+void MixTappedStereo(float* interleaved, uint32_t frames, uint32_t channels);
+
 } // namespace Ajm
 
 namespace AvPlayer {

@@ -21,9 +21,11 @@ Sin generación de cuadros.
 
 ## Estado
 
-Versión **0.5.3**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
+Versión **0.5.4**. Medido en la RX 6800 XT, leyendo los fps que el emulador escribe en el título.
 
-**Nuevo en 0.5.3 — EA SPORTS FC 27 a 35 fps de promedio en el partido.** El solucionador de tela leía la memoria local del grupo con dos ramas en cada acceso. El compilador de AMD las convertía en unas diez instrucciones y separaba las lecturas vecinas; ahora la comprobación se hace una vez y la carga no se ramifica. Las escrituras de fin de tubería sobre memoria que ya posee la GPU se quedan en la cola gráfica, sin vaciarla para copiarlas en la CPU. En un partido el título marcó 35 fps de promedio. La primera partida con esta versión recompila los sombreadores. El sonido sigue muy bajo y no llega a 60.
+**Nuevo en 0.5.4 — diálogos de EA SPORTS FC 27 y césped verde.** El decodificador Opus acepta las familias de mapeo 1 y 255 que pide el juego (antes solo la 0), así que se oyen los diálogos en el partido. Las camas ATRAC9 de menú, que el juego dejaba muy bajas, se suman a los canales frontales del puerto que suena. Un `s_waitcnt` del recompilador ya no se baja a `s_barrier` en el controlador de AMD (esa barrera en código divergente colgaba la GPU). Las tablas de constantes de sombreadores que comparten página con imágenes de la GPU se leen sin esperar cuando sus propios bytes no están sucios. En un partido Boca–River el césped se ve verde y el título marcó unos 32 fps. La plaza de ASTRO's PLAYROOM a 1440p sigue a 60. La primera partida con esta versión recompila los sombreadores.
+
+**De la 0.5.3 — EA SPORTS FC 27 a 35 fps de promedio en el partido.** El solucionador de tela leía la memoria local del grupo con dos ramas en cada acceso. El compilador de AMD las convertía en unas diez instrucciones y separaba las lecturas vecinas; ahora la comprobación se hace una vez y la carga no se ramifica. Las escrituras de fin de tubería sobre memoria que ya posee la GPU se quedan en la cola gráfica, sin vaciarla para copiarlas en la CPU. En un partido el título marcó 35 fps de promedio.
 
 **De la 0.5.2 — más fps en el partido de EA SPORTS FC 27.** El cómputo de la tela dejaba el resto de la GPU parada: había una barrera detrás de cada despacho, y el juego ya ordena ese trabajo con sus propias esperas. Ahora esos despachos se solapan. Los dibujos indirectos múltiples cuyos argumentos escribe la GPU se lanzan desde esa copia, sin leerlos en la CPU. En un partido completo el título marcó entre 28 y 41 fps (antes, 21–29). El sonido sigue muy bajo y no llega a 60.
 

@@ -321,7 +321,7 @@ private:
 	// What ResolveRenderColorTarget resolved for each target slot, so that a draw with the same
 	// target registers keeps it (see TextureCache::RefindImage).
 	struct ColorTargetSource {
-		HW::RenderTarget registers;
+		HW::RenderTarget registers {};
 		uint32_t         mask                = 0;
 		uint32_t         slice_offset        = 0;
 		bool             ignore_target_mask  = false;
@@ -331,24 +331,24 @@ private:
 		RenderColorInfo  target;
 		// The view FindRenderTarget last returned for this slot (see
 		// TextureCache::IsRenderTargetCurrent); view_generation 0: none.
-		vk::ImageView    view;
-		ImageId          view_image;
-		ImageViewInfo    view_info;
+		vk::ImageView    view            = nullptr;
+		ImageId          view_image {};
+		ImageViewInfo    view_info {};
 		uint64_t         view_generation = 0;
 	};
 	[[nodiscard]] static bool TargetReuseEnabled();
 	// The same for the depth target: its description and image, keyed by its registers.
 	struct DepthTargetSource {
-		HW::DepthRenderTarget   registers;
+		HW::DepthRenderTarget   registers {};
 		uint64_t                generation          = 0; // 0: not reusable.
 		uint32_t                metadata_base_layer = 0;
 		TextureCache::ImageDesc desc;
 		ImageId                 image_id;
 		// The view FindDepthTarget last returned (see TextureCache::IsDepthTargetCurrent);
 		// view_generation 0: none.
-		vk::ImageView           view;
-		ImageId                 view_image;
-		ImageViewInfo           view_info;
+		vk::ImageView           view = nullptr;
+		ImageId                 view_image {};
+		ImageViewInfo           view_info {};
 		uint64_t                view_generation      = 0;
 		uint64_t                view_meta_generation = 0;
 		// For a target with stencil: the plane's record that acquisition associated, and the
