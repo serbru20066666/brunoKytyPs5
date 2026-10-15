@@ -255,6 +255,8 @@ jobs:
   release:
     name: Publish release
     needs: windows
+    # Local test branches: the package stays an Actions artifact, nothing is published.
+    if: ${{ github.ref_name != 'dlssg-decouple' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
