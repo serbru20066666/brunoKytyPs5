@@ -12,7 +12,10 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Audio {
@@ -443,6 +446,20 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		}
 	}
 	context->object_mix.clear();
+	bool tapped = false;
+	for (auto& state: g_audioout2_ports) {
+		if (tapped || !state.used || state.context != ctx || state.pcm_data.empty() ||
+		    audioout2_port_type_is_object(state.port_type) || (state.data_format & 0x7fu) == 1u) {
+			continue;
+		}
+		const auto channels = audioout2_data_format_channels(state.data_format);
+		if (channels < 2 || state.samples_num == 0) {
+			continue;
+		}
+		Ajm::MixTappedStereo(reinterpret_cast<float*>(state.pcm_data.data()), state.samples_num,
+		                     channels);
+		tapped = true;
+	}
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
 	for (const auto& state: g_audioout2_ports) {
@@ -743,6 +760,12 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 
 	*port = next_port;
 
+	if (static const bool trace = std::getenv("KYTY_DEBUG_AUDIO2") != nullptr; trace) {
+		std::printf("audio2: create port=%" PRIu64 " type=%u fmt=0x%x freq=%u handle=%d\n",
+		            static_cast<uint64_t>(next_port), static_cast<uint32_t>(params->port_type),
+		            params->data_format, params->sampling_freq, audio_handle);
+		std::fflush(stdout);
+	}
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();
 		LOGF("\t ctx           = 0x%016" PRIx64 "\n"
@@ -782,6 +805,20 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	auto*             state = audioout2_find_port_locked(port);
 	if (state == nullptr) {
 		return AUDIO_OUT2_ERROR_INVALID_PORT;
+	}
+	if (static const bool trace = std::getenv("KYTY_DEBUG_AUDIO2") != nullptr;
+	    trace && audioout2_port_type_is_object(state->port_type)) {
+		static uint32_t calls = 0;
+		if (calls++ % 2000 < 4) {
+			std::printf("audio2: object port=%" PRIu64 " set %u attributes locked=%d:",
+			            static_cast<uint64_t>(port), num, state->attributes_locked ? 1 : 0);
+			for (uint32_t i = 0; i < num; i++) {
+				std::printf(" id=%u size=%zu value=%p", attributes[i].attribute_id,
+				            attributes[i].value_size, attributes[i].value);
+			}
+			std::printf("\n");
+			std::fflush(stdout);
+		}
 	}
 
 	const void* pcm_data   = nullptr;
@@ -1153,4 +1190,97 @@ int KYTY_SYSV_ABI AudioOut2MasteringTerm() {
 }
 
 } // namespace AudioOut2
+
+namespace Ajm {
+
+namespace {
+
+struct AjmStereoTap {
+	std::vector<float> stereo;
+	uint32_t           frames = 0;
+	float              peak   = 0.0f;
+};
+
+std::mutex                                g_at9_tap_mutex;
+std::unordered_map<uint32_t, AjmStereoTap> g_at9_taps;
+
+bool AjmAt9TapDisabled() {
+	const char* disabled = std::getenv("KYTY_DEBUG_NO_AT9_TAP");
+	return disabled != nullptr && disabled[0] != '\0' && disabled[0] != '0';
+}
+
+} // namespace
+
+void FeedAt9Tap(uint32_t instance, const float* interleaved, uint32_t channels, uint32_t frames) {
+	if (AjmAt9TapDisabled() || interleaved == nullptr || channels == 0 || frames == 0) {
+		return;
+	}
+	std::lock_guard lock(g_at9_tap_mutex);
+	auto&           tap = g_at9_taps[instance];
+	tap.frames += frames;
+	tap.stereo.reserve(tap.stereo.size() + static_cast<size_t>(frames) * 2u);
+	for (uint32_t i = 0; i < frames; i++) {
+		const float left  = interleaved[static_cast<size_t>(i) * channels];
+		const float right = channels > 1 ? interleaved[static_cast<size_t>(i) * channels + 1u] : left;
+		tap.peak = std::max(tap.peak, std::max(std::fabs(left), std::fabs(right)));
+		tap.stereo.push_back(left);
+		tap.stereo.push_back(right);
+	}
+	constexpr size_t cap = 48000u * 2u;
+	if (tap.stereo.size() > cap) {
+		tap.stereo.erase(tap.stereo.begin(), tap.stereo.end() - static_cast<std::ptrdiff_t>(cap));
+	}
+}
+
+void DropAt9Tap(uint32_t instance) {
+	std::lock_guard lock(g_at9_tap_mutex);
+	g_at9_taps.erase(instance);
+}
+
+void MixTappedStereo(float* interleaved, uint32_t frames, uint32_t channels) {
+	if (AjmAt9TapDisabled() || interleaved == nullptr || frames == 0 || channels < 2) {
+		return;
+	}
+	std::lock_guard lock(g_at9_tap_mutex);
+	std::vector<std::pair<float, uint32_t>> ranked;
+	ranked.reserve(g_at9_taps.size());
+	for (const auto& [id, tap]: g_at9_taps) {
+		// Continuous bed, not a one-shot UI tick.
+		if (tap.frames >= 64 && tap.peak >= 0.08f && tap.stereo.size() >= 2) {
+			ranked.emplace_back(tap.peak, id);
+		}
+	}
+	std::sort(ranked.begin(), ranked.end(),
+	          [](const auto& a, const auto& b) { return a.first > b.first; });
+	constexpr float gain  = 0.7f;
+	uint32_t        mixed = 0;
+	for (const auto& [peak, id]: ranked) {
+		(void)peak;
+		auto& tap = g_at9_taps[id];
+		if (mixed >= 2) {
+			tap.stereo.clear();
+			continue;
+		}
+		const size_t have = tap.stereo.size() / 2u;
+		if (have > frames) {
+			tap.stereo.erase(tap.stereo.begin(),
+			                 tap.stereo.end() - static_cast<std::ptrdiff_t>(frames) * 2);
+		}
+		const auto count =
+		    std::min<uint32_t>(frames, static_cast<uint32_t>(tap.stereo.size() / 2u));
+		for (uint32_t i = 0; i < count; i++) {
+			const size_t dst   = static_cast<size_t>(i) * channels;
+			const float  left  = interleaved[dst] + tap.stereo[static_cast<size_t>(i) * 2u] * gain;
+			const float  right = interleaved[dst + 1u] +
+			                    tap.stereo[static_cast<size_t>(i) * 2u + 1u] * gain;
+			interleaved[dst]      = std::clamp(left, -1.0f, 1.0f);
+			interleaved[dst + 1u] = std::clamp(right, -1.0f, 1.0f);
+		}
+		tap.stereo.clear();
+		mixed++;
+	}
+}
+
+} // namespace Ajm
+
 } // namespace Libs::Audio
