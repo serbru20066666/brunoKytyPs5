@@ -541,10 +541,69 @@ static uint32_t FlipFpsCap() {
 	return cap;
 }
 
+// KYTY_FLIP_PACE=1: even pacing. The game's 3D view is flipped at a steady rate: the median cost of the last 31 real
+// frames, rounded up to a whole number of vblank periods (60 / 30 / 20 fps at 60 Hz; finer on a 120 Hz vblank). A
+// frame's cost is the time between two completed game frames minus the time the guest spent blocked on flips, so the
+// pacer's own delays do not raise its target. Early flips wait; late ones (a spike) go at once and re-anchor
+// (ScheduleNextFlipLocked). It only delays: no guest frame is dropped or skipped, and every one is presented, with
+// DLSS-G, FSR3 FG or none. KYTY_FLIP_FPS, when set, is a floor on the spacing as before. Implies flip-when-ready.
+static bool FlipPace() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FLIP_PACE");
+		const bool  result = value != nullptr && *value == '1';
+		if (result) {
+			std::printf("Flips: the game's 3D view paced to the median frame time (KYTY_FLIP_PACE)\n");
+			std::fflush(stdout);
+		}
+		return result;
+	}();
+	return enabled;
+}
+
+static std::atomic<uint64_t> g_guest_blocked_qpc {0}; // total time guest threads waited in WaitFlipDone / for a slot
+static std::atomic<uint64_t> g_pace_step_qpc {0};     // the pacer's flip spacing (0: none yet)
+
+// Called under the flip queue's lock when a game-view frame becomes ready.
+static void PaceNoteFrame() {
+	static constexpr size_t kWindow = 31;
+	static std::array<uint64_t, kWindow> costs {};
+	static size_t   count = 0, next = 0;
+	static uint64_t last_ready = 0, last_blocked = 0, last_log = 0;
+	const uint64_t  now       = Common::Timer::QueryPerformanceCounter();
+	const uint64_t  blocked   = g_guest_blocked_qpc.load(std::memory_order_relaxed);
+	const auto      frequency = Common::Timer::QueryPerformanceFrequency();
+	const uint64_t  period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
+	if (last_ready != 0 && now - last_ready < frequency / 2) { // a pause (menu, load) of 0.5 s starts over
+		const uint64_t interval = now - last_ready;
+		const uint64_t idle     = std::min(blocked - last_blocked, interval);
+		costs[next] = interval - idle;
+		next        = (next + 1) % kWindow;
+		count       = std::min(count + 1, kWindow);
+	}
+	last_ready   = now;
+	last_blocked = blocked;
+	if (count < 8) return;
+	std::array<uint64_t, kWindow> sorted {};
+	std::copy_n(costs.begin(), count, sorted.begin());
+	std::nth_element(sorted.begin(), sorted.begin() + count / 2, sorted.begin() + count);
+	const uint64_t median    = sorted[count / 2];
+	const uint64_t tolerance = frequency / 2000; // 0.5 ms: a frame just over a period keeps that period
+	const uint64_t periods   = std::clamp<uint64_t>((median > tolerance ? median - tolerance : 0) / period + 1, 1, 4);
+	g_pace_step_qpc.store(periods * period, std::memory_order_relaxed);
+	if (now - last_log >= frequency) {
+		last_log = now;
+		std::printf("[pace] target %.1f fps (%llu vblank(s)), median frame cost %.2f ms over %zu frames\n",
+		            static_cast<double>(frequency) / static_cast<double>(periods * period),
+		            static_cast<unsigned long long>(periods), static_cast<double>(median) * 1000.0 / static_cast<double>(frequency),
+		            count);
+		std::fflush(stdout);
+	}
+}
+
 static bool FlipWhenReady() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_FLIP_WHEN_READY");
-		return (value != nullptr && *value != '\0' && *value != '0') || FlipFpsCap() != 0;
+		return (value != nullptr && *value != '\0' && *value != '0') || FlipFpsCap() != 0 || FlipPace();
 	}();
 	return enabled;
 }
@@ -578,6 +637,7 @@ static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped, bool game_vi
 	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) intervals = static_cast<uint64_t>(floor) + 1u;
 	uint64_t step = period * intervals;
 	if (const uint32_t cap = FlipFpsCap(); cap != 0 && game_view && !MoviePlaying()) step = std::max<uint64_t>(step, frequency / cap);
+	if (FlipPace() && game_view && !MoviePlaying()) step = std::max(step, g_pace_step_qpc.load(std::memory_order_relaxed));
 	return step;
 }
 
@@ -1200,6 +1260,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		if (FlipPace() && Graphics::Presenter::IsGameView(*request->frame)) PaceNoteFrame();
 		m_submit_cond_var.Signal();
 		if (FlipDecouple() >= 2) m_done_cond_var.SignalAll();
 		m_mutex.Unlock();
@@ -1226,7 +1287,9 @@ void FlipQueue::WaitForSubmitSlot() {
 		if (m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
+		const uint64_t begin = Common::Timer::QueryPerformanceCounter();
 		m_submit_slot_cond_var.Wait(&m_mutex);
+		g_guest_blocked_qpc.fetch_add(Common::Timer::QueryPerformanceCounter() - begin, std::memory_order_relaxed);
 	}
 }
 
@@ -1245,7 +1308,9 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		return std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
+		const uint64_t begin = Common::Timer::QueryPerformanceCounter();
 		m_done_cond_var.Wait(&m_mutex);
+		g_guest_blocked_qpc.fetch_add(Common::Timer::QueryPerformanceCounter() - begin, std::memory_order_relaxed);
 	}
 }
 
