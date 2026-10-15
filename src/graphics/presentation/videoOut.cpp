@@ -549,6 +549,26 @@ static bool FlipWhenReady() {
 	return enabled;
 }
 
+// KYTY_FLIP_DECOUPLE=1|2: the guest's flip completes when its frame is handed to the presentation thread, not when
+// the present call returns. A present that blocks (Streamline's Reflex sleep, DLSS-G's pacer, a full swapchain:
+// 24-35 ms a frame measured) then no longer holds the game's render thread in WaitFlipDone. The presented frame is
+// the presenter's own copy (PrepareFrame), so the guest may reuse its buffer at once. 1: the frame being presented
+// counts as done; 2: also the next ready frame behind it (one more frame of latency). No frame is dropped: the
+// flip queue's capacity (WaitForSubmitSlot) still bounds how far the guest runs ahead. All Streamline calls stay on
+// the presentation thread, in order, one token per presented frame.
+static int FlipDecouple() {
+	static const int depth = [] {
+		const char* value = std::getenv("KYTY_FLIP_DECOUPLE");
+		const int   result = value != nullptr ? std::clamp(std::atoi(value), 0, 2) : 0;
+		if (result != 0) {
+			std::printf("Flips: completed on hand-off to the presentation thread, %d frame(s) ahead (KYTY_FLIP_DECOUPLE)\n", result);
+			std::fflush(stdout);
+		}
+		return result;
+	}();
+	return depth;
+}
+
 // Minimum spacing between two flips (QueryPerformanceCounter units) in flip-when-ready mode.
 static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped, bool game_view) {
 	const auto     frequency = Common::Timer::QueryPerformanceFrequency();
@@ -1181,6 +1201,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 		}
 		request->state = RequestState::Ready;
 		m_submit_cond_var.Signal();
+		if (FlipDecouple() >= 2) m_done_cond_var.SignalAll();
 		m_mutex.Unlock();
 		return;
 	}
@@ -1214,8 +1235,14 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 
 	auto has_request = [this, &cfg, index] {
 		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
-		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+		// KYTY_FLIP_DECOUPLE=2: the oldest ready frame (next to be presented) is already the presenter's copy.
+		auto first_ready = FlipDecouple() >= 2 ? std::find_if(m_requests.begin(), m_requests.end(),
+		                                                      [](const auto& r) { return r.state == RequestState::Ready; })
+		                                       : m_requests.end();
+		for (auto it = m_requests.begin(); it != m_requests.end(); ++it) {
+			if (it != first_ready && matches(*it)) return true;
+		}
+		return std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
 		m_done_cond_var.Wait(&m_mutex);
@@ -1269,34 +1296,49 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// next flip under it. The presented frame is its own copy; a port closed meanwhile takes no status or event.
 	r.cfg->mutex.Unlock();
 
+	// Retires the request: flip status, the flip event, waiters in WaitFlipDone. Called with both locks held.
+	auto finish = [this, &r] {
+		if (m_requests.empty() || m_requests.front().id != r.id ||
+		    m_requests.front().state != RequestState::Presenting) {
+			EXIT("video-out flip queue changed while processing its front request\n");
+		}
+		m_requests.pop_front();
+
+		if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
+			r.cfg->flip_status.count++;
+			r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
+			r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
+			r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+			r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
+			r.cfg->flip_status.flipArg                  = r.flip_arg;
+			r.cfg->flip_status.currentBuffer            = r.index;
+			r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+			if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
+				r.cfg->flip_status.gcQueueNum--;
+			}
+			TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
+		}
+		m_done_cond_var.SignalAll();
+		m_submit_slot_cond_var.Signal();
+	};
+	// KYTY_FLIP_DECOUPLE: retired on hand-off. The request leaves the queue, so Cancel and the destructor no longer
+	// see its frame; Present below consumes it. m_processing stays set until Present returns (one presenter).
+	const bool decoupled = FlipDecouple() != 0;
+	if (decoupled) {
+		r.cfg->mutex.Lock();
+		m_mutex.Lock();
+		finish();
+		m_mutex.Unlock();
+		r.cfg->mutex.Unlock();
+	}
+
 	m_presenter.Present(*r.frame);
 
 	r.cfg->mutex.Lock();
 	m_mutex.Lock();
-	if (m_requests.empty() || m_requests.front().id != r.id ||
-	    m_requests.front().state != RequestState::Presenting) {
-		EXIT("video-out flip queue changed while processing its front request\n");
-	}
-	m_requests.pop_front();
-
-	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
-		r.cfg->flip_status.count++;
-		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
-		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
-		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
-		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-		r.cfg->flip_status.flipArg                  = r.flip_arg;
-		r.cfg->flip_status.currentBuffer            = r.index;
-		r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
-		if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
-			r.cfg->flip_status.gcQueueNum--;
-		}
-		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
-	}
-
+	if (!decoupled) finish();
 	m_processing = false;
 	m_done_cond_var.SignalAll();
-	m_submit_slot_cond_var.Signal();
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
 
