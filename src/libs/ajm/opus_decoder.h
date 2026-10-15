@@ -223,7 +223,7 @@ private:
 			if (const char* env = std::getenv("KYTY_DEBUG_OPUS_GAIN"); env != nullptr && env[0] != '\0') {
 				return std::strtof(env, nullptr);
 			}
-			return 2.5f;
+			return 4.0f;
 		}();
 		return gain;
 	}
