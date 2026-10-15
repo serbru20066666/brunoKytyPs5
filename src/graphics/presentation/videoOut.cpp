@@ -547,18 +547,23 @@ static uint32_t FlipFpsCap() {
 // pacer's own delays do not raise its target. Early flips wait; late ones (a spike) go at once and re-anchor
 // (ScheduleNextFlipLocked). It only delays: no guest frame is dropped or skipped, and every one is presented, with
 // DLSS-G, FSR3 FG or none. KYTY_FLIP_FPS, when set, is a floor on the spacing as before. Implies flip-when-ready.
-static bool FlipPace() {
-	static const bool enabled = [] {
+// KYTY_FLIP_PACE=2: drop cap. Uncapped while frames keep 60 fps; the first real frame slower than 17.5 ms (or than the
+// current cap + 1.5 ms) caps the 3D view at 50 fps at once (a further drop lowers it 2 fps at a time, down to 30), so a sudden drop shows as 180 -> 150 with FG x3 instead of
+// an uneven 40-57. Every second without a drop the cap rises by 2 fps (52, 54 ... 58) until 60, then it is lifted.
+// Measured on the real interval between completed game frames; frames slower than the cap still go at once.
+static int FlipPaceMode() {
+	static const int mode = [] {
 		const char* value = std::getenv("KYTY_FLIP_PACE");
-		const bool  result = value != nullptr && *value == '1';
-		if (result) {
-			std::printf("Flips: the game's 3D view paced to the median frame time (KYTY_FLIP_PACE)\n");
-			std::fflush(stdout);
-		}
+		const int   result = value != nullptr ? std::clamp(std::atoi(value), 0, 2) : 0;
+		if (result == 1) std::printf("Flips: the game's 3D view paced to the median frame time (KYTY_FLIP_PACE=1)\n");
+		if (result == 2) std::printf("Flips: drop cap 50 fps, -2 per drop (min 30), +2 per steady second up to 60 (KYTY_FLIP_PACE=2)\n");
+		std::fflush(stdout);
 		return result;
 	}();
-	return enabled;
+	return mode;
 }
+
+static bool FlipPace() { return FlipPaceMode() != 0; }
 
 static std::atomic<uint64_t> g_guest_blocked_qpc {0}; // total time guest threads waited in WaitFlipDone / for a slot
 static std::atomic<uint64_t> g_pace_step_qpc {0};     // the pacer's flip spacing (0: none yet)
@@ -579,6 +584,30 @@ static void PaceNoteFrame() {
 		costs[next] = interval - idle;
 		next        = (next + 1) % kWindow;
 		count       = std::min(count + 1, kWindow);
+	}
+	if (FlipPaceMode() == 2) {
+		static uint32_t cap_fps = 0;      // 0: uncapped (60)
+		static uint64_t level_since = 0;  // when the current level started without a drop
+		const uint64_t  interval    = last_ready != 0 ? now - last_ready : 0;
+		last_ready                  = now;
+		last_blocked                = blocked;
+		if (interval == 0 || interval >= frequency / 2) { level_since = now; return; } // pause, menu, load
+		const double limit_ms = cap_fps == 0 ? 17.5 : 1000.0 / cap_fps + 1.5;
+		const double ms       = static_cast<double>(interval) * 1000.0 / static_cast<double>(frequency);
+		const uint32_t before = cap_fps;
+		if (ms > limit_ms) {
+			cap_fps     = cap_fps == 0 ? 50 : std::max<uint32_t>(cap_fps - 2, 30);
+			level_since = now;
+		} else if (cap_fps != 0 && now - level_since >= frequency) {
+			cap_fps     = cap_fps + 2 >= 60 ? 0 : cap_fps + 2;
+			level_since = now;
+		}
+		if (cap_fps != before) {
+			g_pace_step_qpc.store(cap_fps == 0 ? 0 : frequency / cap_fps, std::memory_order_relaxed);
+			std::printf("[pace] cap %u fps (frame %.1f ms, was %u)\n", cap_fps == 0 ? 60u : cap_fps, ms, before == 0 ? 60u : before);
+			std::fflush(stdout);
+		}
+		return;
 	}
 	last_ready   = now;
 	last_blocked = blocked;
