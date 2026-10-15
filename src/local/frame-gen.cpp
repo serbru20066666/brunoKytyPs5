@@ -500,8 +500,12 @@ void Initialize() {
 	} else {
 		wchar_t exe[MAX_PATH] {};
 		GetModuleFileNameW(nullptr, exe, MAX_PATH);
-		dir = std::filesystem::path(exe).parent_path().parent_path() / "deps" / "streamline" / "sdk" /
-		      "bin" / "x64";
+		// A package: streamline\ next to the emulator; a build tree: the SDK unpacked next to the build.
+		dir = std::filesystem::path(exe).parent_path() / "streamline";
+		if (!std::filesystem::exists(dir / "sl.interposer.dll")) {
+			dir = std::filesystem::path(exe).parent_path().parent_path() / "deps" / "streamline" / "sdk" /
+			      "bin" / "x64";
+		}
 	}
 	const auto interposer = dir / "sl.interposer.dll";
 	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {

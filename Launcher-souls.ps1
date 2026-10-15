@@ -14,7 +14,12 @@ $iniFile  = Join-Path $root 'launcher.ini'
 $fgModes = @(
 	@('Sin frame generation',                          'sin-fg.json'),
 	@('Frame generation AMD x2',                          'fsr3.json'),
-	@('Frame generation AMD x3',                          'fsr3-x3.json')
+	@('Frame generation AMD x3',                          'fsr3-x3.json'),
+	@('Frame generation DLSS x2 (NVIDIA)',                'dlss-x2.json'),
+	@('Frame generation DLSS x3 (NVIDIA)',                'dlss-x3.json'),
+	@('Frame generation DLSS x4 (NVIDIA)',                'dlss-x4.json'),
+	@('Frame generation DLSS x3 120 fps',                 'dlss-x3-120.json'),
+	@('Frame generation DLSS x4 240 fps',                 'dlss-x4-240.json')
 )
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
