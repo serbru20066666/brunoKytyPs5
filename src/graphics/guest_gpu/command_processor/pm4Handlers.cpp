@@ -2049,6 +2049,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	// Shader tables share pages with GPU images. Wait only when these bytes are GPU-written.
+	// Context/UC tables stay on the guest pointer: a clean-read of those blanks Select Side.
+	{
+		const auto count = static_cast<size_t>(indirect_num_dw) * 2u;
+		thread_local std::vector<uint32_t> copy;
+		copy.resize(count);
+		if (cp.GetRenderer().GetBufferCache().TryReadKnownBytes(
+		        indirect_address, copy.data(), count * sizeof(uint32_t))) {
+			indirect_buffer = copy.data();
+		}
+	}
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];

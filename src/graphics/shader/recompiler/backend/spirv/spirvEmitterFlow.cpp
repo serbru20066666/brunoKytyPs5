@@ -624,9 +624,10 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
+	// s_waitcnt, not s_barrier. OpControlBarrier with device scope becomes s_barrier on this
+	// AMD driver and hangs the GPU when the wait is in divergent code.
 	state.builder.AddFunction(
-	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
-	    ConstantU32(state, spv::ScopeDevice),
+	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeSubgroup),
 	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
 }
