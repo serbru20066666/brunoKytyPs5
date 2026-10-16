@@ -13,10 +13,15 @@
 #include <unordered_map>
 #include <utility>
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+#include "local/vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -378,7 +383,7 @@ bool Enabled() {
 }
 
 bool Capturing() {
-	return Enabled() || Fsr3::Active();
+	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted();
 }
 
 bool Requested() {
@@ -1242,6 +1247,7 @@ int FlipSlot(std::span<const ImageId> targets) {
 
 void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
                     std::span<const TextureBinding> images, const std::function<void()>& redraw) {
+	if (!Enabled() && !Fsr3::Active()) return; // (capturing for upscaling only: no HUD-less image wanted)
 	if (g_hudless_taken || slot >= rendering.num_color_attachments || FlipOf(target) == nullptr) return;
 	auto& flip = g_cache->GetImage(target);
 	// The HUD texture: of the full-screen-ish color images the composite samples, an 8-bit (or 10-bit) one with alpha
@@ -1340,6 +1346,146 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 	g_resuming      = false;
 	g_hudless_taken = true;
 	g_composite     = true;
+}
+
+namespace {
+VulkanImage   g_up_depth, g_up_motion, g_up_output;
+vk::ImageView g_up_depth_view = nullptr, g_up_motion_view = nullptr, g_up_output_view = nullptr;
+bool          g_up_reset = true;
+std::chrono::steady_clock::time_point g_up_last {};
+uint32_t      g_up_logs  = 0;
+uint64_t      g_up_count = 0, g_up_missed = 0;
+
+uint32_t UpscaleHeight() {
+	static const uint32_t height = [] {
+		const char* value = std::getenv("KYTY_UPSCALE_HEIGHT");
+		const auto  h     = value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 1440u;
+		return std::clamp(h, 720u, 2160u);
+	}();
+	return height;
+}
+
+void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D extent) {
+	if (g_up_output.image != nullptr && g_up_output.format == format && g_up_output.extent.width == extent.width &&
+	    g_up_output.extent.height == extent.height)
+		return;
+	if (g_up_output_view != nullptr) {
+		graphics.device.waitIdle();
+		graphics.device.destroyImageView(g_up_output_view, nullptr);
+		g_up_output_view = nullptr;
+	}
+	if (g_up_output.image != nullptr) graphics.DeleteImage(g_up_output);
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+	               vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_up_output)) {
+		EXIT("upscaling: cannot allocate a %ux%u output image\n", extent.width, extent.height);
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_up_output.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &g_up_output_view), "upscaling output view");
+}
+} // namespace
+
+void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images) {
+	if (!Fsr3::UpscaleWanted() || g_cache == nullptr || g_graphics_ctx == nullptr) return;
+	if (!g_sources.valid) {
+		g_up_reset = true; // menus, loading screens and movies: no TAA pass, the history starts again after them
+		return;
+	}
+	auto& depth  = g_cache->GetImage(g_sources.depth);
+	auto& motion = g_cache->GetImage(g_sources.motion);
+	if (depth.info.data.address != g_sources.depth_address || motion.info.data.address != g_sources.motion_address ||
+	    depth.backing.extent.width != motion.backing.extent.width ||
+	    depth.backing.extent.height != motion.backing.extent.height) {
+		g_up_reset = true;
+		return;
+	}
+	const vk::Extent2D render {depth.backing.extent.width, depth.backing.extent.height};
+	// The 3D image: the composite's RGBA16F image of the render size.
+	TextureBinding* scene = nullptr;
+	for (auto& binding: images) {
+		if (!binding.image_id || !binding.mip_views.empty() || binding.image_view == nullptr) continue;
+		auto& image = g_cache->GetImage(binding.image_id);
+		if (image.backing.format == vk::Format::eR16G16B16A16Sfloat && image.backing.extent.width == render.width &&
+		    image.backing.extent.height == render.height) {
+			scene = &binding;
+			break;
+		}
+	}
+	if (scene == nullptr) {
+		if (g_up_missed++ < 4) {
+			std::printf("Upscaling: the composite samples no %ux%u RGBA16F image (%zu images): not upscaled\n", render.width,
+			            render.height, images.size());
+			std::fflush(stdout);
+		}
+		return;
+	}
+	const uint32_t out_height = UpscaleHeight();
+	if (out_height < render.height) return;
+	const auto out_width =
+	    static_cast<uint32_t>(std::lround(static_cast<double>(render.width) * out_height / render.height / 2.0)) * 2u;
+	const vk::Extent2D output {out_width, out_height};
+	auto&              color = g_cache->GetImage(scene->image_id);
+	ConfigureOutput(*g_graphics_ctx, color.backing.format, output);
+
+	const bool in_pass    = command.RenderingWith(rendering);
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	Configure(*g_graphics_ctx, g_up_depth, g_up_depth_view, depth.backing);
+	Configure(*g_graphics_ctx, g_up_motion, g_up_motion_view, motion.backing);
+	CopyInto(vk_command, depth, g_up_depth);
+	CopyInto(vk_command, motion, g_up_motion);
+	color.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
+	Transition(vk_command, g_up_output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+	           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eComputeShader);
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	// FSR records straight into the command buffer: what this thread queued so far goes first.
+	LocalVulkanRecording::Drain();
+#endif
+	const auto now   = std::chrono::steady_clock::now();
+	const auto delta = g_up_last == std::chrono::steady_clock::time_point {}
+	                       ? 16.7f
+	                       : std::chrono::duration<float, std::milli>(now - g_up_last).count();
+	g_up_last = now;
+	Fsr3::UpscaleDesc desc;
+	desc.command  = static_cast<VkCommandBuffer>(vk_command);
+	desc.color    = &color.backing;
+	desc.depth    = &g_up_depth;
+	desc.motion   = &g_up_motion;
+	desc.output   = &g_up_output;
+	desc.render   = render;
+	desc.upscale  = output;
+	desc.camera   = &g_camera;
+	desc.reset    = g_up_reset;
+	desc.delta_ms = delta;
+	const bool done = Fsr3::Upscale(*g_graphics_ctx, desc);
+	Transition(vk_command, g_up_output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	if (in_pass) command.ResumeRendering(rendering);
+	if (!done) return;
+	scene->image_view = g_up_output_view;
+	scene->layout     = vk::ImageLayout::eShaderReadOnlyOptimal;
+	g_up_reset        = false;
+	++g_up_count;
+	if (g_up_logs < 2 || g_up_count % 3600 == 0) {
+		++g_up_logs;
+		std::printf("Upscaling: %ux%u -> %ux%u (%" PRIu64 " frames)\n", render.width, render.height, output.width,
+		            output.height, g_up_count);
+		std::fflush(stdout);
+	}
 }
 
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,

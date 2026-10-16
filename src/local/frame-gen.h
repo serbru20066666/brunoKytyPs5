@@ -144,6 +144,11 @@ void NoteDraw(ImageId target);
 [[nodiscard]] int FlipSlot(std::span<const ImageId> targets);
 void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
                     std::span<const TextureBinding> images, const std::function<void()>& redraw);
+// Upscaling (KYTY_UPSCALE=fsr): with everything bound for the game's composite into the flip image and before the
+// descriptors are written, its 3D image (render size, RGBA16F) upscaled by FSR 3.1 to KYTY_UPSCALE_HEIGHT (default
+// 1440) with the TAA pass's depth and motion vectors, and the composite's binding pointed at the result. Its draw
+// samples it by coordinates: the bigger image takes the place of the render-size one.
+void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,

@@ -27,6 +27,7 @@
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_api_loader.h>
 #include <ffx_api/ffx_framegeneration.h>
+#include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
 #include "gpu_tiler_shaders/hud_split_spv.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
@@ -490,9 +491,9 @@ void LogState(int state, const char* text) {
 
 } // namespace
 
-bool Requested() {
-	static const bool requested = [] {
-		if (!EnvOn("KYTY_FSR3_FG", false)) return false;
+// The FidelityFX API's DLL (amd_fidelityfx_vk.dll next to the emulator), loaded once: frame generation or upscaling.
+static bool LoadApi() {
+	static const bool loaded = [] {
 		wchar_t exe[MAX_PATH] {};
 		GetModuleFileNameW(nullptr, exe, MAX_PATH);
 		std::wstring dir(exe);
@@ -502,13 +503,26 @@ bool Requested() {
 			if (g_dll != nullptr) break;
 		}
 		if (g_dll == nullptr) {
-			std::printf("FSR3 FG: amd_fidelityfx_vk.dll not found next to the emulator: frame generation off\n");
+			std::printf("FSR3: amd_fidelityfx_vk.dll not found next to the emulator\n");
 			std::fflush(stdout);
 			return false;
 		}
 		ffxLoadFunctions(&g_ffx, g_dll);
 		if (g_ffx.CreateContext == nullptr || g_ffx.Configure == nullptr || g_ffx.Dispatch == nullptr) {
-			std::printf("FSR3 FG: amd_fidelityfx_vk.dll has no FidelityFX API: frame generation off\n");
+			std::printf("FSR3: amd_fidelityfx_vk.dll has no FidelityFX API\n");
+			std::fflush(stdout);
+			return false;
+		}
+		return true;
+	}();
+	return loaded;
+}
+
+bool Requested() {
+	static const bool requested = [] {
+		if (!EnvOn("KYTY_FSR3_FG", false)) return false;
+		if (!LoadApi()) {
+			std::printf("FSR3 FG: frame generation off\n");
 			std::fflush(stdout);
 			return false;
 		}
@@ -552,12 +566,14 @@ bool PlanQueues(vk::PhysicalDevice physical_device, uint32_t queue_family, uint3
 }
 
 void OnDevice(GraphicContext& graphics, const QueuePlan& plan) {
+	if (g_requested || (UpscaleWanted() && LoadApi())) {
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+		g_get_device_proc = LocalVulkanRecording::DirectDispatch().vkGetDeviceProcAddr;
+#endif
+		if (g_get_device_proc == nullptr) g_get_device_proc = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	}
 	if (!g_requested || plan.compute_family == UINT32_MAX) return;
 	g_graphics = &graphics;
-#if defined(KYTY_LOCAL_VULKAN_RECORDING)
-	g_get_device_proc = LocalVulkanRecording::DirectDispatch().vkGetDeviceProcAddr;
-#endif
-	if (g_get_device_proc == nullptr) g_get_device_proc = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
 	const auto device = static_cast<VkDevice>(graphics.device);
 	g_queue_submit    = reinterpret_cast<PFN_vkQueueSubmit>(g_get_device_proc(device, "vkQueueSubmit"));
 	auto* get_queue   = reinterpret_cast<PFN_vkGetDeviceQueue>(g_get_device_proc(device, "vkGetDeviceQueue"));
@@ -755,6 +771,103 @@ void RecordHudLayer(GraphicContext& graphics, vk::CommandBuffer command, vk::Ima
 		            backbuffer.width, backbuffer.height, inputs->hudless.extent.width, inputs->hudless.extent.height);
 		std::fflush(stdout);
 	}
+}
+
+// ---- FSR 3.1 upscaling ----
+namespace {
+ffxContext   g_up_context = nullptr;
+vk::Extent2D g_up_render {};
+vk::Extent2D g_up_output {};
+bool         g_up_failed = false;
+uint32_t     g_up_errors = 0;
+} // namespace
+
+bool UpscaleWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_UPSCALE");
+		return value != nullptr && std::string(value) == "fsr";
+	}();
+	return wanted;
+}
+
+bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
+	if (!UpscaleWanted() || g_up_failed || !LoadApi() || g_get_device_proc == nullptr || desc.color == nullptr ||
+	    desc.depth == nullptr || desc.motion == nullptr || desc.output == nullptr || desc.command == VK_NULL_HANDLE)
+		return false;
+	if (g_up_context == nullptr || desc.render.width > g_up_render.width || desc.render.height > g_up_render.height ||
+	    desc.upscale.width != g_up_output.width || desc.upscale.height != g_up_output.height) {
+		if (g_up_context != nullptr) {
+			graphics.device.waitIdle(); // (a size change: the context's resources are released)
+			g_ffx.DestroyContext(&g_up_context, nullptr);
+			g_up_context = nullptr;
+		}
+		ffxCreateBackendVKDesc backend {};
+		backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+		backend.vkDevice         = static_cast<VkDevice>(graphics.device);
+		backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
+		backend.vkDeviceProcAddr = g_get_device_proc;
+		ffxCreateContextDescUpscale create {};
+		create.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+		create.header.pNext = &backend.header;
+		// The game's 3D image is linear HDR (RGBA16F) before its composite tonemaps it; its depth reversed, infinite.
+		create.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+		               FFX_UPSCALE_ENABLE_DEPTH_INFINITE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+		if (EnvOn("KYTY_FSR3_DEBUG", false)) create.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+		create.maxRenderSize  = {desc.render.width, desc.render.height};
+		create.maxUpscaleSize = {desc.upscale.width, desc.upscale.height};
+		create.fpMessage      = &Message;
+		const auto result     = g_ffx.CreateContext(&g_up_context, &create.header, nullptr);
+		if (result != FFX_API_RETURN_OK) {
+			std::printf("FSR3 upscaling: context not created (%u): upscaling off\n", result);
+			std::fflush(stdout);
+			g_up_context = nullptr;
+			g_up_failed  = true;
+			return false;
+		}
+		g_up_render = desc.render;
+		g_up_output = desc.upscale;
+		std::printf("FSR3 upscaling: FSR 3.1 %ux%u -> %ux%u\n", desc.render.width, desc.render.height, desc.upscale.width,
+		            desc.upscale.height);
+		std::fflush(stdout);
+	}
+	const auto        camera  = desc.camera != nullptr ? FromCamera(*desc.camera) : CameraValues {};
+	static const float mv_sign = EnvFloat("KYTY_FSR3_MV_SIGN", -1.0f) >= 0 ? 1.0f : -1.0f;
+	ffxDispatchDescUpscale up {};
+	up.header.type   = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+	up.commandList   = desc.command;
+	up.color         = ImageResource(*desc.color, false);
+	up.depth         = ImageResource(*desc.depth, true);
+	up.motionVectors = ImageResource(*desc.motion, false);
+	up.output        = ImageResource(*desc.output, false);
+	up.output.state  = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
+	up.output.description.usage = FFX_API_RESOURCE_USAGE_UAV;
+	// The game's TAA already resolved its jitter into the image (no jitter left); its vectors are in UV units along the
+	// motion (FSR wants pixels towards the previous position, as for frame generation).
+	up.jitterOffset      = {0.0f, 0.0f};
+	up.motionVectorScale = {mv_sign * static_cast<float>(desc.render.width), mv_sign * static_cast<float>(desc.render.height)};
+	up.renderSize        = {desc.render.width, desc.render.height};
+	up.upscaleSize       = {desc.upscale.width, desc.upscale.height};
+	const float sharpness = EnvFloat("KYTY_UPSCALE_SHARPNESS", 0.3f);
+	up.enableSharpening  = sharpness > 0.0f;
+	up.sharpness         = std::clamp(sharpness, 0.0f, 1.0f);
+	up.frameTimeDelta    = std::clamp(desc.delta_ms, 1.0f, 100.0f);
+	up.preExposure       = 1.0f;
+	up.reset             = desc.reset;
+	const float z_near   = EnvFloat("KYTY_FSR3_NEAR", camera.valid ? camera.z_near : 0.1f);
+	up.cameraNear        = FLT_MAX; // reversed infinite depth: the SDK's convention (frame generation's too)
+	up.cameraFar         = z_near;
+	up.cameraFovAngleVertical  = EnvFloat("KYTY_FSR3_FOV", camera.valid ? camera.fov : 1.0f);
+	up.viewSpaceToMetersFactor = 1.0f;
+	up.flags                   = 0;
+	const auto result = g_ffx.Dispatch(&g_up_context, &up.header);
+	if (result != FFX_API_RETURN_OK) {
+		if (g_up_errors++ < 4) {
+			std::printf("FSR3 upscaling: dispatch failed (%u)\n", result);
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	return true;
 }
 
 static double CapInterval() {
@@ -1016,6 +1129,12 @@ bool PlanQueues(vk::PhysicalDevice, uint32_t, uint32_t, QueuePlan&) {
 void OnDevice(GraphicContext&, const QueuePlan&) {}
 double RealFrameInterval() {
 	return 0.0;
+}
+bool UpscaleWanted() {
+	return false;
+}
+bool Upscale(GraphicContext&, const UpscaleDesc&) {
+	return false;
 }
 bool Active() {
 	return false;

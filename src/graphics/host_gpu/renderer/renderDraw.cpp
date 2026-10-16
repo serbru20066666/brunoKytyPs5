@@ -1673,6 +1673,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	     primitive == Prospero::PrimitiveType::kRectList);
 #endif
 	if (flip_slot >= 0) record_draw = false;
+	// Upscaling (KYTY_UPSCALE): the game's 3D image upscaled before the composite's descriptors are written.
+	if (flip_slot >= 0 && bindings.pixel.has_value())
+		FrameGen::UpscaleComposite(buffer, rendering, std::span<TextureBinding> {bindings.pixel->images});
 	auto vk_buffer = buffer.Handle();
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);

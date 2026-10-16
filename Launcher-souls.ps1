@@ -24,13 +24,17 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
-# Resolucion 3D (reescalado del propio juego a 4K): texto -> altura (run-windows.ps1 -RenderHeight). 1440 = la del juego.
+# Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight) y reescalador (-Upscale). 1440 = la del juego.
+# FSR 3.1: el 3D a menos resolucion y FSR lo sube a 1440 (Calidad 1.5x, Equilibrado 1.7x, Rendimiento 2x).
+# "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
-	@('3D 1440p', 1440),
-	@('3D 1260p', 1260),
-	@('3D 1080p', 1080),
-	@('3D 900p',  900),
-	@('3D 720p',  720)
+	@('1440p nativo', 1440, ''),
+	@('FSR Calidad',  960,  'fsr'),
+	@('FSR Equilib.', 848,  'fsr'),
+	@('FSR Rendim.',  720,  'fsr'),
+	@('1080p juego',  1080, ''),
+	@('900p juego',   900,  ''),
+	@('720p juego',   720,  '')
 )
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
@@ -96,8 +100,9 @@ function Start-Game {
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
 	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
-	$height = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)][1]
-	if ($height -ne 1440) { $psargs += @('-RenderHeight', "$height") }
+	$res    = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)]
+	if ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
+	if ($res[2]) { $psargs += @('-Upscale', $res[2]) }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
 	$form.WindowState = 'Minimized'
 }
@@ -209,13 +214,13 @@ $cmbRes = New-Object System.Windows.Forms.ComboBox
 $cmbRes.DropDownStyle = 'DropDownList'
 $cmbRes.Font     = $smallFont
 $cmbRes.Location = New-Object System.Drawing.Point(555, 100)
-$cmbRes.Size     = New-Object System.Drawing.Size(100, 26)
+$cmbRes.Size     = New-Object System.Drawing.Size(110, 26)
 foreach ($m in $resModes) { [void]$cmbRes.Items.Add($m[0]) }
 $resIndex = 0
-[void][int]::TryParse((Get-IniValue 'resmode' '0'), [ref]$resIndex)
+[void][int]::TryParse((Get-IniValue 'scalemode' '0'), [ref]$resIndex)
 $cmbRes.SelectedIndex = [math]::Min([math]::Max(0, $resIndex), $resModes.Count - 1)
-$cmbRes.Add_SelectedIndexChanged({ Set-IniValue 'resmode' "$($cmbRes.SelectedIndex)" })
-$tips.SetToolTip($cmbRes, 'Resolucion a la que el juego dibuja el 3D (la salida sigue en 4K). Menos = mas fps, menos nitidez.')
+$cmbRes.Add_SelectedIndexChanged({ Set-IniValue 'scalemode' "$($cmbRes.SelectedIndex)" })
+$tips.SetToolTip($cmbRes, 'Reescalado: FSR 3.1 dibuja el 3D a menos resolucion y lo sube a 1440 (mas fps). "juego": lo sube el propio juego.')
 $panel.Controls.Add($cmbRes)
 
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
