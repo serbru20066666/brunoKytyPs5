@@ -1,4 +1,4 @@
-# KytyPS5 - Demon's Souls: lanzador (ventana). Launcher.cmd lo abre.
+﻿# KytyPS5 - Demon's Souls: lanzador (ventana). Launcher.cmd lo abre.
 #   Jugar                -> arranca el juego; con "Frame generation AMD x2" (config\fsr3.json) o
 #                           "x3" (config\fsr3-x3.json, 2 frames generados), si no, sin FG (config\sin-fg.json). Copia de las partidas antes.
 #   Settings             -> carpeta del juego volcado (game-path.txt). La casilla se recuerda en launcher.ini.
@@ -122,7 +122,8 @@ function Start-Game {
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
 	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
-	$res    = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)]
+	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
+	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
 	# el dispositivo grafico. Con AMD: FSR o XeSS para reescalar.
 	if ($res[2] -eq 'dlss' -and $config -like 'fsr3*') {
@@ -211,6 +212,10 @@ $cmbFg.Font      = $subFont
 $cmbFg.Location  = New-Object System.Drawing.Point(350, 56)
 $cmbFg.Size      = New-Object System.Drawing.Size(300, 34)
 foreach ($m in $fgModes) { [void]$cmbFg.Items.Add($m[0]) }
+$cmbFg.DrawMode = 'OwnerDrawFixed'
+$cmbFg.ItemHeight = 24
+$cmbFg.BackColor = [System.Drawing.Color]::FromArgb(24, 26, 34)
+$cmbFg.ForeColor = $ink
 $cmbFg.SelectedIndex = [math]::Min([math]::Max(0, (Get-FgIndex)), $fgModes.Count - 1)
 if (-not $fgModes[$cmbFg.SelectedIndex][1]) { $cmbFg.SelectedIndex = [math]::Min($cmbFg.SelectedIndex + 1, $fgModes.Count - 1) }
 $cmbFg.Add_SelectedIndexChanged({
@@ -241,18 +246,88 @@ $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync
 $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
 
+# Desplegables con color por marca: titulos de apartado en negrita (NVIDIA verde, Intel azul, AMD rojo) y sus modos
+# en el mismo tono.
+$boldSmall = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)
+function Get-BrandColor([string]$text) {
+	if ($text -match 'NVIDIA|DLSS')      { return [System.Drawing.Color]::FromArgb(118, 185, 0) }
+	if ($text -match 'Intel|XeSS')       { return [System.Drawing.Color]::FromArgb(70, 160, 255) }
+	if ($text -match 'AMD|FSR')          { return [System.Drawing.Color]::FromArgb(237, 70, 70) }
+	if ($text -match 'juego|Del juego')  { return [System.Drawing.Color]::FromArgb(170, 170, 170) }
+	return $ink
+}
+function Draw-ColoredItem($combo, $e) {
+	if ($e.Index -lt 0) { return }
+	$text   = [string]$combo.Items[$e.Index]
+	$header = $text.StartsWith('---')
+	$selected = ((([int]$e.State) -band [int][System.Windows.Forms.DrawItemState]::Selected) -ne 0) -and -not $header
+	$back = if ($selected) { [System.Drawing.Color]::FromArgb(60, 64, 80) } elseif ($header) { [System.Drawing.Color]::FromArgb(14, 16, 22) } else { [System.Drawing.Color]::FromArgb(24, 26, 34) }
+	$brush = New-Object System.Drawing.SolidBrush($back)
+	$e.Graphics.FillRectangle($brush, $e.Bounds)
+	$brush.Dispose()
+	$font  = if ($header) { $boldSmall } else { $combo.Font }
+	$label = if ($header) { $text.Trim('-', ' ') } else { $text.Trim() }
+	$color = Get-BrandColor $text
+	$x = if ($header) { 4 } else { 12 }
+	$textBrush = New-Object System.Drawing.SolidBrush($color)
+	$e.Graphics.DrawString($label, $font, $textBrush, [single]($e.Bounds.X + $x), [single]($e.Bounds.Y + 2))
+	$textBrush.Dispose()
+}
+
+# Reescalado por apartados (NVIDIA DLSS, Intel XeSS, AMD FSR, el juego), sin mezclar con la generacion de frames:
+# con la de NVIDIA solo DLSS; con la de AMD, FSR y XeSS; sin generacion, todos.
+$script:resShown = @()
+function Get-ResFamilies {
+	$cfg = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
+	if ($cfg -like 'dlss*') { return @('', 'dlss', 'juego') }
+	if ($cfg -like 'fsr3*') { return @('', 'xess', 'fsr', 'juego') }
+	return @('', 'dlss', 'xess', 'fsr', 'juego')
+}
+function Fill-Res {
+	$wanted = Get-IniValue 'scalelabel' '1440p nativo'
+	$titles = @{ 'dlss' = '--- NVIDIA DLSS ---'; 'xess' = '--- Intel XeSS ---'; 'fsr' = '--- AMD FSR 3.1 ---'; 'juego' = '--- Del juego ---' }
+	$shown  = @()
+	foreach ($family in (Get-ResFamilies)) {
+		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } else { $_[2] }) -eq $family })
+		if ($family -eq '') { $modes = @($resModes | Where-Object { $_[0] -eq '1440p nativo' }) }
+		if ($modes.Count -eq 0) { continue }
+		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }
+		foreach ($m in $modes) { $shown += , $m }
+	}
+	$script:resShown = $shown
+	$script:resFilling = $true
+	$cmbRes.Items.Clear()
+	foreach ($m in $shown) { [void]$cmbRes.Items.Add($m[0]) }
+	$index = 0
+	for ($i = 0; $i -lt $shown.Count; $i++) { if ($shown[$i][0] -eq $wanted) { $index = $i } }
+	$cmbRes.SelectedIndex = $index
+	$script:resFilling = $false
+}
 $cmbRes = New-Object System.Windows.Forms.ComboBox
 $cmbRes.DropDownStyle = 'DropDownList'
 $cmbRes.Font     = $smallFont
 $cmbRes.Location = New-Object System.Drawing.Point(555, 100)
 $cmbRes.Size     = New-Object System.Drawing.Size(110, 26)
-foreach ($m in $resModes) { [void]$cmbRes.Items.Add($m[0]) }
-$resIndex = 0
-[void][int]::TryParse((Get-IniValue 'scalemode' '0'), [ref]$resIndex)
-$cmbRes.SelectedIndex = [math]::Min([math]::Max(0, $resIndex), $resModes.Count - 1)
-$cmbRes.Add_SelectedIndexChanged({ Set-IniValue 'scalemode' "$($cmbRes.SelectedIndex)" })
-$tips.SetToolTip($cmbRes, 'Reescalado: DLSS (NVIDIA RTX) o FSR 3.1 dibujan el 3D a menos resolucion y lo suben a 1440 (mas fps). "juego": lo sube el propio juego.')
+$cmbRes.DropDownWidth = 170
+$cmbRes.DrawMode = 'OwnerDrawFixed'
+$cmbRes.ItemHeight = 20
+$cmbRes.BackColor = [System.Drawing.Color]::FromArgb(24, 26, 34)
+$cmbRes.ForeColor = $ink
+$cmbRes.Add_DrawItem({ param($sender, $e) Draw-ColoredItem $sender $e })
+$cmbRes.Add_SelectedIndexChanged({
+	if ($script:resFilling -or $cmbRes.SelectedIndex -lt 0) { return }
+	# Los titulos de apartado no son modos: al siguiente.
+	if ($script:resShown[$cmbRes.SelectedIndex][1] -eq 0) {
+		$cmbRes.SelectedIndex = [math]::Min($cmbRes.SelectedIndex + 1, $script:resShown.Count - 1)
+		return
+	}
+	Set-IniValue 'scalelabel' $script:resShown[$cmbRes.SelectedIndex][0]
+})
+$tips.SetToolTip($cmbRes, 'Reescalado: dibuja el 3D a menos resolucion y lo sube a 1440 (mas fps). DLSS: NVIDIA RTX. XeSS y FSR: todas las graficas. "juego": lo sube el propio juego.')
 $panel.Controls.Add($cmbRes)
+Fill-Res
+$cmbFg.Add_SelectedIndexChanged({ Fill-Res })
+$cmbFg.Add_DrawItem({ param($sender, $e) Draw-ColoredItem $sender $e })
 
 $cmbPreset = New-Object System.Windows.Forms.ComboBox
 $cmbPreset.DropDownStyle = 'DropDownList'
