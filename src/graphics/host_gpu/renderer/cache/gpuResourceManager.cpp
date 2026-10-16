@@ -9,6 +9,10 @@
 #include <bit>
 #include <chrono>
 #include <optional>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <utility>
 #include <x86intrin.h>
 
@@ -84,6 +88,55 @@ bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
 	return m_buffer_cache.TryInvalidateCpuWriteWindow(fault, selected.address, selected.size);
 }
 
+// KYTY_FAULT_STATS=1 (diagnostic): every 5 s, the 2 MiB guest regions that took the most CPU-tracking faults
+// (write-window, write, read), so the memory the game keeps rewriting can be told apart. A fixed open-addressed table.
+namespace {
+struct FaultSlot {
+	std::atomic<uint64_t> region {0};
+	std::atomic<uint32_t> window {0}, write {0}, read {0};
+};
+constexpr size_t           FaultSlots = 4096;
+FaultSlot                  g_fault_slots[FaultSlots];
+std::atomic<int64_t>       g_fault_report_ms {0};
+bool FaultStatsOn() {
+	static const bool on = [] { const char* v = std::getenv("KYTY_FAULT_STATS"); return v != nullptr && v[0] == '1'; }();
+	return on;
+}
+void NoteFault(uint64_t vaddr, int kind) {
+	const uint64_t region = (vaddr >> 21u) + 1u;
+	size_t         i      = static_cast<size_t>((region * 0x9E3779B97F4A7C15ull) >> 52u) % FaultSlots;
+	for (size_t probe = 0; probe < 64; ++probe, i = (i + 1) % FaultSlots) {
+		uint64_t cur = g_fault_slots[i].region.load(std::memory_order_relaxed);
+		if (cur == 0 && g_fault_slots[i].region.compare_exchange_strong(cur, region)) cur = region;
+		if (cur != region) continue;
+		(kind == 0 ? g_fault_slots[i].window : kind == 1 ? g_fault_slots[i].write : g_fault_slots[i].read)
+		    .fetch_add(1, std::memory_order_relaxed);
+		break;
+	}
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto last = g_fault_report_ms.load(std::memory_order_relaxed);
+	if (now - last < 5000 || !g_fault_report_ms.compare_exchange_strong(last, now)) return;
+	struct Row { uint64_t region; uint32_t window, write, read; };
+	std::vector<Row> rows;
+	for (auto& slot: g_fault_slots) {
+		const uint64_t r = slot.region.load(std::memory_order_relaxed);
+		if (r == 0) continue;
+		Row row {r - 1u, slot.window.exchange(0), slot.write.exchange(0), slot.read.exchange(0)};
+		if (row.window + row.write + row.read != 0) rows.push_back(row);
+	}
+	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+		return a.window + a.write + a.read > b.window + b.write + b.read; });
+	uint64_t total = 0;
+	for (const auto& r: rows) total += r.window + r.write + r.read;
+	std::printf("[faults] 5 s: %llu faults in %zu regions of 2 MiB; top:\n", static_cast<unsigned long long>(total), rows.size());
+	for (size_t k = 0; k < rows.size() && k < 12; ++k)
+		std::printf("[faults]   0x%010llx  window %u  write %u  read %u\n", static_cast<unsigned long long>(rows[k].region << 21u),
+		            rows[k].window, rows[k].write, rows[k].read);
+	std::fflush(stdout);
+}
+} // namespace
+
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -94,9 +147,11 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (access == PageFaultAccess::Write) {
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
 			LiveCounters::Add(LiveCounters::WindowFault);
+			if (FaultStatsOn()) NoteFault(fault_vaddr, 0);
 			return true;
 		}
 		LiveCounters::Add(LiveCounters::WriteFault);
+		if (FaultStatsOn()) NoteFault(fault_vaddr, 1);
 		// No watcher holds the page, so no cache expects this fault: the protection outlived its
 		// watchers and would fault forever. It gets the guest's own protection back.
 		if (m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
@@ -107,6 +162,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		LiveCounters::Add(LiveCounters::ReadFault);
+		if (FaultStatsOn()) NoteFault(fault_vaddr, 2);
 		if (LiveCensus::g_render) LiveCounters::Add(LiveCounters::RenderReadFaults);
 		// A speculative translation's thread read GPU-written memory: the readback is the normal path's (the
 		// scheduler's own command buffers and ticks), as the translation in order would make it there.
