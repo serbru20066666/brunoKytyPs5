@@ -1745,7 +1745,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		// SPIR-V and modules took 3.1 GiB of RAM, and the shader prefetch translates every shader of the game in the
 		// background anyway (16 GB reported at 1-1: +76 MiB instead of +3181, the HUD 10 s sooner, the same 59-60 fps
 		// and one slow shader translation).
-		constexpr uint64_t PipelineWarmupMinRam = uint64_t {24} << 30u;
+		constexpr uint64_t PipelineWarmupMinRam = uint64_t {30} << 30u;
 		const uint64_t     ram                  = LocalPlatform::PhysicalMemory();
 		const bool         low_ram              = ram != 0 && ram < PipelineWarmupMinRam;
 		const bool         compile_shaders      = std::string_view(warmup) == "1" && !low_ram;
@@ -1802,16 +1802,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			std::_Exit(0);
 		}
 	}
-	// Under 24 GB of RAM the prefetch is off unless KYTY_SHADER_PREFETCH=1: its plans and infos held ~1.1 GB of the
-	// process's memory all game long (14112 programs at 1-1), on PCs where the game's own 25 GB of commit leaves none
-	// to spare. Programs are then translated when the game first meets them, as before the prefetch.
-	const char*    prefetch      = std::getenv("KYTY_SHADER_PREFETCH");
-	const uint64_t prefetch_ram  = LocalPlatform::PhysicalMemory();
-	const bool     prefetch_low  = prefetch_ram != 0 && prefetch_ram < (uint64_t {24} << 30u);
-	const bool     prefetch_on   = prefetch != nullptr ? std::string_view(prefetch) != "0" : !prefetch_low;
-	if (prefetch == nullptr && prefetch_low)
-		PipelineCacheLog("Shader prefetch: off (RAM {} MiB; KYTY_SHADER_PREFETCH=1 turns it on)", prefetch_ram >> 20u);
-	if (prefetch_on && KYTY_BUILD == KYTY_BUILD_RELEASE && !PipelineCacheTitleId().empty()) {
+	if (const char* prefetch = std::getenv("KYTY_SHADER_PREFETCH");
+	    (prefetch == nullptr || std::string_view(prefetch) != "0") && KYTY_BUILD == KYTY_BUILD_RELEASE &&
+	    !PipelineCacheTitleId().empty()) {
 		std::vector<ProgramCache::ProgramKey> warm;
 		for (const auto& [key, source]: m_program_cache->programs) warm.push_back(key);
 		m_program_cache->StartPrefetch(

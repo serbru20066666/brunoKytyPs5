@@ -576,7 +576,7 @@ if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 	$commit += [math]::Max([double]0, $room)
 }
 $memory = @()
-if ($ram -lt 24GB) {
+if ($ram -lt 30GB) {
 	$memory += ("This PC has {0:N0} GB of RAM. The game asks Windows for about 25 GB (RAM plus page file), more with " +
 		"frame generation: set the page file to 'System managed size' on a disk with at least 20 GB free, or the game " +
 		"(or Windows) can stop in the middle of play. Settings > System > About > Advanced system settings > " +
