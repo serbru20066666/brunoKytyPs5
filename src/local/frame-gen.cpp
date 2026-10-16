@@ -616,6 +616,28 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		if (std::string(mode) == "off") reflex.mode = sl::ReflexMode::eOff;
 		if (std::string(mode) == "boost") reflex.mode = sl::ReflexMode::eLowLatencyWithBoost;
 	}
+	// G-SYNC: the frames shown (rendered x (1 + generated)) must stay under the monitor's refresh, or the ones past it
+	// leave the variable refresh range (a doubled / jumping picture at 227-228 of 240 Hz). Reflex's limiter holds the
+	// rendered frames to cap / (1 + generated), the way NVIDIA's own G-SYNC + Reflex cap does (240 Hz: 224 shown,
+	// 56 rendered at x4). KYTY_VRR_CAP_FPS=<shown fps> sets it, 0 turns it off; default: refresh - refresh^2 / 3600.
+	{
+		uint32_t cap = 0;
+		if (const char* text = std::getenv("KYTY_VRR_CAP_FPS"); text != nullptr && *text != '\0') {
+			cap = static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+		} else {
+			DEVMODEA mode {};
+			mode.dmSize = sizeof(mode);
+			if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) != 0 && mode.dmDisplayFrequency > 30) {
+				const double hz = mode.dmDisplayFrequency;
+				cap             = static_cast<uint32_t>(hz - hz * hz / 3600.0);
+			}
+		}
+		if (cap != 0 && g_generate > 0) {
+			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_generate + 1) / cap);
+			std::printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, Reflex limit %u us)\n", cap,
+			            static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
+		}
+	}
 	std::printf("Frame generation: Reflex mode %d\n", static_cast<int>(reflex.mode));
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
