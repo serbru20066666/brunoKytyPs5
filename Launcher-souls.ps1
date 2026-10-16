@@ -123,6 +123,12 @@ function Start-Game {
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
 	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	$res    = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)]
+	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
+	# el dispositivo grafico. Con AMD: FSR o XeSS para reescalar.
+	if ($res[2] -eq 'dlss' -and $config -like 'fsr3*') {
+		[System.Windows.Forms.MessageBox]::Show('El reescalado DLSS va con "Sin frame generation" o con DLSS frame generation. Con la generacion de AMD usa FSR o XeSS para reescalar.', 'Launcher', 'OK', 'Warning') | Out-Null
+		return
+	}
 	if ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
 	if ($res[2]) { $psargs += @('-Upscale', $res[2]) }
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }

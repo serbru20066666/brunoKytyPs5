@@ -149,6 +149,9 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 // 1440) with the TAA pass's depth and motion vectors, and the composite's binding pointed at the result. Its draw
 // samples it by coordinates: the bigger image takes the place of the render-size one.
 void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images);
+// KYTY_TAA_DIAG=1: true for the TAA dispatches of the frames logged ([taa] lines: the first 6 scene frames, then every
+// 600th); the composite's images are logged in those frames too.
+[[nodiscard]] bool TaaDiagFrame();
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,

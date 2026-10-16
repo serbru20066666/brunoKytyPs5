@@ -42,6 +42,8 @@
 #include "live-counters.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -977,6 +979,26 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGen::OnDispatch(program.shader_hash, bindings.images[1].image_id,
 		                     bindings.images[1].desc.info.data.address, bindings.images[3].image_id,
 		                     bindings.images[3].desc.info.data.address);
+	}
+	// KYTY_TAA_DIAG=1: the TAA dispatch's images (slot, guest address, format, size, storage), the first frames and
+	// every 600th (the plan to put DLSS in its place: which image its output is, and what reads it after).
+	if (FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaDiagFrame()) {
+		auto& cache = m_context.GetTextureCache();
+		std::printf("[taa] dispatch %ux%ux%u groups, %zu images:", thread_group_x, thread_group_y, thread_group_z,
+		            bindings.images.size());
+		for (size_t i = 0; i < bindings.images.size(); ++i) {
+			const auto& b = bindings.images[i];
+			if (!b.image_id) {
+				std::printf(" [%zu] none", i);
+				continue;
+			}
+			const auto& image = cache.GetImage(b.image_id);
+			std::printf(" [%zu] 0x%" PRIx64 " fmt %d %ux%u%s", i, b.desc.info.data.address,
+			            static_cast<int>(image.backing.format), image.backing.extent.width, image.backing.extent.height,
+			            b.desc.type == TextureCache::BindingType::Storage ? " storage" : "");
+		}
+		std::printf("\n");
+		std::fflush(stdout);
 	}
 	if (FrameCapture::Active()) {
 		auto& call     = FrameCapture::g_call;

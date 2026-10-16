@@ -1554,7 +1554,42 @@ void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D e
 }
 } // namespace
 
+namespace {
+std::atomic<uint64_t> g_taa_diag_count {0};
+bool                  g_taa_diag_now = false; // this frame's TAA dispatch was logged: its composite is too
+} // namespace
+
+bool TaaDiagFrame() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TAA_DIAG");
+		return value != nullptr && *value == '1';
+	}();
+	if (!on) return false;
+	const auto n   = g_taa_diag_count.fetch_add(1, std::memory_order_relaxed);
+	g_taa_diag_now = n < 6 || n % 600 == 0;
+	if (g_taa_diag_now) {
+		const auto& c = g_camera;
+		std::printf("[taa] frame %" PRIu64 ": camera %s, jitter ndc %.6f %.6f\n", n, c.valid ? "valid" : "none",
+		            c.jitter_ndc[0], c.jitter_ndc[1]);
+		std::fflush(stdout);
+	}
+	return g_taa_diag_now;
+}
+
 void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images) {
+	if (g_taa_diag_now && g_cache != nullptr) {
+		g_taa_diag_now = false;
+		std::printf("[taa] composite samples %zu images:", images.size());
+		for (size_t i = 0; i < images.size(); ++i) {
+			const auto& b = images[i];
+			if (!b.image_id) continue;
+			const auto& image = g_cache->GetImage(b.image_id);
+			std::printf(" [%zu] 0x%" PRIx64 " fmt %d %ux%u", i, b.desc.info.data.address,
+			            static_cast<int>(image.backing.format), image.backing.extent.width, image.backing.extent.height);
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+	}
 	const bool dlss = DlssUpscaleWanted();
 	const bool xess = Xess::Wanted();
 	if ((!Fsr3::UpscaleWanted() && !dlss && !xess) || g_cache == nullptr || g_graphics_ctx == nullptr) return;
