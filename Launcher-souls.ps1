@@ -24,17 +24,32 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
-# Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight) y reescalador (-Upscale). 1440 = la del juego.
-# FSR 3.1: el 3D a menos resolucion y FSR lo sube a 1440 (Calidad 1.5x, Equilibrado 1.7x, Rendimiento 2x).
+# Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
+# (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
+# Rendimiento 2x, Ultra rendimiento 3x (720 -> 2160). FSR 3.1 (todas las graficas, para las de bajo rendimiento).
 # "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
-	@('1440p nativo', 1440, ''),
-	@('FSR Calidad',  960,  'fsr'),
-	@('FSR Equilib.', 848,  'fsr'),
-	@('FSR Rendim.',  720,  'fsr'),
-	@('1080p juego',  1080, ''),
-	@('900p juego',   900,  ''),
-	@('720p juego',   720,  '')
+	@('1440p nativo',   1440, '',     0),
+	@('DLSS DLAA',      1440, 'dlss', 0),
+	@('DLSS U.calidad', 1108, 'dlss', 0),
+	@('DLSS Calidad',   960,  'dlss', 0),
+	@('DLSS Equilib.',  836,  'dlss', 0),
+	@('DLSS Rendim.',   720,  'dlss', 0),
+	@('DLSS U.rendim.', 720,  'dlss', 2160),
+	@('FSR U.calidad',  1108, 'fsr',  0),
+	@('FSR Calidad',    960,  'fsr',  0),
+	@('FSR Equilib.',   848,  'fsr',  0),
+	@('FSR Rendim.',    720,  'fsr',  0),
+	@('1080p juego',    1080, '',     0),
+	@('900p juego',     900,  '',     0),
+	@('720p juego',     720,  '',     0)
+)
+# Preset de DLSS: Auto (el de NVIDIA para cada modo), K (DLSS 4), L y M (DLSS 4.5).
+$dlssPresets = @(
+	@('DLSS auto',    ''),
+	@('DLSS 4 (K)',   'K'),
+	@('DLSS 4.5 (L)', 'L'),
+	@('DLSS 4.5 (M)', 'M')
 )
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
@@ -103,6 +118,9 @@ function Start-Game {
 	$res    = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
 	if ($res[2]) { $psargs += @('-Upscale', $res[2]) }
+	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
+	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
+	if ($res[2] -eq 'dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
 	$form.WindowState = 'Minimized'
 }
@@ -220,8 +238,21 @@ $resIndex = 0
 [void][int]::TryParse((Get-IniValue 'scalemode' '0'), [ref]$resIndex)
 $cmbRes.SelectedIndex = [math]::Min([math]::Max(0, $resIndex), $resModes.Count - 1)
 $cmbRes.Add_SelectedIndexChanged({ Set-IniValue 'scalemode' "$($cmbRes.SelectedIndex)" })
-$tips.SetToolTip($cmbRes, 'Reescalado: FSR 3.1 dibuja el 3D a menos resolucion y lo sube a 1440 (mas fps). "juego": lo sube el propio juego.')
+$tips.SetToolTip($cmbRes, 'Reescalado: DLSS (NVIDIA RTX) o FSR 3.1 dibujan el 3D a menos resolucion y lo suben a 1440 (mas fps). "juego": lo sube el propio juego.')
 $panel.Controls.Add($cmbRes)
+
+$cmbPreset = New-Object System.Windows.Forms.ComboBox
+$cmbPreset.DropDownStyle = 'DropDownList'
+$cmbPreset.Font     = $smallFont
+$cmbPreset.Location = New-Object System.Drawing.Point(($W - 610), 110)
+$cmbPreset.Size     = New-Object System.Drawing.Size(150, 26)
+foreach ($m in $dlssPresets) { [void]$cmbPreset.Items.Add($m[0]) }
+$presetIndex = 0
+[void][int]::TryParse((Get-IniValue 'dlsspreset' '0'), [ref]$presetIndex)
+$cmbPreset.SelectedIndex = [math]::Min([math]::Max(0, $presetIndex), $dlssPresets.Count - 1)
+$cmbPreset.Add_SelectedIndexChanged({ Set-IniValue 'dlsspreset' "$($cmbPreset.SelectedIndex)" })
+$tips.SetToolTip($cmbPreset, 'Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)')
+$panel.Controls.Add($cmbPreset)
 
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
 $btnPre = New-Button 'Precompilar shaders' ($W - 610) 46 230 58 $false

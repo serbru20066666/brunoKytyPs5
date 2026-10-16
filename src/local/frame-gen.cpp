@@ -36,6 +36,7 @@
 // NVIDIA Streamline SDK headers (_Build/deps/streamline/sdk/include, see CMakeLists.txt).
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
@@ -59,6 +60,8 @@ struct Sources {
 };
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
+bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
+bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
@@ -231,6 +234,8 @@ struct Api {
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
 	PFun_slReflexSleep*          reflex_sleep        = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
+	PFun_slEvaluateFeature*      evaluate            = nullptr;
+	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr;
 };
 Api              g_api;
 sl::FrameToken*  g_token = nullptr; // present thread: the frame being presented
@@ -382,8 +387,9 @@ bool Enabled() {
 	return g_ready;
 }
 
+bool DlssUpscaleWanted();
 bool Capturing() {
-	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted();
+	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted();
 }
 
 bool Requested() {
@@ -430,7 +436,7 @@ bool WantsCamera() {
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
-	if (g_generate == 0 || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+	if ((g_generate == 0 && !g_dlss_sr) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
 		return;
 	}
 	// The real loader: Streamline itself forwards to it.
@@ -502,7 +508,11 @@ void BypassCommandHooks(vk::Device device) {
 void Initialize() {
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
-	if (g_generate == 0) {
+	{
+		const char* upscale = std::getenv("KYTY_UPSCALE");
+		g_dlss_sr           = upscale != nullptr && std::string(upscale) == "dlss";
+	}
+	if (g_generate == 0 && !g_dlss_sr) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -532,6 +542,7 @@ void Initialize() {
 		LOGF("frame generation: no sl.interposer.dll (KYTY_STREAMLINE_DIR or a streamline folder next to the emulator)\n");
 		std::printf("Frame generation: NVIDIA's Streamline runtime was not found (choose its folder in the launcher)\n");
 		g_generate = 0;
+		g_dlss_sr  = false;
 		return;
 	}
 	const auto interposer = dir / "sl.interposer.dll";
@@ -540,6 +551,7 @@ void Initialize() {
 		LOGF("frame generation: %s is not signed by NVIDIA: not loaded\n", interposer.string().c_str());
 		std::printf("Frame generation: %s is not signed by NVIDIA, not loaded\n", interposer.string().c_str());
 		g_generate = 0;
+		g_dlss_sr  = false;
 		return;
 	}
 	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {
@@ -554,6 +566,7 @@ void Initialize() {
 		LOGF("frame generation: cannot load %s\n", interposer.string().c_str());
 		std::printf("Frame generation: cannot load %s\n", interposer.string().c_str());
 		g_generate = 0;
+		g_dlss_sr  = false;
 		return;
 	}
 	const auto load = [&](auto& function, const char* name) {
@@ -566,9 +579,10 @@ void Initialize() {
 	    !load(g_api.get_feature_function, "slGetFeatureFunction") ||
 	    !load(g_api.get_new_frame_token, "slGetNewFrameToken") ||
 	    !load(g_api.set_constants, "slSetConstants") ||
-	    !load(g_api.set_tag_for_frame, "slSetTagForFrame")) {
+	    !load(g_api.set_tag_for_frame, "slSetTagForFrame") || !load(g_api.evaluate, "slEvaluateFeature")) {
 		LOGF("frame generation: sl.interposer.dll lacks an entry point\n");
 		g_generate = 0;
+		g_dlss_sr  = false;
 		return;
 	}
 	static const std::wstring plugin_dir = dir.wstring();
@@ -583,6 +597,9 @@ void Initialize() {
 		if (text.find("reflex") != std::string::npos) features.push_back(sl::kFeatureReflex);
 		if (text.find("pcl") != std::string::npos) features.push_back(sl::kFeaturePCL);
 	}
+	// DLSS super resolution (KYTY_UPSCALE=dlss): its plugin too; alone without frame generation.
+	if (g_generate == 0) features.clear();
+	if (g_dlss_sr) features.push_back(sl::kFeatureDLSS);
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
@@ -603,6 +620,7 @@ void Initialize() {
 		LOGF("frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		std::printf("Frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		g_generate = 0;
+		g_dlss_sr  = false;
 		return;
 	}
 	// SDL loads the interposer as the Vulkan loader: every instance/device/swapchain call then
@@ -614,19 +632,35 @@ void Initialize() {
 #else
 	LOGF("frame generation: this build has no Streamline support\n");
 	g_generate = 0;
+		g_dlss_sr  = false;
 #endif
 }
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
-	if (g_generate == 0) {
+	if (g_generate == 0 && !g_dlss_sr) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
 	bool loaded              = false;
+	if (g_dlss_sr) {
+		bool dlss_loaded = false;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) != sl::Result::eOk ||
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, dlss_loaded) != sl::Result::eOk || !dlss_loaded ||
+		    !FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options)) {
+			std::printf("Upscaling: DLSS is not supported on this device: upscaling off\n");
+		} else {
+			g_sr_ready = true;
+			std::printf("Upscaling: DLSS super resolution ready\n");
+		}
+		std::fflush(stdout);
+	}
+	if (g_generate == 0) {
+		return;
+	}
 	if (g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter) != sl::Result::eOk ||
 	    g_api.is_feature_loaded(sl::kFeatureDLSS_G, loaded) != sl::Result::eOk || !loaded) {
 		LOGF("frame generation: DLSS-G is not supported on this device\n");
@@ -684,6 +718,189 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame)\n", g_generate);
 	std::fflush(stdout);
 #endif
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D render) {
+	sl::Constants constants {};
+	const auto    camera = usable ? Decompose(camera_in.view_proj) : CameraFrame {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) {
+		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	}
+	constants.cameraViewToClip = identity;
+	constants.clipToCameraView = identity;
+	constants.clipToLensClip   = identity;
+	constants.clipToPrevClip   = identity;
+	constants.prevClipToClip   = identity;
+	constants.jitterOffset     = sl::float2(0.0f, 0.0f);
+	constants.mvecScale        = sl::float2(1.0f, 1.0f);
+	constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
+	constants.cameraPos        = sl::float3(0, 0, 0);
+	constants.cameraUp         = sl::float3(0, 1, 0);
+	constants.cameraRight      = sl::float3(1, 0, 0);
+	constants.cameraFwd        = sl::float3(0, 0, 1);
+	constants.cameraNear       = 0.1f;
+	constants.cameraFar        = 10000.0f;
+	constants.cameraFOV        = 1.0f;
+	constants.cameraAspectRatio = 16.0f / 9.0f;
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted       = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded = sl::Boolean::eTrue;
+	constants.motionVectors3D     = sl::Boolean::eFalse;
+	constants.reset               = usable ? sl::Boolean::eFalse : sl::Boolean::eTrue;
+	constants.orthographicProjection = sl::Boolean::eFalse;
+	constants.motionVectorsDilated   = sl::Boolean::eFalse;
+	constants.motionVectorsJittered  = sl::Boolean::eFalse;
+	if (usable && camera.valid) {
+		// Projection in view space: x' = sx*x + cx*z, y' = sy*y + cy*z, z' = near, w' = z.
+		Mat4 projection;
+		projection[0] = sl::float4(camera.sx, 0, 0, 0);
+		projection[1] = sl::float4(0, camera.sy, 0, 0);
+		projection[2] = sl::float4(camera.cx, camera.cy, 0, 1);
+		projection[3] = sl::float4(0, 0, camera.z_near, 0);
+		constants.cameraViewToClip = projection;
+		Inverted(projection, constants.clipToCameraView);
+		const auto current  = Transposed(camera_in.view_proj);
+		const auto previous = Transposed(camera_in.prev_view_proj);
+		Mat4       clip_to_world;
+		if (Inverted(current, clip_to_world)) {
+			constants.clipToPrevClip = Multiply(clip_to_world, previous);
+			Inverted(constants.clipToPrevClip, constants.prevClipToClip);
+		}
+		const float width  = static_cast<float>(render.width);
+		const float height = static_cast<float>(render.height);
+		constants.jitterOffset = sl::float2(camera_in.jitter_ndc[0] * width * 0.5f,
+		                                    -camera_in.jitter_ndc[1] * height * 0.5f);
+		static const bool pixels_mv = [] {
+			const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
+			return mv != nullptr && std::string(mv) == "px";
+		}();
+		// The game's vectors point along the motion, in UV units: its TAA reads the history at
+		// uv - mv. DLSS wants them towards the previous position (uv + mv = previous uv), so they
+		// are negated; with them as they were, generated frames moved the scene the wrong way
+		// when the camera turned. KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's sign (a comparison).
+		static const float mv_sign = [] {
+			const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
+		}();
+		constants.mvecScale = pixels_mv ? sl::float2(mv_sign / width, mv_sign / height) : sl::float2(mv_sign, mv_sign);
+		constants.cameraPos   = camera.position;
+		constants.cameraUp    = camera.up;
+		constants.cameraRight = camera.right;
+		constants.cameraFwd   = camera.forward;
+		constants.cameraNear  = camera.z_near;
+		constants.cameraFar   = 100000.0f;
+		constants.cameraFOV   = 2.0f * std::atan(1.0f / std::fabs(camera.sy));
+		constants.cameraAspectRatio = std::fabs(camera.sy / camera.sx);
+	}
+	return constants;
+}
+
+// DLSS super resolution of the composite's 3D image (UpscaleComposite): viewport 1, its own frame indices.
+bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
+                 vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
+                 vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset) {
+	if (!g_sr_ready || g_api.dlss_set_options == nullptr || g_api.evaluate == nullptr) return false;
+	const sl::ViewportHandle viewport {1};
+	static vk::Extent2D      set_render {}, set_output {};
+	if (set_render != render || set_output != upscale) {
+		const double ratio = static_cast<double>(upscale.height) / render.height;
+		sl::DLSSOptions options {};
+		options.mode = ratio < 1.05   ? sl::DLSSMode::eDLAA
+		               : ratio < 1.4  ? sl::DLSSMode::eUltraQuality
+		               : ratio < 1.6  ? sl::DLSSMode::eMaxQuality
+		               : ratio < 1.85 ? sl::DLSSMode::eBalanced
+		               : ratio < 2.5  ? sl::DLSSMode::eMaxPerformance
+		                              : sl::DLSSMode::eUltraPerformance;
+		options.outputWidth     = upscale.width;
+		options.outputHeight    = upscale.height;
+		options.colorBuffersHDR = sl::Boolean::eTrue;
+		options.useAutoExposure = sl::Boolean::eTrue;
+		// KYTY_DLSS_PRESET=K (DLSS 4, transformer), L or M (DLSS 4.5), J; default: NVIDIA's choice per mode.
+		sl::DLSSPreset preset = sl::DLSSPreset::eDefault;
+		if (const char* text = std::getenv("KYTY_DLSS_PRESET"); text != nullptr && *text != '\0') {
+			switch (*text) {
+				case 'J': case 'j': preset = sl::DLSSPreset::ePresetJ; break;
+				case 'K': case 'k': preset = sl::DLSSPreset::ePresetK; break;
+				case 'L': case 'l': preset = sl::DLSSPreset::ePresetL; break;
+				case 'M': case 'm': preset = sl::DLSSPreset::ePresetM; break;
+				default: break;
+			}
+		}
+		options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+		    options.ultraPerformancePreset = options.ultraQualityPreset = preset;
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			std::printf("Upscaling: slDLSSSetOptions failed (%d): upscaling off\n", static_cast<int>(result));
+			std::fflush(stdout);
+			g_sr_ready = false;
+			return false;
+		}
+		set_render = render;
+		set_output = upscale;
+		std::printf("Upscaling: DLSS %ux%u -> %ux%u, mode %u, preset %u\n", render.width, render.height, upscale.width,
+		            upscale.height, static_cast<uint32_t>(options.mode), static_cast<uint32_t>(preset));
+		std::fflush(stdout);
+	}
+	static uint32_t index = 0;
+	++index;
+	sl::FrameToken* token = nullptr;
+	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) return false;
+	auto constants = MakeConstants(camera.valid, camera, render);
+	// The game's TAA already resolved its jitter into the image.
+	constants.jitterOffset = sl::float2(0.0f, 0.0f);
+	constants.reset        = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	if (!camera.valid) {
+		// (No camera this frame: the vectors as they are, in UV units towards the motion.)
+		static const float mv_sign = [] {
+			const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+			return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
+		}();
+		constants.mvecScale = sl::float2(mv_sign, mv_sign);
+	}
+	if (g_api.set_constants(constants, *token, viewport) != sl::Result::eOk) return false;
+	const auto resource = [](const VulkanImage& image, vk::ImageView view, vk::ImageLayout layout) {
+		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr, static_cast<VkImageView>(view),
+		               static_cast<uint32_t>(layout));
+		r.width        = image.extent.width;
+		r.height       = image.extent.height;
+		r.nativeFormat = static_cast<uint32_t>(image.format);
+		r.mipLevels    = 1;
+		r.arrayLayers  = 1;
+		r.flags        = 0;
+		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+		return r;
+	};
+	auto in_color  = resource(color, color_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+	auto in_depth  = resource(depth, depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+	auto in_motion = resource(motion, motion_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+	auto out_color = resource(output, output_view, vk::ImageLayout::eGeneral);
+	const sl::Extent render_extent {0, 0, render.width, render.height};
+	const sl::Extent output_extent {0, 0, upscale.width, upscale.height};
+	const sl::ResourceTag tags[] {
+	    sl::ResourceTag(&in_color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render_extent),
+	    sl::ResourceTag(&in_depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render_extent),
+	    sl::ResourceTag(&in_motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_extent),
+	    sl::ResourceTag(&out_color, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_extent),
+	};
+	auto* cmd = reinterpret_cast<sl::CommandBuffer*>(command);
+	if (g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), cmd) != sl::Result::eOk)
+		return false;
+	const sl::BaseStructure* inputs[] {&viewport};
+	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, inputs, 1, cmd); result != sl::Result::eOk) {
+		static uint32_t errors = 0;
+		if (errors++ < 4) {
+			std::printf("Upscaling: DLSS evaluate failed (%d)\n", static_cast<int>(result));
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	return true;
+}
+#endif
+
+bool DlssUpscaleWanted() {
+	return g_dlss_sr;
 }
 
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
@@ -770,78 +987,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
 
-	sl::Constants constants {};
-	const auto    camera = usable ? Decompose(inputs->camera.view_proj) : CameraFrame {};
-	Mat4          identity;
-	for (uint32_t i = 0; i < 4; ++i) {
-		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
-	}
-	constants.cameraViewToClip = identity;
-	constants.clipToCameraView = identity;
-	constants.clipToLensClip   = identity;
-	constants.clipToPrevClip   = identity;
-	constants.prevClipToClip   = identity;
-	constants.jitterOffset     = sl::float2(0.0f, 0.0f);
-	constants.mvecScale        = sl::float2(1.0f, 1.0f);
-	constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
-	constants.cameraPos        = sl::float3(0, 0, 0);
-	constants.cameraUp         = sl::float3(0, 1, 0);
-	constants.cameraRight      = sl::float3(1, 0, 0);
-	constants.cameraFwd        = sl::float3(0, 0, 1);
-	constants.cameraNear       = 0.1f;
-	constants.cameraFar        = 10000.0f;
-	constants.cameraFOV        = 1.0f;
-	constants.cameraAspectRatio = 16.0f / 9.0f;
-	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
-	constants.depthInverted       = sl::Boolean::eTrue;
-	constants.cameraMotionIncluded = sl::Boolean::eTrue;
-	constants.motionVectors3D     = sl::Boolean::eFalse;
-	constants.reset               = usable ? sl::Boolean::eFalse : sl::Boolean::eTrue;
-	constants.orthographicProjection = sl::Boolean::eFalse;
-	constants.motionVectorsDilated   = sl::Boolean::eFalse;
-	constants.motionVectorsJittered  = sl::Boolean::eFalse;
-	if (usable && camera.valid) {
-		// Projection in view space: x' = sx*x + cx*z, y' = sy*y + cy*z, z' = near, w' = z.
-		Mat4 projection;
-		projection[0] = sl::float4(camera.sx, 0, 0, 0);
-		projection[1] = sl::float4(0, camera.sy, 0, 0);
-		projection[2] = sl::float4(camera.cx, camera.cy, 0, 1);
-		projection[3] = sl::float4(0, 0, camera.z_near, 0);
-		constants.cameraViewToClip = projection;
-		Inverted(projection, constants.clipToCameraView);
-		const auto current  = Transposed(inputs->camera.view_proj);
-		const auto previous = Transposed(inputs->camera.prev_view_proj);
-		Mat4       clip_to_world;
-		if (Inverted(current, clip_to_world)) {
-			constants.clipToPrevClip = Multiply(clip_to_world, previous);
-			Inverted(constants.clipToPrevClip, constants.prevClipToClip);
-		}
-		const float width  = static_cast<float>(inputs->render_extent.width);
-		const float height = static_cast<float>(inputs->render_extent.height);
-		constants.jitterOffset = sl::float2(inputs->camera.jitter_ndc[0] * width * 0.5f,
-		                                    -inputs->camera.jitter_ndc[1] * height * 0.5f);
-		static const bool pixels_mv = [] {
-			const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
-			return mv != nullptr && std::string(mv) == "px";
-		}();
-		// The game's vectors point along the motion, in UV units: its TAA reads the history at
-		// uv - mv. DLSS wants them towards the previous position (uv + mv = previous uv), so they
-		// are negated; with them as they were, generated frames moved the scene the wrong way
-		// when the camera turned. KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's sign (a comparison).
-		static const float mv_sign = [] {
-			const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
-			return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
-		}();
-		constants.mvecScale = pixels_mv ? sl::float2(mv_sign / width, mv_sign / height) : sl::float2(mv_sign, mv_sign);
-		constants.cameraPos   = camera.position;
-		constants.cameraUp    = camera.up;
-		constants.cameraRight = camera.right;
-		constants.cameraFwd   = camera.forward;
-		constants.cameraNear  = camera.z_near;
-		constants.cameraFar   = 100000.0f;
-		constants.cameraFOV   = 2.0f * std::atan(1.0f / std::fabs(camera.sy));
-		constants.cameraAspectRatio = std::fabs(camera.sy / camera.sx);
-	}
+	sl::Constants constants = MakeConstants(usable, usable ? inputs->camera : Camera {}, usable ? inputs->render_extent : vk::Extent2D {});
 	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk &&
 	                                                                          g_presents < 8) {
 		LOGF("frame generation: slSetConstants failed (%d)\n", static_cast<int>(result));
@@ -1400,7 +1546,8 @@ void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D e
 } // namespace
 
 void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images) {
-	if (!Fsr3::UpscaleWanted() || g_cache == nullptr || g_graphics_ctx == nullptr) return;
+	const bool dlss = DlssUpscaleWanted();
+	if ((!Fsr3::UpscaleWanted() && !dlss) || g_cache == nullptr || g_graphics_ctx == nullptr) return;
 	if (!g_sources.valid) {
 		g_up_reset = true; // menus, loading screens and movies: no TAA pass, the history starts again after them
 		return;
@@ -1471,7 +1618,16 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 	desc.camera   = &g_camera;
 	desc.reset    = g_up_reset;
 	desc.delta_ms = delta;
-	const bool done = Fsr3::Upscale(*g_graphics_ctx, desc);
+	bool done = false;
+	if (dlss) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+		done = DlssUpscale(desc.command, color.backing, scene->image_view, g_up_depth, g_up_depth_view, g_up_motion,
+		                   g_up_motion_view, g_up_output, g_up_output_view, render, output, g_camera, g_up_reset);
+#endif
+	} else {
+		done = Fsr3::Upscale(*g_graphics_ctx, desc);
+	}
+	command.InvalidateGraphicsState(); // (the upscaler bound its own pipelines and descriptors)
 	Transition(vk_command, g_up_output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
 	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
 	if (in_pass) command.ResumeRendering(rendering);

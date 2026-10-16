@@ -66,6 +66,8 @@ param(
 	[switch]$Fps120,
 	[int]$RenderHeight = 0,
 	[string]$Upscale = '',
+	[int]$UpscaleHeight = 0,
+	[string]$DlssPreset = '',
 	[string]$Aspect = '',
 	[string]$Quality = '',
 	[string]$TextureReduce = '',
@@ -365,6 +367,9 @@ if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER
 # -Upscale fsr: the 3D image (at -RenderHeight) upscaled to 1440 by FSR 3.1 before the game's composite (frame-gen.h
 # UpscaleComposite), instead of the game's own scaling in that composite.
 if ($Upscale) { $environment['KYTY_UPSCALE'] = $Upscale }
+# -UpscaleHeight: the upscaled image's height (default 1440; 2160 for DLSS ultra performance); -DlssPreset K|L|M|J.
+if ($UpscaleHeight -gt 0) { $environment['KYTY_UPSCALE_HEIGHT'] = "$UpscaleHeight" }
+if ($DlssPreset) { $environment['KYTY_DLSS_PRESET'] = $DlssPreset }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
 # projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }
