@@ -24,6 +24,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
+#include "local/fsr3-fg.h"
 
 #include <algorithm>
 #include <array>
@@ -1295,7 +1296,20 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
 		if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
 	}
-	if (!IsFlipDueLocked(*r.cfg, r.generation, floor)) {
+	// FSR 3 under the G-SYNC cap (Fsr3::RealFrameInterval: 1/56 s at x4 on 240 Hz, KYTY_VRR_CAP_FPS): the game's own
+	// flips keep to that grid, as Reflex holds the game for DLSS-G. Held only at the present, the game made 60 and 4
+	// a second were dropped (a stutter). Half a vblank early is due (the flips land on the nearest vblank).
+	static std::chrono::steady_clock::time_point s_paced_next {};
+	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying()
+	                                  ? Graphics::Fsr3::RealFrameInterval()
+	                                  : 0.0;
+	const auto   paced_now      = std::chrono::steady_clock::now();
+	const auto   paced_step     = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	                                  std::chrono::duration<double>(paced_interval));
+	const auto   paced_slack    = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	                                  std::chrono::duration<double>(0.5 / std::max(Config::GetVblankFrequency(), 1u)));
+	const bool   paced_wait     = paced_interval > 0.0 && paced_now + paced_slack < s_paced_next;
+	if (paced_wait || !IsFlipDueLocked(*r.cfg, r.generation, floor)) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
@@ -1303,6 +1317,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		return false;
 	}
 
+	if (paced_interval > 0.0) s_paced_next = std::max(s_paced_next, paced_now - paced_step) + paced_step;
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Ready || !m_processing) {

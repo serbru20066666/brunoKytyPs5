@@ -757,12 +757,7 @@ void RecordHudLayer(GraphicContext& graphics, vk::CommandBuffer command, vk::Ima
 	}
 }
 
-void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs, vk::SwapchainKHR swapchain,
-                   vk::Extent2D backbuffer, vk::Format format) {
-	if (!Active()) return;
-	// G-SYNC: with KYTY_VRR_CAP_FPS (auto = refresh - refresh^2 / 3600; 240 Hz -> 224) the real frames wait just enough
-	// for real x (1 + generated) to stay under the cap, as Reflex does for DLSS-G (x4 at 60 real sent 240 to a 224 cap:
-	// 16 frames a second dropped or held, a stutter at a steady 60). Only while generating; movies and menus untouched.
+static double CapInterval() {
 	static const double interval = [] {
 		const char* text = std::getenv("KYTY_VRR_CAP_FPS");
 		if (text == nullptr || *text == '\0') return 0.0;
@@ -784,6 +779,20 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		std::fflush(stdout);
 		return (1 + generated) / cap;
 	}();
+	return interval;
+}
+
+double RealFrameInterval() {
+	return Active() ? CapInterval() : 0.0;
+}
+
+void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs, vk::SwapchainKHR swapchain,
+                   vk::Extent2D backbuffer, vk::Format format) {
+	if (!Active()) return;
+	// G-SYNC: with KYTY_VRR_CAP_FPS (auto = refresh - refresh^2 / 3600; 240 Hz -> 224) the real frames wait just enough
+	// for real x (1 + generated) to stay under the cap, as Reflex does for DLSS-G (x4 at 60 real sent 240 to a 224 cap:
+	// 16 frames a second dropped or held, a stutter at a steady 60). Only while generating; movies and menus untouched.
+	const double interval = CapInterval();
 	if (interval > 0.0 && inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying()) {
 		static std::chrono::steady_clock::time_point next {};
 		const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval));
@@ -1005,6 +1014,9 @@ bool PlanQueues(vk::PhysicalDevice, uint32_t, uint32_t, QueuePlan&) {
 	return false;
 }
 void OnDevice(GraphicContext&, const QueuePlan&) {}
+double RealFrameInterval() {
+	return 0.0;
+}
 bool Active() {
 	return false;
 }
