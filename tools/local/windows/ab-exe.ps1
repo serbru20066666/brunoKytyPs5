@@ -1,12 +1,13 @@
 param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B, [string]$Label = 'abexe',
       [string]$Plan = 'w:down:0,w:up:10000', [int]$Rounds = 2, [int]$Windows = 2, [double]$Seconds = 6,
-      [string[]]$Set = @(), [string[]]$SetA = @(), [string[]]$SetB = @())
+      [string[]]$Set = @(), [string[]]$SetA = @(), [string[]]$SetB = @(), [int]$StartupSeconds = 100)
 # A/B of two builds at one place of the walk route, for changes a runtime switch cannot select (data
 # structures, code generation): separate launches in ABBA order (each one: bench-run.ps1 with -Exe,
 # walk -Plan, -Windows measurement windows of -Seconds). Each executable sits in its own directory
 # with libwinpthread-1.dll; its first launch also builds its driver pipeline cache (bench-run's
 # precompile), so the first round is a warm-up worth repeating when it differs. -SetA / -SetB add
-# switches to one side only (one executable as both A and B compares launch-time switches).
+# switches to one side only (one executable as both A and B compares launch-time switches). -StartupSeconds: each
+# start-up attempt's limit (a 1-1 save on a 16 GB laptop needs ~180).
 #   ab-exe.ps1 -A _Build\ab\base\kyty_emulator.exe -B _Build\windows\kyty_emulator.exe -Label rangeset
 $S = $PSScriptRoot
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
@@ -19,7 +20,7 @@ $order = @()
 for ($round = 1; $round -le $Rounds; $round++) { $order += if ($round % 2) { @('A', 'B') } else { @('B', 'A') } }
 foreach ($side in $order) {
 	$exe = (Resolve-Path $(if ($side -eq 'A') { $A } else { $B })).Path
-	$params = @{ Label = "$Label-$side"; Exe = $exe; KeepRunning = $true; NoWalk = $true; ShotOnly = $true }
+	$params = @{ Label = "$Label-$side"; Exe = $exe; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = $StartupSeconds }
 	$switches = @($Set) + $(if ($side -eq 'A') { @($SetA) } else { @($SetB) })
 	if ($switches.Count) { $params['Set'] = $switches }
 	& "$S\bench-run.ps1" @params | Select-Object -Last 1

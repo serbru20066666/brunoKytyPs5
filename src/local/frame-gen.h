@@ -1,6 +1,6 @@
 #ifndef EMULATOR_SRC_LOCAL_FRAME_GEN_H_
 #define EMULATOR_SRC_LOCAL_FRAME_GEN_H_
-// DLSS Frame Generation through NVIDIA Streamline (KYTY_FRAMEGEN=<generated frames, 1..3>), for
+// DLSS Frame Generation through NVIDIA Streamline (KYTY_FRAMEGEN=<generated frames, 1..5>), for
 // Demon's Souls PPSA01341 01.007.000 and 01.005.000. The inputs come from the game's own passes, found by frame
 // capture (docs/RE-DEMONS-SOULS.md): the G-buffer vertex shaders' constants hold the camera
 // (world->clip matrix, the previous frame's, and the TAA jitter), the TAA dispatch reads the depth
@@ -31,6 +31,9 @@ constexpr std::array<uint64_t, 6> GbufferVertexShaders {0xf4d2e78cd1769fc7ULL, 0
                                                         0x1d69b5d27198446aULL, 0x5931e753b757f3bcULL, 0xa97f610824942162ULL};
 inline bool IsTaaShader(uint64_t hash) {
 	return std::find(TaaShaders.begin(), TaaShaders.end(), hash) != TaaShaders.end();
+}
+inline bool IsGbufferVertexShader(uint64_t hash) {
+	return std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), hash) != GbufferVertexShaders.end();
 }
 constexpr uint32_t SrtViewProj     = 29; // 16 floats, row-major, clip = M * world
 constexpr uint32_t SrtPrevViewProj = 45; // 12 floats: the previous frame's rows x, y and w
@@ -103,6 +106,19 @@ void AfterPresent();
 void SetStaticRect(float x0, float y0, float x1, float y1);
 
 // Renderer thread (Kyty.Gpu).
+// The guest frame ran the TAA pass: the game's 3D view (play, or a cutscene in the engine), not a movie, a menu or a
+// loading screen; with or without frame generation, by the normal or the table way. The guest flip takes it
+// (Presenter::PrepareFrame): above 60 Hz the other frames keep 60 (videoOut.cpp).
+void NoteScene();
+[[nodiscard]] bool TakeScene();
+// The current guest frame ran the TAA pass so far, or the last one flipped did (HudAnchor: the game queues a frame's
+// interface before the flip of the one before).
+[[nodiscard]] bool SceneNoted();
+// The guest flips taken so far (TakeScene).
+[[nodiscard]] uint64_t GuestFlips();
+// The current guest frame has no camera yet: its next G-buffer draw goes the normal way (the table way's draws have
+// no constants on the CPU), whose hook reads it.
+[[nodiscard]] bool WantsCamera();
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address);

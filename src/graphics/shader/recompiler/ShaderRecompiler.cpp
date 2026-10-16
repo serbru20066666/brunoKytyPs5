@@ -756,6 +756,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	if (ir.lane_local && ir.lane_local_uniform_loads &&
+	    std::ranges::any_of(ir.info.buffers, [](const IR::BufferResource& buffer) {
+		    return (buffer.packed_stride & IR::BufferAddTidBit) != 0u;
+	    }))
+		ir.lane_local = false;
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 

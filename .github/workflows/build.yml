@@ -221,10 +221,12 @@ jobs:
           # game's shaders from its files (kyty_shader_precompile --make-seeds; a release cannot hold that list: it
           # contains the game's shader code). The Python tools that made it before are not needed. With them, each
           # game version's specialization hints: recorded play without the game's code, which the precompile
-          # completes with the seed file's (--apply-hints).
+          # completes with the seed file's (--apply-hints). And the recording of the game's file opens a first launch
+          # starts from (files-*.files: file names, opened ahead of the game's loads).
           $states = "$out\tools\local\static-precompile"
           New-Item -ItemType Directory -Force $states | Out-Null
           Copy-Item tools\local\static-precompile\pass-states.json, tools\local\static-precompile\hints-*.hints $states
+          Copy-Item tools\local\static-precompile\files-*.files $states -ErrorAction SilentlyContinue
           # The VC++ runtime next to the exe (Microsoft's redistributable files): nothing to install.
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" | Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |

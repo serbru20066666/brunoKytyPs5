@@ -21,6 +21,11 @@ void Enable(bool maintenance5);
 [[nodiscard]] bool Enabled();
 // A stored module of `spirv`, or null (no scratch file, or the store is off): the caller makes a driver module.
 vk::ShaderModule Add(const std::vector<uint32_t>& spirv);
+// A stored module of SPIR-V in another scratch file (the shader prefetch's): `stored` bytes at `offset`, zstd-compressed
+// or as they are, `words` words of SPIR-V. Read from there: nothing copied. The caller keeps the file open as long as the
+// process runs. (Adopting a prefetched module decompressed, compressed again and wrote its SPIR-V: half of an adoption,
+// ~0.1 s of the prologue walk's slow frames at 16 GB.)
+vk::ShaderModule AddFrom(uint64_t file, uint64_t offset, uint32_t stored, uint32_t words, bool compressed);
 [[nodiscard]] bool Holds(vk::ShaderModule module);
 // Its SPIR-V (null when it cannot be read). A released module's still reads (a worker may make a pipeline of it).
 std::shared_ptr<const std::vector<uint32_t>> Load(vk::ShaderModule module);

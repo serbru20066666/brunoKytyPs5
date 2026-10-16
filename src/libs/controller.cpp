@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -111,6 +112,7 @@ public:
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	int32_t GetTriggerEffectState(bool left);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -131,6 +133,9 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	// Every effect the game set, whether or not the host pad could reproduce it:
+	// scePadGetTriggerEffectState answers from it (m_trigger_sent keeps the sent one only).
+	PadTriggerEffectParam m_state_effect {};
 };
 
 static GameController* g_controller = nullptr;
@@ -524,11 +529,71 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 
 	Common::LockGuard lock(m_mutex);
+	// Remember it for scePadGetTriggerEffectState even when no DualSense takes it: a game that polls
+	// the state has to see the effect it asked for, not a zero.
+	m_state_effect = param;
 	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
 		(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
 	}
 	return true;
+}
+
+// A trigger's travel, 0..255. An L2/R2 that arrives as a button only (input remapping, pads or
+// tools that report the trigger digitally) counts as full travel.
+static int TriggerTravel(const ControllerState& state, Axis axis) {
+	const auto button = axis == Axis::TriggerLeft ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
+	const int  value  = state.axes[static_cast<int>(axis)];
+	// An analog press also sets the button, so only a button without any travel is digital.
+	return (state.buttons & button) != 0 && value == 0 ? 255 : value;
+}
+
+// A real DualSense reports which effect runs and where the trigger is against it. Without that
+// report (SDL does not expose it, and other pads have no trigger motors) the state follows from the
+// game's effect and the trigger's travel: 0..255 maps to the effect's ten positions 0..9. Games wait
+// for the weapon or feedback state before acting on L2/R2 - the state stayed 0 before, so those
+// actions only ever half happened (a bow's draw, for one).
+static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
+	const int  pos     = std::clamp(value, 0, 255) * 10 / 256;
+	const bool pressed = value >= 8; // below this a trigger counts as released (analog rest noise)
+
+	switch (command.mode) {
+		case 1: // feedback: resistance from position data[0], strength data[1]
+			return pressed && command.data[1] != 0 && pos >= command.data[0]
+			           ? PAD_TRIGGER_STATE_IS_PUSHING
+			           : PAD_TRIGGER_STATE_NO_FORCE;
+		case 2: // weapon: resistance from data[0], released at data[1]
+			if (pos >= command.data[1]) {
+				return PAD_TRIGGER_STATE_WEAPON_FULLY_PRESSED;
+			}
+			return pos >= command.data[0] ? PAD_TRIGGER_STATE_WEAPON_ALMOST_PRESSED
+			                              : PAD_TRIGGER_STATE_WEAPON_NOT_PRESSED;
+		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
+			return pressed && command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
+			           ? PAD_TRIGGER_STATE_VIBRATION_IS_FIRING
+			           : PAD_TRIGGER_STATE_VIBRATION_NOT_FIRING;
+		case 4: // multiple-position feedback: strength per position
+			return pressed && command.data[pos] != 0 ? PAD_TRIGGER_STATE_IS_PUSHING
+			                                         : PAD_TRIGGER_STATE_NO_FORCE;
+		case 5: // slope feedback from position data[0]
+			return pressed && pos >= command.data[0] ? PAD_TRIGGER_STATE_IS_PUSHING
+			                                         : PAD_TRIGGER_STATE_NO_FORCE;
+		case 6: // multiple-position vibration: frequency data[0], amplitude per position
+			return pressed && command.data[0] != 0 && command.data[1 + pos] != 0
+			           ? PAD_TRIGGER_STATE_VIBRATION_IS_FIRING
+			           : PAD_TRIGGER_STATE_VIBRATION_NOT_FIRING;
+		default: return 0;
+	}
+}
+
+int32_t GameController::GetTriggerEffectState(bool left) {
+	Common::LockGuard lock(m_mutex);
+	const auto        index = left ? 0 : 1;
+	if ((m_state_effect.trigger_mask & (1u << index)) == 0) {
+		return 0;
+	}
+	const auto axis = left ? Axis::TriggerLeft : Axis::TriggerRight;
+	return TriggerEffectState(m_state_effect.command[index], TriggerTravel(m_state, axis));
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -851,6 +916,32 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 	}
 
 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+}
+
+int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
+	PRINT_NAME();
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (info == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	info->state[0] = g_controller->GetTriggerEffectState(true);
+	info->state[1] = g_controller->GetTriggerEffectState(false);
+
+	// The first changes, so a log shows whether the game polls this and what it sees (printf: the
+	// console's LOGF is silent in the release configuration).
+	static int                    reports = 0;
+	static std::array<int32_t, 2> last {-1, -1};
+	if (reports < 32 && (info->state[0] != last[0] || info->state[1] != last[1])) {
+		std::printf("Pad: trigger state %d,%d\n", info->state[0], info->state[1]);
+		last[0] = info->state[0];
+		last[1] = info->state[1];
+		reports++;
+	}
+	return OK;
 }
 
 } // namespace Libs::Controller

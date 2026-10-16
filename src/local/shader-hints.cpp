@@ -2,6 +2,7 @@
 #include "shader-hints.h"
 
 #include "common/file.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "shader-warmup-cache.h"
 #include "static-seeds.h"
 
@@ -79,6 +80,9 @@ std::vector<uint32_t> HintOf(Record record) {
 	record.code       = {code.words, static_cast<uint32_t>(code.hash), static_cast<uint32_t>(code.hash >> 32u)};
 	record.back_code  = {code.back_words, static_cast<uint32_t>(code.back_hash), static_cast<uint32_t>(code.back_hash >> 32u)};
 	record.static_key = {};
+	// (The GPU's compute subgroup size, which the precompile sets anyway: one record for AMD's 64 and NVIDIA's 32.)
+	if (record.stage == ShaderType::Compute)
+		record.compute.host_subgroup_size = Libs::Graphics::ShaderComputeInputInfo {}.host_subgroup_size;
 	return Encode(record);
 }
 
@@ -269,10 +273,24 @@ int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>
 	return 0;
 }
 
+// A hint file of another region's Demon's Souls, the same version, for game_id (<title>_<version>): the regions' builds
+// share their shaders, and a record whose code this game's seed file lacks is left out as for any hint.
+static bool OtherRegion(std::string_view identity, std::string_view game_id) {
+	const auto name    = identity.substr(Identity.size(), identity.size() - Identity.size() - 1);
+	const auto title   = [](std::string_view id) { return id.substr(0, id.find('_')); };
+	const auto version = [](std::string_view id) {
+		return id.find('_') == std::string_view::npos ? std::string_view {} : id.substr(id.find('_'));
+	};
+	return Libs::Graphics::DemonsSouls::IsSupportedTitle(title(name)) &&
+	       Libs::Graphics::DemonsSouls::IsSupportedTitle(title(game_id)) && !version(name).empty() &&
+	       version(name) == version(game_id);
+}
+
 int Apply(const fs::path& hints, const fs::path& seeds, const fs::path& out, const std::string& game_id) {
 	// The hint file: identity line, checksum, one zstd frame.
 	const auto identity = Cache::FileIdentity(hints);
-	if (!identity.starts_with(Identity) || (!game_id.empty() && identity != std::string(Identity) + game_id + "\n")) {
+	if (!identity.starts_with(Identity) || !identity.ends_with('\n') ||
+	    (!game_id.empty() && identity != std::string(Identity) + game_id + "\n" && !OtherRegion(identity, game_id))) {
 		std::fprintf(stderr, "%s: not a hint file of %s\n", Utf8(hints).c_str(), game_id.c_str());
 		return 1;
 	}

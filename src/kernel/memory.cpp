@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -68,6 +69,18 @@ extern "C" {
 // 1: small host-copy reads of guest backing take a lock-free read transaction
 // with a cached translation instead of the backing mutex.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_backing_read_mode {0};
+// 1: the other parts of a view a partial unmap maps again (Windows) get the GPU trackers' protection of their watched
+// pages at once, before the address-space lock is released (GuestBackingStore::ProtectRemapped). 0: given back after
+// the lock (ReapplyRemappedViews): a CPU write to a watched page in between went unseen (a GPU copy left stale, or a
+// GPU-owned page later written back over the write).
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_protective_remap {1};
+// 1: a partial unmap of a view (Windows) leaves the range parked in the view instead of unmapping the whole view and
+// mapping its other parts again (GuestBackingStore::UnmapOne); 2: parked no-access (a stray access faults, for
+// debugging). 0: views with nothing parked yet are split at once, as before (a view holding parked ranges keeps parking).
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_park_unmaps {1};
+// (Diagnostic: microseconds UnmapBacking waits after it mapped views again, before ReapplyRemappedViews: the window
+// kyty_local_protective_remap 0 leaves, widened.)
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_remap_window_us {0};
 }
 
 namespace VirtualMemory = Common::VirtualMemory;
@@ -128,7 +141,9 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
+	const auto start = __rdtsc();
 	GetGpuResources().MapMemory(vaddr, size);
+	LiveCounters::Add(LiveCounters::GpuMapKt, (__rdtsc() - start) >> 10u);
 }
 
 // `releasing`: the range is unmapped or decommitted right after (GpuResourceManager::UnmapMemory).
@@ -136,7 +151,9 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size, bool releasing = false)
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
+	const auto start = __rdtsc();
 	GetGpuResources().UnmapMemory(vaddr, size, releasing);
+	LiveCounters::Add(LiveCounters::GpuUnmapKt, (__rdtsc() - start) >> 10u);
 }
 
 // A releasing UnmapGpuRange left the pages' host protection to the unmap; when the unmap fails
@@ -1364,10 +1381,16 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 	uint64_t written = 0;
 	for (const auto& part: parts) {
 		const auto* source = static_cast<const uint8_t*>(data) + (part.address - vaddr);
-		if (part.private_memory ? WritePrivate(part.address, source, part.size)
-		                        : TryWriteBacking(part.address, source, part.size)) {
-			written += part.size;
+		bool        done   = part.private_memory ? WritePrivate(part.address, source, part.size)
+		                                         : TryWriteBacking(part.address, source, part.size);
+		if (!done && !part.private_memory && g_guest_address_space != nullptr) {
+			// A partial unmap of the part's view (Windows) takes the mapping entries of its other parts away until they
+			// are mapped again, under the address-space lock: written once that change is done.
+			g_guest_address_space->WaitForChanges(part.address, part.size);
+			done = TryWriteBacking(part.address, source, part.size);
+			if (done) LiveCounters::Add(LiveCounters::WriteBackRetries);
 		}
+		if (done) written += part.size;
 	}
 	if (written == size) {
 		return;
@@ -1447,6 +1470,11 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 
 bool IsGuestMappedAfterChanges(uint64_t vaddr) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsMappedAfterChanges(vaddr);
+}
+
+bool InRemapWindow(uint64_t vaddr) noexcept {
+	const auto begin = g_remap_window_begin.load(std::memory_order_acquire);
+	return begin != 0 && vaddr >= begin && vaddr < g_remap_window_end.load(std::memory_order_relaxed);
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
@@ -4383,7 +4411,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
-	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
+	bool ok = g_guest_address_space->ProtectKeepingWatched(aligned_addr, aligned_len, mode);
 
 	if (!ok) {
 		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64

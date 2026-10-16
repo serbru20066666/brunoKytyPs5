@@ -121,6 +121,29 @@ static bool TableInterchangeable(const ShaderRecompiler::IR::CompiledShaderInfo&
 	       x.table_block_dwords == y.table_block_dwords && x.user_data_registers == y.user_data_registers;
 }
 
+// A stage's flat form as TableRuns makes it (TablePack packs it into the pair): every operand an index into one of
+// three arrays (the stage's user data, its block's slots, the stage's constants).
+struct RenderExecutor::TableFlatStage {
+	struct Operand {
+		uint32_t index = 0;
+		uint32_t base  = 2; // 0: user data, 1: slots, 2: constants
+	};
+	struct Run {
+		std::array<Operand, 3> address; // low, high, offset
+		int32_t                immediate = 0;
+		uint32_t               first = 0, count = 0;
+		Operand                records; // a bounded run's (TablePlan::Slot::bounded)
+		bool                   bounded = false;
+	};
+	std::vector<Run>      runs;         // the runs in level order
+	std::vector<uint32_t> level_ends;   // the run after each level
+	std::vector<Operand>  image_words;  // every image's words, then every sampler's
+	std::vector<uint32_t> image_counts;
+	std::vector<Operand>  buffer_words; // every buffer's four V# words (TableBlocks)
+	std::vector<uint32_t> constants;
+	uint32_t              user_words = 0; // the user data it reads: below this
+};
+
 struct RenderExecutor::TablePair {
 	// Evaluated slots at consecutive addresses (the same base, immediates 4 apart): one read, at the address of the
 	// first. Ordered by level: a run whose address is made of slots is read after the runs of those slots.
@@ -136,29 +159,31 @@ struct RenderExecutor::TablePair {
 	const char* special = nullptr; // a dispatch's: the normal path's special path that takes it (refused)
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {}; // vertex, pixel (null: inactive)
 	std::array<std::vector<Run>, 2>                             runs;
-	// TableEvaluate's form of a stage's plan (TableRuns): every operand an index into one of three arrays (the stage's
-	// user data, its block's slots, the stage's constants), so a draw's evaluation branches on no operand kind.
-	struct FlatOperand {
-		uint32_t index = 0;
-		uint32_t base  = 2; // 0: user data, 1: slots, 2: constants
+	// TableEvaluate's form of a stage's plan (TableRuns, TablePack): every operand an index into one of three arrays (the
+	// stage's user data, its block's slots, the stage's constants), so a draw's evaluation branches on no operand kind.
+	// Both stages' arrays in one block, each operand 16 bits (its array in the top two, its index in the low 14), each
+	// run 16 bytes: a pair a draw switches to is cold, and its arrays were a dozen allocations of 8-byte operands, as
+	// many cold lines on as many pages (TablePrefetchArrays). Same process, 10 rounds: Stonefang standing render 8.94 ->
+	// 8.75 ms, Latria 13.47 -> 13.31.
+	struct PackedRun {
+		std::array<uint16_t, 3>   address {}; // low, high, offset
+		uint16_t                  records = NotBounded;
+		int32_t                   immediate = 0;
+		uint16_t                  first = 0, count = 0;
+		static constexpr uint16_t NotBounded = 0xffff;
 	};
-	struct FlatRun {
-		std::array<FlatOperand, 3> address; // low, high, offset
-		int32_t                    immediate = 0;
-		uint32_t                   first = 0, count = 0;
-		FlatOperand                records; // a bounded run's (TablePlan::Slot::bounded)
-		bool                       bounded = false;
+	struct PackedStage {
+		std::span<const PackedRun> runs;
+		std::span<const uint16_t>  level_ends, image_words, buffer_words;
+		std::span<const uint8_t>   image_counts;
+		std::span<const uint32_t>  constants;
+		uint32_t                   user_words = 0;
+		bool                       valid      = false; // (else an index or a count past its packed width)
 	};
-	struct FlatStage {
-		std::vector<FlatRun>     runs;        // the runs in level order
-		std::vector<uint32_t>    level_ends;  // the run after each level
-		std::vector<FlatOperand> image_words; // every image's words, then every sampler's
-		std::vector<uint32_t>    image_counts;
-		std::vector<FlatOperand> buffer_words; // every buffer's four V# words (TableBlocks)
-		std::vector<uint32_t>    constants;
-		uint32_t                 user_words = 0; // the user data it reads: below this
-	};
-	std::array<FlatStage, 2> flat;
+	std::array<PackedStage, 2>      packed;
+	std::unique_ptr<std::byte[]>    packed_block;
+	const std::byte*                packed_at    = nullptr; // (the block's first 64-byte line)
+	uint32_t                        packed_bytes = 0;
 	std::vector<TableVariant>                                   variants;
 	uint64_t                                                    store_frame = 0, store_state = 0; // the last request
 	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>, HashedKey> sets; // by T#/S# words
@@ -419,14 +444,9 @@ static void TablePrefetchArrays(const Pair& pair, const Set* set) {
 		const auto  bytes = std::min<size_t>(items.size() * sizeof(*items.data()), 256);
 		for (size_t offset = 0; offset < bytes; offset += 64) __builtin_prefetch(at + offset);
 	};
+	for (uint32_t offset = 0; offset < std::min<uint32_t>(pair.packed_bytes, 2048); offset += 64)
+		__builtin_prefetch(pair.packed_at + offset);
 	for (uint32_t st = 0; st < 2 && pair.programs[st] != nullptr; ++st) {
-		const auto& form = pair.flat[st];
-		lines(form.runs);
-		lines(form.level_ends);
-		lines(form.image_words);
-		lines(form.image_counts);
-		lines(form.buffer_words);
-		lines(form.constants);
 		lines(pair.programs[st]->table_plan.buffers); // (TableBlocks' plan and resource flags of each V#)
 		lines(pair.programs[st]->info.buffers);
 	}
@@ -525,6 +545,11 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		TableReset(pair);
 	}
 	if (pair.refused) return Spec::Refuse("table: pair refused"), TableResult::Native;
+	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
+	// camera from its constants (a speculation's thread leaves them all to the GPU thread's).
+	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&
+	    FrameGen::IsGbufferVertexShader(pair.programs[0]->shader_hash) && (Role() != 0 || FrameGen::WantsCamera()))
+		return Spec::Refuse("table: frame generation camera"), TableResult::Native;
 	// A store at most once a frame per pair and draw state, within the frame's budget (kyty_local_table_store_budget):
 	// while its programs and pipeline compile, the pair's draws take the normal path (Deferred). (Once a frame per pair
 	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
@@ -1195,25 +1220,27 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	};
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
-		const auto& form    = pair.flat[st];
+		const auto& form    = pair.packed[st];
 		// (Slots no stage reads keep what an earlier draw left: the block carries them unread.)
 		auto& slots = table.blocks[st];
 		slots.resize(program.table_plan.BlockDwords());
 		if (table.addresses.size() < pair.runs[st].size()) table.addresses.resize(pair.runs[st].size());
-		if (form.runs.size() != pair.runs[st].size() || user_data[st].size() < form.user_words || user_data[st].size() > 64) {
+		if (!form.valid || form.runs.size() != pair.runs[st].size() || user_data[st].size() < form.user_words ||
+		    user_data[st].size() > 64) {
 			if (!by_operands(st) || !indirect(st)) return false;
 			continue;
 		}
-		// The flat form (TablePair::flat): every operand one load from one of three arrays. A level's addresses are
+		// The flat form (TablePair::packed): every operand one load from one of three arrays. A level's addresses are
 		// known together: their lines load at once (the guest's tables are cold).
 		const std::array<const uint32_t*, 3> bases {user_data[st].data(), slots.data(), form.constants.data()};
-		const auto get = [&](const TablePair::FlatOperand& operand) { return bases[operand.base][operand.index]; };
+		const auto get = [&](uint16_t operand) { return bases[operand >> 14u][operand & 0x3fffu]; };
 		uint32_t   begin = 0;
 		for (const auto end: form.level_ends) {
 			for (auto i = begin; i < end; ++i) {
-				const auto& run = form.runs[i];
+				const auto& run     = form.runs[i];
+				const bool  bounded = run.records != TablePair::PackedRun::NotBounded;
 				if (!locate(get(run.address[0]), get(run.address[1]), get(run.address[2]), run.immediate, run.count,
-				            table.addresses[i], run.bounded, run.bounded ? get(run.records) : 0))
+				            table.addresses[i], bounded, bounded ? get(run.records) : 0))
 					return false;
 			}
 			for (auto i = begin; i < end; ++i)
@@ -1226,7 +1253,7 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		size_t at  = 0;
 		for (size_t i = 0; i < form.image_counts.size(); ++i) {
 			std::array<uint32_t, 8> image {};
-			const auto              count = form.image_counts[i];
+			const uint32_t          count = form.image_counts[i];
 			for (uint32_t w = 0; w < count; ++w) {
 				image[w]    = get(form.image_words[at + w]);
 				out[at + w] = image[w] & ~NativeXprLodStatsMask[w];
@@ -1305,16 +1332,16 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 		const auto& block   = table.blocks[st];
 		auto&       entries = table.entries[st];
 		entries.resize(plan.buffers.size());
-		const auto& form = pair.flat[st];
-		const bool  flat = form.buffer_words.size() == 4 * plan.buffers.size() && user_data[st].size() >= form.user_words &&
-		                  user_data[st].size() <= 64;
+		const auto& form = pair.packed[st];
+		const bool  flat = form.valid && form.buffer_words.size() == 4 * plan.buffers.size() &&
+		                  user_data[st].size() >= form.user_words && user_data[st].size() <= 64;
 		const std::array<const uint32_t*, 3> bases {user_data[st].data(), block.data(), form.constants.data()};
 		for (size_t i = 0; i < plan.buffers.size(); ++i) {
 			auto& [words4, entry] = entries[i];
 			if (flat) {
 				for (uint32_t w = 0; w < 4; ++w) {
-					const auto& operand = form.buffer_words[4 * i + w];
-					words4[w]           = bases[operand.base][operand.index];
+					const auto operand = form.buffer_words[4 * i + w];
+					words4[w]          = bases[operand >> 14u][operand & 0x3fffu];
 				}
 			} else {
 				for (uint32_t w = 0; w < 4; ++w) {
@@ -2259,6 +2286,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 void RenderExecutor::TableRuns(TablePair& pair) {
 	using Kind  = ShaderRecompiler::IR::TablePlan::Operand::Kind;
 	auto& table = *m_table_xpr;
+	std::array<TableFlatStage, 2> flat_forms; // (packed into the pair: TablePack)
 	for (uint32_t st = 0; st < 2; ++st) {
 		if (pair.programs[st] == nullptr) continue;
 		const auto&           plan = pair.programs[st]->table_plan;
@@ -2294,10 +2322,9 @@ void RenderExecutor::TableRuns(TablePair& pair) {
 		// value() reads one beyond them as 0: one of 64 and up is the constant 0), a slot by its index, an immediate
 		// from the constants (the first is 0).
 		const auto& program = *pair.programs[st];
-		auto&       flat    = pair.flat[st];
-		flat                = {};
+		auto&       flat    = flat_forms[st];
 		flat.constants.push_back(0);
-		const auto flat_of = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) -> TablePair::FlatOperand {
+		const auto flat_of = [&](const ShaderRecompiler::IR::TablePlan::Operand& operand) -> TableFlatStage::Operand {
 			if (operand.kind == Kind::Slot) return {operand.value, 1};
 			if (TableCodeOperand(operand)) {
 				flat.constants.push_back(TableCodeWord(operand, st == 0 ? pair.vs : pair.ps));
@@ -2327,6 +2354,88 @@ void RenderExecutor::TableRuns(TablePair& pair) {
 			for (uint32_t w = 0; w < descriptor.count; ++w) flat.image_words.push_back(flat_of(descriptor.words[w]));
 		for (const auto& words: plan.buffers)
 			for (const auto& word: words) flat.buffer_words.push_back(flat_of(word));
+	}
+	TablePack(pair, flat_forms);
+}
+
+// The pair's flat forms packed into one block (TablePair::packed): a stage whose operand indices, counts or levels do not
+// fit their packed widths is left invalid (evaluated by its plan's operands).
+void RenderExecutor::TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat_forms) {
+	using Pair = TablePair;
+	pair.packed       = {};
+	pair.packed_block = nullptr;
+	pair.packed_at    = nullptr;
+	pair.packed_bytes = 0;
+	const auto operand = [](const TableFlatStage::Operand& from, bool& fits) -> uint16_t {
+		if (from.base > 2 || from.index >= 0x4000u) fits = false;
+		return static_cast<uint16_t>(from.base << 14u | (from.index & 0x3fffu));
+	};
+	const auto align = [](size_t at, size_t to) { return (at + to - 1) / to * to; };
+	// (Layout per stage: runs, constants, level ends, image words, buffer words, image counts.)
+	std::array<std::array<size_t, 6>, 2> offsets {};
+	size_t                               bytes = 0;
+	std::array<bool, 2>                  fits {};
+	for (uint32_t st = 0; st < 2; ++st) {
+		if (pair.programs[st] == nullptr) continue;
+		const auto& flat = flat_forms[st];
+		fits[st]         = flat.runs.size() < 0x10000 && flat.image_words.size() < 0x10000;
+		for (const auto end: flat.level_ends) fits[st] = fits[st] && end < 0x10000;
+		for (const auto count: flat.image_counts) fits[st] = fits[st] && count < 0x100;
+		for (const auto& run: flat.runs) fits[st] = fits[st] && run.first < 0x10000 && run.count < 0x10000;
+		if (!fits[st]) continue;
+		bytes          = align(bytes, 64);
+		offsets[st][0] = bytes;
+		bytes += flat.runs.size() * sizeof(Pair::PackedRun);
+		offsets[st][1] = bytes;
+		bytes += flat.constants.size() * sizeof(uint32_t);
+		offsets[st][2] = bytes;
+		bytes += flat.level_ends.size() * sizeof(uint16_t);
+		offsets[st][3] = bytes;
+		bytes += flat.image_words.size() * sizeof(uint16_t);
+		offsets[st][4] = bytes;
+		bytes += flat.buffer_words.size() * sizeof(uint16_t);
+		offsets[st][5] = bytes;
+		bytes += flat.image_counts.size();
+	}
+	if (bytes == 0) return;
+	pair.packed_block = std::make_unique<std::byte[]>(bytes + 64);
+	auto* base        = reinterpret_cast<std::byte*>(align(reinterpret_cast<uintptr_t>(pair.packed_block.get()), 64));
+	pair.packed_at    = base;
+	pair.packed_bytes = static_cast<uint32_t>(bytes);
+	for (uint32_t st = 0; st < 2; ++st) {
+		if (!fits[st]) continue;
+		const auto& flat    = flat_forms[st];
+		auto&       packed  = pair.packed[st];
+		bool        operand_fits = true;
+		auto*       runs    = reinterpret_cast<Pair::PackedRun*>(base + offsets[st][0]);
+		for (size_t i = 0; i < flat.runs.size(); ++i) {
+			const auto& run = flat.runs[i];
+			runs[i]         = {.address   = {operand(run.address[0], operand_fits), operand(run.address[1], operand_fits),
+			                                 operand(run.address[2], operand_fits)},
+			                   .records   = run.bounded ? operand(run.records, operand_fits) : Pair::PackedRun::NotBounded,
+			                   .immediate = run.immediate,
+			                   .first     = static_cast<uint16_t>(run.first),
+			                   .count     = static_cast<uint16_t>(run.count)};
+			if (run.bounded && runs[i].records == Pair::PackedRun::NotBounded) operand_fits = false;
+		}
+		auto* constants = reinterpret_cast<uint32_t*>(base + offsets[st][1]);
+		std::copy(flat.constants.begin(), flat.constants.end(), constants);
+		auto* level_ends = reinterpret_cast<uint16_t*>(base + offsets[st][2]);
+		for (size_t i = 0; i < flat.level_ends.size(); ++i) level_ends[i] = static_cast<uint16_t>(flat.level_ends[i]);
+		auto* image_words = reinterpret_cast<uint16_t*>(base + offsets[st][3]);
+		for (size_t i = 0; i < flat.image_words.size(); ++i) image_words[i] = operand(flat.image_words[i], operand_fits);
+		auto* buffer_words = reinterpret_cast<uint16_t*>(base + offsets[st][4]);
+		for (size_t i = 0; i < flat.buffer_words.size(); ++i) buffer_words[i] = operand(flat.buffer_words[i], operand_fits);
+		auto* image_counts = reinterpret_cast<uint8_t*>(base + offsets[st][5]);
+		for (size_t i = 0; i < flat.image_counts.size(); ++i) image_counts[i] = static_cast<uint8_t>(flat.image_counts[i]);
+		packed = {.runs         = {runs, flat.runs.size()},
+		          .level_ends   = {level_ends, flat.level_ends.size()},
+		          .image_words  = {image_words, flat.image_words.size()},
+		          .buffer_words = {buffer_words, flat.buffer_words.size()},
+		          .image_counts = {image_counts, flat.image_counts.size()},
+		          .constants    = {constants, flat.constants.size()},
+		          .user_words   = flat.user_words,
+		          .valid        = operand_fits};
 	}
 }
 
@@ -2494,6 +2603,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = known->special != nullptr ? known->special : "dispatch: refused", false;
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
+	// (The game's 3D view; a dispatch declined below goes the normal way, which notes it too.)
+	if (Role() == 0 && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+		FrameGen::NoteScene();
 	// Frame generation reads the TAA pass's depth and motion vectors from the normal path's bindings
 	// (RenderExecutor::DispatchDirect, FrameGen::OnDispatch): one dispatch a frame.
 	if (FrameGen::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))

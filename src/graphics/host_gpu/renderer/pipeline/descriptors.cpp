@@ -569,48 +569,88 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
 }
 
+// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 with less than 12 GiB of video memory, else 0): a sampled 2D block-compressed
+// texture of at least 1024 texels on a side is held without its 1 or 2 largest levels, as a T# from that level would be
+// (TextureFromLevel): its kept levels are the first bytes of its memory, so the left-out ones take no video memory and
+// are not uploaded when the game writes them. One level left out is a quarter of the texture: at 1-1 its BC textures
+// took 3.7 GiB (0.9 reduced), on cards whose budget held about 10 of the 11 GB the level wanted. Shaders sample the
+// smaller texture (half the texels across); size queries, explicit levels and texel loads see it too (a little blur).
+static uint32_t TextureReduceLevels(bool small_video_memory) {
+	static const uint32_t levels = [&] {
+		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
+		const uint32_t chosen = value != nullptr && value[0] != '\0'
+		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
+		                            : (small_video_memory ? 1u : 0u);
+		if (chosen != 0) {
+			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
+			            "(KYTY_TEXTURE_REDUCE=0 keeps them whole)\n",
+			            chosen);
+			std::fflush(stdout);
+		}
+		return chosen;
+	}();
+	return levels;
+}
+
 static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
 	const auto  base = desc.view_info.base_level;
+	const auto  last = base + desc.view_info.level_count - 1u;
 	const auto& full = desc.info;
-	if (base == 0 || !TexturePrefixEnabled(small_video_memory) || full.resources.layers != 1 || full.samples != 1 ||
-	    full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() || full.HasMetadata() ||
-	    full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
+	// The levels left out of a large BC texture (none where the view reads only those, nor of one the GPU wrote: the
+	// character creator compresses faces on the GPU through texel views of the same memory, which must stay whole).
+	const auto reduce = TextureReduceLevels(small_video_memory);
+	const auto drop   = reduce != 0 && full.IsBlock() && std::max(full.extent.width, full.extent.height) >= 1024u &&
+	                          full.resources.levels > reduce && last >= reduce &&
+	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
+	                          !cache.HasGpuWrittenImageOverlap(full.data.address, full.data.size)
+	                        ? reduce
+	                        : 0u;
+	// The first level held: the T#'s base, or past the levels left out.
+	const auto first_held = std::max(base, drop);
+	if (first_held == 0 || (drop == 0 && !TexturePrefixEnabled(small_video_memory)) || full.resources.layers != 1 ||
+	    full.samples != 1 || full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() ||
+	    full.HasMetadata() || full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
 	    full.tile_mode == Prospero::TileMode::kDepth || full.tile_mode == Prospero::TileMode::kRenderTarget ||
 	    cache.HoldsImage(full)) {
 		return;
 	}
 	ImageInfo from {};
-	for (uint32_t first = 1; first < base; ++first) {
+	for (uint32_t first = std::max(drop, 1u); first < first_held; ++first) {
 		if (TextureFromLevel(full, first, from) && cache.HoldsImage(from)) {
-			desc.info                 = from;
-			desc.view_info.base_level = base - first;
+			desc.info                  = from;
+			desc.view_info.base_level  = first_held - first;
+			desc.view_info.level_count = last - first_held + 1u;
 			return;
 		}
 	}
-	if (!TextureFromLevel(full, base, from)) return;
-	desc.info                 = from;
-	desc.view_info.base_level = 0;
+	if (!TextureFromLevel(full, first_held, from)) return;
+	desc.info                  = from;
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = last - first_held + 1u;
 }
 
-// KYTY_TEXTURE_LAYER_RANGE=1|0 (default: on with less than 12 GiB of video memory): a sampled array texture of one
+// KYTY_TEXTURE_LAYER_RANGE=1|0 (default: on): a sampled array texture of one
 // level whose view starts past its first layer is held as the array of the layers the view reads, not whole. The
 // game's streamed texture pool is one T# of ~1700 1024x1024 BC layers (1.7 GB at 0x1009000000, over the shadow-map
 // pool's lent layers) of which a view samples one (base layer 737 at 2-3, 1617 at 4-1): the whole array was made, its
 // buffer joined from 8 others (3 s), and that buffer over the shadow-map layers refused their partial uploads, which
 // became whole 320 MiB uploads: frames of 5 and 17 s on an 8 GB laptop. Not a view of more than half the layers (an
 // array view from layer 17 of 1585 at 4-2): an image of nearly all of it beside the whole one other views take.
-static bool TextureLayerRangeEnabled(bool small_video_memory) {
+// (With any video memory since 10-15, not only below 12 GiB: a 16 GB RTX 4080 froze for seconds and once lost the
+// device at 2-3 and 4-1, each new layer count of the pool a whole new image uploaded (issue #9); a 32 GB RTX 5090 held
+// no layer range in a 4-1 tour or a 2-3 walk, the same frames and pictures as without.)
+static bool TextureLayerRangeEnabled() {
 	static const char* const value = std::getenv("KYTY_TEXTURE_LAYER_RANGE");
-	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+	return value == nullptr || value[0] != '0';
 }
 
-static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc) {
 	const auto& full  = desc.info;
 	const auto  first = desc.view_info.base_layer;
 	const auto  count = desc.view_info.layer_count;
 	if (first == 0 || count == 0 || full.resources.layers < 2 || first + count > full.resources.layers ||
 	    count > full.resources.layers / 2 ||
-	    !TextureLayerRangeEnabled(small_video_memory) || full.resources.levels != 1 || full.samples != 1 ||
+	    !TextureLayerRangeEnabled() || full.resources.levels != 1 || full.samples != 1 ||
 	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() || full.mip_layout.empty() ||
 	    full.mip_layout[0].offset != 0 || full.mip_layout[0].size != full.data.size ||
 	    full.data.size % full.resources.layers != 0 || cache.HoldsImage(full)) {
@@ -844,6 +884,14 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	} else if (TileTextureElementLayout element {}; !TileGetTextureElementLayout(format, element)) {
 		// A stale descriptor (a compute pass while Latria loaded, format 129) has no layout to size.
 		rejection = "format without a texel layout";
+	} else if (TileSurfaceLayout probe {};
+	           tile != Prospero::TileMode::kLinear &&
+	           !TileGetTiledTextureLayout({format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+	                                       width, height, volume ? depth : 1u, levels, 1u},
+	                                      probe)) {
+		// No layout for the shape in its tiling: TileGetTextureTotalSize would end the emulator (10-15, a Nexus walk: an
+		// indirect dispatch's texture of format 128, tile 27, 68x1; the same 67-68x1 tile 27 shape as 10-13's format 182).
+		rejection = "tiling without a layout";
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
 		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels,
@@ -993,7 +1041,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	if (!storage && type == Prospero::ImageType::kColor2D) {
 		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	}
-	if (!storage) HoldLayerRange(texture_cache, desc, m_context.GetGraphics().small_video_memory);
+	if (!storage) HoldLayerRange(texture_cache, desc);
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);

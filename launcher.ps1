@@ -9,14 +9,24 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 	'Portuguese (Portugal)', 'Russian', 'Korean', 'Chinese (Traditional)', 'Chinese (Simplified)', 'Finnish', 'Swedish',
 	'Danish', 'Norwegian', 'Polish', 'Portuguese (Brazil)', 'English (United Kingdom)', 'Turkish', 'Spanish (Latin America)',
 	'Arabic', 'French (Canada)', 'Czech', 'Hungarian', 'Greek', 'Romanian', 'Thai', 'Vietnamese', 'Indonesian'
-$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
+$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160',
+	'3840x1080', '5120x1440'
 # The height Demon's Souls renders its 3D at (run-windows.ps1 -RenderHeight); its output and UI stay 3840x2160.
 $renderHeights = '1440 (PS5)', '1296', '1152', '1080', '900'
-# Demon's Souls' own settings for what a frame draws (run-windows.ps1 -Quality): simpler shadows and distant detail.
+# The aspect ratio of Demon's Souls' 3D (run-windows.ps1 -Aspect): wider sees more to the sides.
+$ratios = '16:9 (PS5)', '21:9', '32:9'
+# Demon's Souls' own settings for what a frame draws (run-windows.ps1 -Quality): simpler shadows and distant detail;
+# and smaller textures (run-windows.ps1 -TextureReduce: Low 1, Lowest 2; Standard leaves it to the emulator: 1 below
+# 12 GB of video memory, else 0).
 $qualities = 'Standard (PS5)', 'Low', 'Lowest'
+# DLSS frame generation (run-windows.ps1 -FrameGen: the generated frames per rendered one, the multiplier less one).
+$frameGens = 'Off', '2x', '3x', '4x', '5x', '6x'
+# The emulator's own panel at the top right of the game image (KYTY_FPS_HUD 0, 1, 2).
+$overlays = 'Off', 'Frame rate', 'Detailed'
 
 $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
-	ecores = $false; fps120 = $false; render = 1440; quality = 'standard'; vsync = $false; hdr = $false }
+	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
+	hud = 0; streamline = '' }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -57,6 +67,37 @@ public static int[] Query() {
 	return $mask
 }
 $efficiencyMask = Get-EfficiencyMask
+# Frame generation needs NVIDIA's Streamline runtime, which no release ships: the Streamline SDK
+# (github.com/NVIDIA-RTX/Streamline/releases) chosen with "Streamline..." (settings: streamline), else a "streamline"
+# folder next to the emulator, else the SDK beside a local build (_Build\deps\streamline\sdk). The emulator loads
+# only NVIDIA's own sl.interposer.dll (run-windows -StreamlineDir).
+$exe = if (Test-Path "$root\kyty_emulator.exe") { "$root\kyty_emulator.exe" } else { "$root\_Build\windows\kyty_emulator.exe" }
+$streamlineSdkUrl = 'https://github.com/NVIDIA-RTX/Streamline/releases'
+# The runtime's folder in $dir (the folder itself or its bin\x64) when its sl.interposer.dll is signed by NVIDIA;
+# $null otherwise.
+function Find-Streamline([string]$dir) {
+	if (!$dir) { return $null }
+	foreach ($folder in @($dir, (Join-Path $dir 'bin\x64'))) {
+		$file = Join-Path $folder 'sl.interposer.dll'
+		if (Test-Path -LiteralPath $file) {
+			$signature = Get-AuthenticodeSignature -LiteralPath $file
+			if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match 'O=NVIDIA Corporation') { return $folder }
+			return $null
+		}
+	}
+	return $null
+}
+function Resolve-Streamline {
+	if ($settings.streamline) { return Find-Streamline $settings.streamline }
+	if ($env:KYTY_STREAMLINE_DIR) { return Find-Streamline $env:KYTY_STREAMLINE_DIR }
+	foreach ($dir in @((Join-Path (Split-Path $exe) 'streamline'), (Join-Path (Split-Path (Split-Path $exe)) 'deps\streamline\sdk'))) {
+		$found = Find-Streamline $dir
+		if ($found) { return $found }
+	}
+	return $null
+}
+$streamline = Resolve-Streamline
+$frameGenAvailable = [bool]$streamline
 
 function Get-PlayCommand {
 	$size = $settings.resolution -split 'x'
@@ -70,13 +111,23 @@ function Get-PlayCommand {
 	# HDR10 output when Windows HDR is on for the display; SDR otherwise.
 	if ($settings.hdr) { $arguments += '-Hdr' }
 	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
-	if ($settings.quality -in 'low', 'lowest') { $arguments += @('-Quality', $settings.quality) }
+	if ($settings.ratio -in '21:9', '32:9') { $arguments += @('-Aspect', $settings.ratio) }
+	if ($settings.quality -in 'low', 'lowest') {
+		$arguments += @('-Quality', $settings.quality, '-TextureReduce', $(if ($settings.quality -eq 'lowest') { 2 } else { 1 }))
+	}
+	if ($frameGenAvailable -and [int]$settings.framegen -ge 2) {
+		$arguments += @('-FrameGen', ([int]$settings.framegen - 1), '-StreamlineDir', "`"$streamline`"")
+	}
+	# The emulator's panel (KYTY_FPS_HUD) at the top right of the game image: the frame rate and frame times, or with
+	# the GPU, processor and memory too.
+	if ([int]$settings.hud -ge 1) { $arguments += @('-Set', "KYTY_FPS_HUD=$([Math]::Min([int]$settings.hud, 2))") }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	# The console stays for the live log; after a crash it waits for a key.
 	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
 }
-function Get-PrecompileCommand {
+function Get-PrecompileCommand([string]$switch = '') {
 	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\precompile-windows.ps1`"")
+	if ($switch) { $arguments += $switch }
 	if ($settings.ecores -and $efficiencyMask -ne 0) { $arguments += @('-Affinity', $efficiencyMask) }
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	return 'powershell ' + ($arguments -join ' ') + ' & pause'
@@ -85,7 +136,9 @@ function Save-Settings { $settings | ConvertTo-Json | Set-Content $settingsPath 
 if ($DryRun) {
 	"play:       cmd /v:on /s /c `"$(Get-PlayCommand)`""
 	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
+	"hints:      cmd /s /c `"$(Get-PrecompileCommand '-ExportHints')`""
 	"efficiency cores: 0x{0:X}" -f $efficiencyMask
+	"frame generation: $(if ($frameGenAvailable) { "NVIDIA's Streamline runtime in $streamline" } else { "no NVIDIA-signed Streamline runtime (settings: '$($settings.streamline)')" })"
 	return
 }
 
@@ -169,24 +222,70 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
-$fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies play faster)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
+$fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies stay at 60)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
 Add-Row '' @($fps120)
 $vsync = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'VSync (no screen tearing; adaptive sync displays keep it)'; AutoSize = $true; Checked = [bool]$settings.vsync }
 Add-Row '' @($vsync)
 $hdr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'HDR (turn on "Use HDR" in Windows display settings first)'; AutoSize = $true; Checked = [bool]$settings.hdr }
 Add-Row '' @($hdr)
-$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
+$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $render.Items.AddRange($renderHeights)
 $render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
 if ($render.SelectedIndex -lt 0) { $render.SelectedIndex = 0 }
 $renderNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'Demon''s Souls 3D; lower = faster, less sharp'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
 Add-Row 'Render height' @($render, $renderNote)
-$quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
+$ratio = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
+$ratio.Items.AddRange($ratios)
+$ratio.SelectedItem = ($ratios | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.ratio } | Select-Object -First 1)
+if ($ratio.SelectedIndex -lt 0) { $ratio.SelectedIndex = 0 }
+$ratioNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0'
+	Text = 'the 3D wider (more to the sides); the HUD keeps its shape, menus are stretched, movies stay 16:9' }
+Add-Row 'Aspect ratio' @($ratio, $ratioNote)
+$quality = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 205 }
 $quality.Items.AddRange($qualities)
 $quality.SelectedItem = ($qualities | Where-Object { ($_ -split ' ')[0] -eq [string]$settings.quality } | Select-Object -First 1)
 if ($quality.SelectedIndex -lt 0) { $quality.SelectedIndex = 0 }
-$qualityNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'simpler shadows and distant detail; faster where the CPU limits'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+$qualityNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'simpler shadows and detail, smaller textures; faster on weaker PCs'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+$qualityTips = New-Object System.Windows.Forms.ToolTip
+$qualityTips.SetToolTip($quality, "Standard: the PS5's picture. With less than 12 GB of video memory, large textures leave out their largest level`n(half the size per side) so that they fit.`nLow: simpler shadows and distant detail, textures half the size per side.`nLowest: simpler still, textures a quarter the size per side.")
 Add-Row 'Graphics' @($quality, $qualityNote)
+$frameGen = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160; Enabled = $frameGenAvailable }
+$frameGen.Items.AddRange($frameGens)
+$frameGen.SelectedItem = if ($frameGenAvailable -and [int]$settings.framegen -ge 2) { "$([int]$settings.framegen)x" } else { 'Off' }
+if ($frameGen.SelectedIndex -lt 0) { $frameGen.SelectedIndex = 0 }
+$frameGenFolder = New-Object System.Windows.Forms.Button -Property @{ Text = 'Streamline...'; AutoSize = $true }
+$frameGenNote = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+function Update-FrameGenNote {
+	$frameGenNote.Text = if ($frameGenAvailable) { 'DLSS; NVIDIA RTX 40 or newer (3x and up: RTX 50)' } else {
+		'needs NVIDIA''s Streamline SDK: download it, then choose its folder' }
+}
+Update-FrameGenNote
+$frameGenTips = New-Object System.Windows.Forms.ToolTip
+$frameGenTips.SetToolTip($frameGen, "Shown frames = the game's frames x the multiplier. With VSync on, they are capped at the display's refresh`n(a 60 Hz display at 2x runs the game at 30 fps). The game's frames stay at 60 with 'Up to 120 fps' too:`nframe generation needs them evenly spaced.")
+$frameGenTips.SetToolTip($frameGenFolder, "The NVIDIA Streamline SDK (a release zip from $streamlineSdkUrl), unpacked: its folder or its bin\x64.`nOnly NVIDIA-signed files are used; nothing of NVIDIA's comes with the emulator.")
+$frameGenFolder.Add_Click({
+	$dialog = New-Object System.Windows.Forms.FolderBrowserDialog -Property @{
+		Description = "The unpacked NVIDIA Streamline SDK ($streamlineSdkUrl), or its bin\x64 folder" }
+	if ($settings.streamline -and (Test-Path -LiteralPath $settings.streamline)) { $dialog.SelectedPath = $settings.streamline }
+	if ($dialog.ShowDialog($form) -ne 'OK') { return }
+	$found = Find-Streamline $dialog.SelectedPath
+	if (!$found) {
+		[void][System.Windows.Forms.MessageBox]::Show($form, "No sl.interposer.dll signed by NVIDIA in that folder or its bin\x64.`nDownload the Streamline SDK from $streamlineSdkUrl and choose the unpacked folder.", 'Frame generation')
+		return
+	}
+	$settings.streamline = $dialog.SelectedPath
+	$script:streamline = $found
+	$script:frameGenAvailable = $true
+	$frameGen.Enabled = $true
+	Update-FrameGenNote
+})
+Add-Row 'Frame generation' @($frameGen, $frameGenFolder, $frameGenNote)
+$hud = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
+$hud.Items.AddRange($overlays)
+# (An older launcher saved true for the frame rate.)
+$hud.SelectedIndex = [Math]::Max(0, [Math]::Min($overlays.Count - 1, [int]$settings.hud))
+$hudNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'top right: frame rate and frame times; detailed: GPU, CPU, memory'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+Add-Row 'Overlay' @($hud, $hudNote)
 $ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
 	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
 Add-Row '' @($ecores)
@@ -194,9 +293,12 @@ Add-Row '' @($ecores)
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ AutoSize = $true; Margin = '0,10,0,0' }
 $play = New-Object System.Windows.Forms.Button -Property @{ Text = 'Play'; AutoSize = $true; Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
 $precompile = New-Object System.Windows.Forms.Button -Property @{ Text = 'Precompile shaders'; AutoSize = $true }
+$share = New-Object System.Windows.Forms.Button -Property @{ Text = 'Export shader hints'; AutoSize = $true }
+(New-Object System.Windows.Forms.ToolTip).SetToolTip($share, ('The shaders your play recorded, without the game''s code, as my-hints-<game>.hints: ' +
+	'attached to a GitHub issue, the next packages precompile them for everyone.'))
 $logs = New-Object System.Windows.Forms.Button -Property @{ Text = 'Logs folder'; AutoSize = $true }
 $readme = New-Object System.Windows.Forms.Button -Property @{ Text = 'README'; AutoSize = $true }
-$buttons.Controls.AddRange(@($play, $precompile, $logs, $readme))
+$buttons.Controls.AddRange(@($play, $precompile, $share, $logs, $readme))
 $grid.Controls.Add($buttons)
 $grid.SetColumnSpan($buttons, 2)
 $credit = New-Object System.Windows.Forms.Label -Property @{ AutoSize = $true; ForeColor = 'Gray'; Margin = '0,8,0,0'
@@ -215,8 +317,12 @@ function Read-Form {
 	$settings.fps120     = $fps120.Checked
 	$settings.vsync      = $vsync.Checked
 	$settings.hdr        = $hdr.Checked
+	$settings.hud        = $hud.SelectedIndex
 	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
+	$settings.ratio      = ([string]$ratio.SelectedItem -split ' ')[0]
 	$settings.quality    = ([string]$quality.SelectedItem -split ' ')[0].ToLowerInvariant()
+	# (Kept as it was where the DLLs are missing.)
+	if ($frameGenAvailable) { $settings.framegen = if ($frameGen.SelectedIndex -gt 0) { $frameGen.SelectedIndex + 1 } else { 0 } }
 	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
@@ -228,6 +334,10 @@ $play.Add_Click({
 $precompile.Add_Click({
 	Read-Form
 	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand)`"" -WorkingDirectory $root
+})
+$share.Add_Click({
+	Read-Form
+	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand '-ExportHints')`"" -WorkingDirectory $root
 })
 $logs.Add_Click({
 	$folder = if (Test-Path "$root\_Build") { "$root\_Build\run-logs" } else { "$root\logs" }

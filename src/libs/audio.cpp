@@ -10,12 +10,14 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
+#include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -77,7 +79,10 @@ public:
 
 	struct OutputParam {
 		Id          handle;
-		const void* data = nullptr;
+		const void* data  = nullptr;
+		// One gain for each of the port's channels, from the guest's per-channel gain attribute
+		// (see AudioInternal::OutputParam): where a pad's speaker and vibration levels are set.
+		const float* gains = nullptr;
 	};
 
 	Audio() = default;
@@ -143,7 +148,7 @@ private:
 	static void            CloseSdlDevice(PortOut* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
-	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
+	static bool            QueueSdlAudio(PortOut* port, const void* data, const float* gains, bool blocking);
 	void                   NoteOutputs(const OutputParam* params, uint32_t num);
 };
 
@@ -180,7 +185,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	for (uint32_t i = 0; i < num; i++) {
 		if (params[i].handle > 0 && params[i].data != nullptr) {
 			output_params.push_back(
-			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data});
+			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data, params[i].gains});
 		}
 	}
 
@@ -239,6 +244,65 @@ SDL_AudioFormat Audio::SdlFormat(Format format) {
 	return FormatIsFloat(format) ? AUDIO_F32SYS : AUDIO_S16SYS;
 }
 
+// The host output device the DualSense's haptics and speaker play on: Windows and Linux list the
+// pad's USB audio interface as an output device of its own ("Speakers (DualSense Wireless
+// Controller)"). The name is matched, so a localized prefix is fine, but an ambiguous match is
+// refused: playing the game's audio on the wrong device is worse than not playing it (the
+// mainline's DualSenseHaptics refuses ambiguous USB or Bluetooth endpoints for the same reason).
+// Diagnostic for now: it only says which device would be used (see the AUDIO-DEVICE lines).
+static std::string FindControllerAudioDevice() {
+	if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+		return {};
+	}
+
+	std::string matched;
+	const int   devices = SDL_GetNumAudioDevices(0);
+	for (int i = 0; i < devices; i++) {
+		const char* name = SDL_GetAudioDeviceName(i, 0);
+		if (name == nullptr) {
+			continue;
+		}
+		std::string lower = name;
+		for (auto& c : lower) {
+			if (c >= 'A' && c <= 'Z') {
+				c = static_cast<char>(c - 'A' + 'a');
+			}
+		}
+		if (lower.find("dualsense") == std::string::npos &&
+		    lower.find("wireless controller") == std::string::npos) {
+			continue;
+		}
+		if (!matched.empty()) {
+			return {}; // ambiguous: two pads, or an endpoint per interface
+		}
+		matched = name;
+	}
+	return matched;
+}
+
+// Lists the host's output devices once, and which of them the DualSense's audio would use.
+static void LogAudioDevicesOnce() {
+	static bool logged = false;
+	if (logged || SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+		return;
+	}
+	logged = true;
+
+	const int devices = SDL_GetNumAudioDevices(0);
+	std::printf("AudioOut: %d output device(s), default is the one the main ports use\n", devices);
+	for (int i = 0; i < devices; i++) {
+		const char* name = SDL_GetAudioDeviceName(i, 0);
+		std::printf("AudioOut:   [%d] %s\n", i, name != nullptr ? name : "(null)");
+	}
+	const auto controller_device = FindControllerAudioDevice();
+	if (controller_device.empty()) {
+		std::printf("AudioOut: no DualSense-named output device (SDL names only; the pad's endpoint "
+		            "is used by USB id regardless)\n");
+	} else {
+		std::printf("AudioOut: DualSense audio endpoint by name: %s\n", controller_device.c_str());
+	}
+}
+
 bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
@@ -246,6 +310,8 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
 		return false;
 	}
+
+	LogAudioDevicesOnce();
 
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
@@ -399,11 +465,75 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, bool blocking) {
 	EXIT_IF(port == nullptr);
 
-	if (port->audio_device == 0 || data == nullptr) {
+	if (data == nullptr) {
 		return false;
+	}
+
+	// The pad routes are silent while the guest keeps writing into them, so a log has to say whether
+	// the guest's own samples are silent or this port's volume scaled them away: this prints the raw
+	// samples' peak and the volume the port carries, next to the prepared peak the module reports.
+	const auto report_pad_samples = [&](bool speaker) {
+		static int speaker_reports   = 0;
+		static int vibration_reports = 0;
+		auto&      reports           = speaker ? speaker_reports : vibration_reports;
+		const auto channels          = PreparedChannels(*port);
+		if (reports >= 8 || port->samples_num == 0 || channels == 0) {
+			return;
+		}
+		reports++;
+
+		const auto count = static_cast<size_t>(port->samples_num) * channels;
+		float      peak  = 0.0f;
+		if (FormatIsFloat(port->format)) {
+			const auto* samples = static_cast<const float*>(data);
+			for (size_t i = 0; i < count; i++) {
+				const float value = samples[i] < 0.0f ? -samples[i] : samples[i];
+				peak              = value > peak ? value : peak;
+			}
+		} else {
+			const auto* samples = static_cast<const int16_t*>(data);
+			for (size_t i = 0; i < count; i++) {
+				const float value = (samples[i] < 0 ? -static_cast<float>(samples[i])
+				                                   : static_cast<float>(samples[i])) /
+				                    32768.0f;
+				peak = value > peak ? value : peak;
+			}
+		}
+		std::printf("AudioOut: %s raw samples %zu peak %.4f, port volume %d/%d (32768 is full)\n",
+		            speaker ? "pad speaker" : "vibration", count, static_cast<double>(peak),
+		            port->volume[0], port->volume[1]);
+	};
+
+	// A vibration port has no main output: its audio drives the pad's own actuators instead (the
+	// DualSense's USB audio endpoint, whose second channel pair is the haptics). The guest's own
+	// per-channel gain goes with it: a DualSense's vibration and speaker levels are set there, and
+	// without it the actuators and the pad's speaker play far too quietly. Best effort: when the
+	// endpoint is behind, the audio is dropped rather than delaying the guest's audio thread.
+	if (port->audio_device == 0) {
+		if (port->type == AUDIO_OUT_PORT_TYPE_VIBRATION && Controller::DualSenseHaptics::Available()) {
+			report_pad_samples(false);
+			std::vector<uint8_t> prepared_buffer;
+			const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
+			return Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq,
+			                                           PreparedChannels(*port),
+			                                           FormatIsFloat(port->format), false, gains);
+		}
+		return false;
+	}
+
+	// A pad speaker port whose samples the pad takes plays only there: playing them on the main
+	// output as well would be heard as an echo, because the two paths' latencies differ. Without the
+	// pad (or with its speaker route closed) they stay on the main output, as they always did.
+	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK && Controller::DualSenseHaptics::SpeakerActive()) {
+		report_pad_samples(true);
+		std::vector<uint8_t> prepared_buffer;
+		const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
+		return Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq,
+		                                           PreparedChannels(*port),
+		                                           FormatIsFloat(port->format), true, gains);
 	}
 
 	std::vector<uint8_t> prepared_buffer;
@@ -411,6 +541,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	const auto           output_channels = PreparedChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
+
+	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+		report_pad_samples(true);
+	}
 
 	std::vector<uint8_t> convert_buffer;
 	const void*          queue_data = prepared_data;
@@ -465,6 +599,8 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		return false;
 	}
 
+	// A pad speaker port reaches this point only when the pad did not take it (see above): its
+	// samples belong on the main output alone.
 	return true;
 }
 
@@ -499,6 +635,22 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				port.volume[i] = 32768;
 			}
 
+			// The console's own diagnostics use printf because LOGF is silent by default.
+			std::printf("AudioOut: port %d: type %d, %u Hz, %u samples, format 0x%08x, %d channel(s)\n",
+			            id, type, freq, samples_num, static_cast<uint32_t>(format), port.channels_num);
+
+			if (type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+				// The vibration port plays on the pad's actuators and the pad speaker port on its
+				// speaker: the two routes of the pad's own USB audio endpoint (see
+				// libs/dualSenseHaptics.h). Without that endpoint the vibration port has no host
+				// path and stays silent, as it always did, and the pad speaker port keeps playing
+				// on the main output below.
+				const bool pad_speaker = type == AUDIO_OUT_PORT_TYPE_PADSPK;
+				if (!Controller::DualSenseHaptics::Open(pad_speaker)) {
+					std::printf("AudioOut: port %d has no pad path (%s)\n", id,
+					            pad_speaker ? "speaker" : "vibration");
+				}
+			}
 			if (type != AUDIO_OUT_PORT_TYPE_VIBRATION) {
 				OpenSdlDevice(&port);
 			}
@@ -516,6 +668,9 @@ bool Audio::AudioOutClose(Id handle) {
 	if (AudioOutValid(handle)) {
 		auto& port = m_out_ports[handle.GetId()];
 
+		if (port.type == AUDIO_OUT_PORT_TYPE_VIBRATION || port.type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+			Controller::DualSenseHaptics::Close(port.type == AUDIO_OUT_PORT_TYPE_PADSPK);
+		}
 		CloseSdlDevice(&port);
 		port = {};
 
@@ -559,6 +714,21 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 	if (AudioOutValid(handle)) {
 		auto& port = m_out_ports[handle.GetId()];
+
+		// The console's LOGF is silent in the release configuration, and this is where a pad speaker
+		// port's level (or its silencing) comes from: show the first calls and every port type, so a
+		// log says whether the guest asked for a pad speaker level at all.
+		static int volume_reports = 0;
+		const bool report         = volume_reports < 24 && port.type != AUDIO_OUT_PORT_TYPE_MAIN;
+		if (report) {
+			volume_reports++;
+			std::printf("AudioOut: port %d (type %d, %d ch) volume: bitflag 0x%x", handle.GetId(),
+			            port.type, port.channels_num, bitflag);
+			for (int i = 0; i < port.channels_num; i++) {
+				std::printf(" %d", volume != nullptr ? volume[i] : -1);
+			}
+			std::printf("\n");
+		}
 
 		for (int i = 0; i < port.channels_num; i++, bitflag >>= 1u) {
 			auto bit = bitflag & 0x1u;
@@ -651,7 +821,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
 
-		QueueSdlAudio(&port, params[i].data, blocking);
+		QueueSdlAudio(&port, params[i].data, params[i].gains, blocking);
 	}
 
 	for (uint32_t i = 0; i < num; i++) {

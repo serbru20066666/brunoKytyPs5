@@ -331,6 +331,18 @@ static std::filesystem::path capacity_metadata(std::string_view name) {
 	       (std::string(name) + ".blocks");
 }
 
+// A slot's modification time (time_t) as the PS5 reports it: the time of its last write, here its newest file.
+static int64_t save_data_mtime(const std::filesystem::path& directory) {
+	int64_t newest = 0;
+	for (const auto& entry: Common::File::GetDirEntries(directory)) {
+		if (entry.is_file) {
+			newest = std::max(newest, static_cast<int64_t>(
+			                              Common::File::GetLastWriteTimeUTC(directory / entry.name).ToUnix()));
+		}
+	}
+	return newest;
+}
+
 static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
@@ -423,37 +435,70 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
-	});
-
-	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
+	// Sorted by the key the game asks for, ties by name. Games pick the slot to continue from this order or from
+	// the reported times (Demon's Souls' Continue: the newest PlayerProfile); sorting by name only made it load
+	// PlayerProfile0 whichever character was played last (issue #26).
+	struct Slot {
+		std::string name;
+		int64_t     mtime;
+		uint64_t    blocks;
+		uint64_t    free_blocks;
+		bool        capacity;
+	};
+	std::vector<Slot> slots;
+	for (const auto& name: dir_list) {
+		const auto directory = std::filesystem::path(root) / name;
+		const auto capacity  = ReadSaveDataCapacity(directory, capacity_metadata(name));
+		slots.push_back({name, save_data_mtime(directory), capacity ? capacity->blocks : 0,
+		                 capacity ? capacity->free_blocks : 0, capacity.has_value()});
+	}
+	std::sort(slots.begin(), slots.end(), [key = cond->key](const Slot& a, const Slot& b) {
+		uint64_t va = 0;
+		uint64_t vb = 0;
+		switch (key) {
+			case SaveDataSortKey::Mtime:
+				va = static_cast<uint64_t>(a.mtime);
+				vb = static_cast<uint64_t>(b.mtime);
+				break;
+			case SaveDataSortKey::Blocks:
+				va = a.blocks;
+				vb = b.blocks;
+				break;
+			case SaveDataSortKey::FreeBlocks:
+				va = a.free_blocks;
+				vb = b.free_blocks;
+				break;
+			default: break; // DirName; UserParam is not kept (SaveDataSetParam stores nothing)
 		}
-		dir_list = reversed;
+		return va != vb ? va < vb : std::strcmp(a.name.c_str(), b.name.c_str()) < 0;
+	});
+	if (cond->order == SaveDataSortOrder::Descent) {
+		std::reverse(slots.begin(), slots.end());
 	}
 
-	auto max_count =
-	    (result->dir_names_num < dir_list.size() ? result->dir_names_num : dir_list.size());
+	auto max_count = (result->dir_names_num < slots.size() ? result->dir_names_num : slots.size());
 
-	result->hit_num = static_cast<uint32_t>(dir_list.size());
+	result->hit_num = static_cast<uint32_t>(slots.size());
 	result->set_num = static_cast<uint32_t>(max_count);
 
+	std::printf("SaveData: search %s by key %" PRIu32 "%s: %zu slots, first %s\n",
+	            cond->dir_name != nullptr && cond->dir_name->data[0] != '\0' ? cond->dir_name->data : "<all>",
+	            static_cast<uint32_t>(cond->key), cond->order == SaveDataSortOrder::Descent ? " descending" : "",
+	            slots.size(), slots.empty() ? "-" : slots.front().name.c_str());
+
 	for (size_t i = 0; i < max_count; i++) {
+		const auto& slot = slots[i];
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
-		              dir_list[i].c_str());
+		              slot.name.c_str());
 		if (result->params != nullptr) {
-			result->params[i] = {};
+			result->params[i]       = {};
+			result->params[i].mtime = slot.mtime;
 		}
 		if (result->infos != nullptr) {
-			result->infos[i]             = {};
-			const auto capacity = ReadSaveDataCapacity(std::filesystem::path(root) / dir_list[i],
-			                                               capacity_metadata(dir_list[i]));
-			if (!capacity) { return SAVE_DATA_ERROR_INTERNAL; }
-			result->infos[i].blocks = capacity->blocks;
-			result->infos[i].free_blocks = capacity->free_blocks;
+			result->infos[i] = {};
+			if (!slot.capacity) { return SAVE_DATA_ERROR_INTERNAL; }
+			result->infos[i].blocks      = slot.blocks;
+			result->infos[i].free_blocks = slot.free_blocks;
 		}
 	}
 
@@ -767,11 +812,23 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
+	// The mounted slot's modification time (ALL and MTIME); titles and user_param are not kept (SetParam).
+	int64_t mtime = 0;
+	{
+		Common::LockGuard lock(g_mount_mutex);
+		const int         slot = g_mount_slots.Find(mount_point->data);
+		if (slot != SaveDataMountSlots::FULL) {
+			mtime = save_data_mtime(std::filesystem::path(SAVE_DATA_DIR) / get_title_id() /
+			                        g_mount_slots.Directory(static_cast<size_t>(slot)));
+		}
+	}
+
 	if (param_type == 0) {
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		static_cast<SaveDataParam*>(param_buf)->mtime = mtime;
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -779,6 +836,9 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	}
 
 	std::memset(param_buf, 0, param_buf_size);
+	if (param_type == 5 && param_buf_size >= sizeof(mtime)) {
+		std::memcpy(param_buf, &mtime, sizeof(mtime));
+	}
 	if (got_size != nullptr) {
 		*got_size = param_buf_size;
 	}

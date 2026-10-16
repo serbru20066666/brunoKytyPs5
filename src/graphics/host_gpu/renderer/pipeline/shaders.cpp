@@ -257,6 +257,7 @@ constexpr size_t HandleSpace = size_t {1} << 22u;
 alignas(64) uint8_t g_handles[HandleSpace];
 
 struct Entry {
+	uint64_t file       = 0; // the store's (g_file) or another's (AddFrom)
 	uint64_t offset     = 0;
 	uint32_t stored     = 0; // bytes in the file
 	uint32_t words      = 0;
@@ -281,6 +282,19 @@ size_t                   g_recent_next = 0;
 size_t IndexOf(vk::ShaderModule module) {
 	return reinterpret_cast<const uint8_t*>(static_cast<VkShaderModule>(module)) - g_handles;
 }
+
+vk::ShaderModule Push(const Entry& entry) {
+	size_t index = 0;
+	{
+		std::unique_lock lock(g_mutex);
+		index = g_entries.size();
+		if (index >= HandleSpace) return nullptr;
+		g_entries.push_back(entry);
+	}
+	g_live.fetch_add(1, std::memory_order_relaxed);
+	g_spirv_bytes.fetch_add(uint64_t {entry.words} * sizeof(uint32_t), std::memory_order_relaxed);
+	return vk::ShaderModule(reinterpret_cast<VkShaderModule>(&g_handles[index]));
+}
 } // namespace
 
 void Enable(bool maintenance5) {
@@ -304,17 +318,14 @@ vk::ShaderModule Add(const std::vector<uint32_t>& spirv) {
 	const auto        stored      = compressed ? packed_size : bytes;
 	const auto        offset      = g_end.fetch_add(stored, std::memory_order_relaxed);
 	if (stored > UINT32_MAX || !LocalPlatform::WriteScratchFile(g_file, offset, data, stored)) return nullptr;
-	size_t index = 0;
-	{
-		std::unique_lock lock(g_mutex);
-		index = g_entries.size();
-		if (index >= HandleSpace) return nullptr;
-		g_entries.push_back({offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
-	}
-	g_live.fetch_add(1, std::memory_order_relaxed);
-	g_spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
-	g_stored_bytes.fetch_add(stored, std::memory_order_relaxed);
-	return vk::ShaderModule(reinterpret_cast<VkShaderModule>(&g_handles[index]));
+	const auto module = Push({g_file, offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
+	if (module) g_stored_bytes.fetch_add(stored, std::memory_order_relaxed);
+	return module;
+}
+
+vk::ShaderModule AddFrom(uint64_t file, uint64_t offset, uint32_t stored, uint32_t words, bool compressed) {
+	if (!Enabled() || file == 0 || words == 0) return nullptr;
+	return Push({file, offset, stored, words, compressed});
 }
 
 bool Holds(vk::ShaderModule module) {
@@ -342,10 +353,10 @@ std::shared_ptr<const std::vector<uint32_t>> Load(vk::ShaderModule module) {
 	const auto bytes = spirv->size() * sizeof(uint32_t);
 	if (entry.compressed) {
 		std::vector<char> packed(entry.stored);
-		if (!LocalPlatform::ReadScratchFile(g_file, entry.offset, packed.data(), packed.size()) ||
+		if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, packed.data(), packed.size()) ||
 		    ZSTD_decompress(spirv->data(), bytes, packed.data(), packed.size()) != bytes)
 			return nullptr;
-	} else if (!LocalPlatform::ReadScratchFile(g_file, entry.offset, spirv->data(), bytes)) {
+	} else if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, spirv->data(), bytes)) {
 		return nullptr;
 	}
 	std::lock_guard lock(g_recent_mutex);
@@ -796,6 +807,27 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	return create(nullptr, info);
 }
 
+// KYTY_PS_WAVE64=1 (a test for issue #24: AMD's 26.9.2 driver runs pixel shaders on 32-lane subgroups, 26.9.1 on 64, and
+// the mosaics on see-through effects came back with it): pixel shaders on 64-lane subgroups, where the GPU lets a
+// pipeline require that; the log says which.
+static bool PixelWave64Required(const GraphicContext& graphics) {
+	static const bool required = [&] {
+		const char* value = std::getenv("KYTY_PS_WAVE64");
+		if (value == nullptr || std::string_view(value) != "1") return false;
+		if (graphics.fragment_wave64_requirable) {
+			std::printf("Pixel shaders: 64-lane subgroups required (KYTY_PS_WAVE64=1)\n");
+		} else {
+			std::printf("KYTY_PS_WAVE64=1: this GPU lets no pipeline require a pixel shader subgroup size (sizes %u-%u, "
+			            "required sizes for stages 0x%x)\n",
+			            graphics.min_subgroup_size, graphics.max_subgroup_size,
+			            static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages));
+		}
+		std::fflush(stdout);
+		return graphics.fragment_wave64_requirable;
+	}();
+	return required;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -859,6 +891,11 @@ void CreatePipelineInternal(
 	frag_shader_stage_info.stage  = vk::ShaderStageFlagBits::eFragment;
 	frag_shader_stage_info.module = pixel_program.module;
 	frag_shader_stage_info.pName  = "main";
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo frag_subgroup_size {};
+	if (PixelWave64Required(graphics)) {
+		frag_subgroup_size.requiredSubgroupSize = 64;
+		frag_shader_stage_info.pNext            = &frag_subgroup_size;
+	}
 
 	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
 	tess_control_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationControl;

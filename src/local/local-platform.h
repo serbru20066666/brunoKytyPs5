@@ -48,6 +48,11 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 // A kept file read whole once, in the background (the first call for the path; Windows only): its later reads come from
 // the system file cache.
 void PrefetchKeptFile(const std::string& path);
+// The game's file opens followed (Windows; once, KYTY_FILE_FOLLOW=0: not): `recording` lists the files OpenKeptReadFile
+// opened in earlier sessions in the order first opened (one a line, relative to `root` where under it; this session's
+// new ones appended). Each one the game opens, or first reads after it was opened here, has the 1024 recorded after it
+// opened on threads of their own, ahead of the game's reads.
+void FollowKeptFiles(const std::string& recording, const std::string& root);
 
 // Stack bounds of the calling thread; false when unknown.
 bool CurrentThreadStack(uint64_t* low, uint64_t* high);
@@ -63,6 +68,16 @@ void MakeBackgroundThread(const char* avoid_cpus);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
+
+// The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).
+int DisplayRefreshHz(void* window);
+// Vertical blanks of that display, counted by a thread of their own that waits for each (Windows:
+// D3DKMTWaitForVerticalBlankEvent on the window's display, again when the window moves to another one); a window
+// passed again replaces the first. false where there are none.
+bool StartDisplayVblanks(void* window);
+// Waits up to `timeout_us` for a display vblank after the `seen`th one; `seen` then counts it. Several that came while
+// the caller was away are taken one call each (four at most). false on a timeout or without StartDisplayVblanks.
+bool WaitDisplayVblank(uint64_t& seen, uint32_t timeout_us);
 
 // A temporary file for scratch data, deleted when it is closed or the process ends (Windows keeps it
 // in memory while it can: FILE_ATTRIBUTE_TEMPORARY); 0 when none could be made. Writes and reads go
@@ -105,6 +120,10 @@ bool OpenVideoMemoryAdapter(const uint8_t* luid);
 bool QueryVideoMemory(uint64_t* usage, uint64_t* budget);
 // The process's system memory the GPU uses (Task Manager's shared GPU memory).
 bool QuerySharedGpuMemory(uint64_t* usage);
+
+// The file's Authenticode signature is valid (no network: revocation not checked) and its signer is NVIDIA
+// Corporation: NVIDIA's DLLs the emulator loads (Streamline for frame generation, DLSS). false elsewhere.
+bool IsNvidiaSigned(const std::wstring& path);
 
 #if defined(_WIN32)
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process

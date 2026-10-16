@@ -29,6 +29,7 @@
 #include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
 #include "local-platform.h"
+#include "perf-overlay.h"
 #include "slow-log.h"
 #include "time-census.h"
 
@@ -98,10 +99,14 @@ inline void NoteRenderIdle(int64_t now_ns) {
 // The line also has the frame's render-thread wait for guest work, what some counters did in it and its
 // wall-clock time.
 inline void Flip() {
-	const auto flip = g_flips.load(std::memory_order_relaxed);
-	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
-	                                     std::memory_order_relaxed);
+	const auto flip    = g_flips.load(std::memory_order_relaxed);
+	const auto flip_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                         std::chrono::steady_clock::now().time_since_epoch())
+	                         .count();
+	g_flip_times[flip % FlipTimes].store(flip_ns, std::memory_order_relaxed);
 	g_flips.store(flip + 1, std::memory_order_release);
+	// (KYTY_FPS_HUD's frame-time graph: the frame and the render thread's busy part of it.)
+	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,

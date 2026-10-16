@@ -63,16 +63,28 @@ std::optional<uint64_t> FindUniqueData(const Program& program, std::span<const u
 	return found.size() == 1 ? std::optional(found[0]) : std::nullopt;
 }
 
+double g_wide_aspect = 0.0; // the aspect KYTY_RENDER_ASPECT installed (0: 16:9)
+
 } // namespace
+
+double WideAspect() {
+	return g_wide_aspect;
+}
 
 void Install(Program* program) {
 	const char* setting = std::getenv("KYTY_RENDER_HEIGHT");
-	if (setting == nullptr || *setting == 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
-	    program->file_name.filename() != "eboot.bin")
+	const char* wide    = std::getenv("KYTY_RENDER_ASPECT");
+	if (((setting == nullptr || *setting == 0) && (wide == nullptr || *wide == 0)) || program == nullptr ||
+	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
-	const auto requested = static_cast<uint32_t>(std::strtoul(setting, nullptr, 10));
-	if (requested == RenderHeight) return;
-	const auto size = RenderSizeFor(requested);
+	const auto requested = setting != nullptr && *setting != 0 ? static_cast<uint32_t>(std::strtoul(setting, nullptr, 10))
+	                                                           : RenderHeight;
+	const auto aspect    = wide != nullptr && *wide != 0 ? ParseAspect(wide) : 0.0;
+	if (wide != nullptr && *wide != 0 && aspect == 0.0)
+		std::printf("Demon's Souls render size: KYTY_RENDER_ASPECT=%s is not wider than 16:9 and at most 32:9; 16:9 kept\n",
+		            wide);
+	if (requested == RenderHeight && aspect == 0.0) return;
+	const auto size = RenderSizeFor(requested, aspect != 0.0 ? aspect : GameAspect);
 	if (size.height == 0) {
 		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%s is not 720-1440; the game's 2560x1440 kept\n", setting);
 		return;
@@ -80,7 +92,13 @@ void Install(Program* program) {
 	const auto constant = FindRenderConstant(*program);
 	const auto widths   = FindUniqueData(*program, std::span(reinterpret_cast<const uint8_t*>(ModeWidths), sizeof(ModeWidths)));
 	const auto heights  = FindUniqueData(*program, std::span(reinterpret_cast<const uint8_t*>(ModeHeights), sizeof(ModeHeights)));
-	if (!constant || !widths || !heights) {
+	// (The render setup's 16:9: the one such store in the code.)
+	std::optional<uint64_t> aspect_store;
+	if (aspect != 0.0) {
+		const auto sites = GuestCode::Find(*program, GuestCode::Pattern(AspectStore), 2);
+		if (sites.size() == 1) aspect_store = sites[0];
+	}
+	if (!constant || !widths || !heights || (aspect != 0.0 && !aspect_store)) {
 		std::printf("Demon's Souls render size: the video settings of a known build not found; the game's 2560x1440 kept\n");
 		return;
 	}
@@ -89,8 +107,15 @@ void Install(Program* program) {
 	std::memcpy(reinterpret_cast<void*>(*constant), pair, sizeof(pair));
 	std::memcpy(reinterpret_cast<void*>(*widths + PerformanceMode * sizeof(uint32_t)), &size.width, sizeof(uint32_t));
 	std::memcpy(reinterpret_cast<void*>(*heights + PerformanceMode * sizeof(uint32_t)), &size.height, sizeof(uint32_t));
-	std::printf("Demon's Souls render size: performance mode renders %ux%u instead of %ux%u (output %ux%u)\n", size.width,
-	            size.height, RenderWidth, RenderHeight, OutputWidth, OutputHeight);
+	if (aspect_store) {
+		// The projection's aspect: the render size's own, as the game's 2560x1440 has 16/9.
+		const float value = static_cast<float>(static_cast<double>(size.width) / size.height);
+		std::memcpy(reinterpret_cast<void*>(*aspect_store + 3), &value, sizeof(value));
+		g_wide_aspect = value;
+	}
+	std::printf("Demon's Souls render size: performance mode renders %ux%u instead of %ux%u (output %ux%u)%s\n", size.width,
+	            size.height, RenderWidth, RenderHeight, OutputWidth, OutputHeight,
+	            aspect_store ? ", its projection as wide" : "");
 }
 
 } // namespace Loader::DemonsSoulsRenderSize

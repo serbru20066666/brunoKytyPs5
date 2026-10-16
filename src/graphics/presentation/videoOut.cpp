@@ -1,6 +1,5 @@
 #include "graphics/presentation/videoOut.h"
 #include "live-counters.h"
-#include "local-platform.h"
 #include "live-trace.h"
 #include "time-census.h"
 
@@ -30,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <list>
@@ -191,7 +191,6 @@ struct VideoOutConfig {
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
 	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
-	uint64_t                            next_flip_due_qpc = 0; // QueryPerformanceCounter the next flip may be shown at (FlipWhenReady)
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -501,14 +500,33 @@ static int FlipRateFloor() {
 	return floor;
 }
 
-// Movies decoded through the system's decoders (VideoDec2, AvPlayer) advance a frame per flip: above a
-// 60 Hz vblank (-Fps120) they played too fast. While one decodes, flips keep the console's 60 per second.
+// Above 60 Hz (-Fps120): at least vblank/60 vblanks between the flips of frames without the game's 3D view
+// (Presenter::IsSceneFrame: movies, menus, loading screens), the console's 60 Hz. The game's Bink movies advance a
+// frame per flip (the intro played in 54 s instead of 113 at 120 Hz, ahead of its music); menus gain nothing.
+static int SceneFreeFloor() {
+	static const int floor =
+	    std::max(0, static_cast<int>(std::lround(static_cast<double>(Config::GetVblankFrequency()) / 60.0)) - 1);
+	return floor;
+}
+
+// Frame generation above 60 Hz: the game's frames too keep 60 (KYTY_FRAMEGEN_BASE=<Hz>: another rate, 0: none). DLSS-G
+// paces the frames it generates from the intervals between the game's own; on the 120 Hz vblanks a game between 60 and
+// 120 fps flipped after one vblank or two by turns (8.3 or 16.7 ms, 3-25 ms with late vblanks; at 60 Hz 16.7 +- 0.3 ms),
+// and its frames stuttered (issue #29).
+static int FrameGenFloor() {
+	static const int floor = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_BASE");
+		const int   base  = value != nullptr ? std::max(0, std::atoi(value)) : 60;
+		if (base == 0) return 0;
+		return std::max(0, static_cast<int>(std::lround(static_cast<double>(Config::GetVblankFrequency()) / base)) - 1);
+	}();
+	return floor;
+}
+
+// Movies decoded through the system's decoders (VideoDec2, AvPlayer) note each frame: frame generation stays off while
+// one plays (frame-gen.cpp, fsr3-fg.cpp).
 static std::atomic<int64_t> g_movie_frame_ns {0};
 void NoteMovieFrame() noexcept {
-	if (g_movie_frame_ns.load(std::memory_order_relaxed) == 0) {
-		std::printf("Movie playback: decoded through the system decoder; flips stay at 60 a second while it plays\n");
-		std::fflush(stdout);
-	}
 	g_movie_frame_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
 bool MoviePlaying() noexcept {
@@ -518,185 +536,28 @@ bool MoviePlaying() noexcept {
 	return now - last < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(500)).count();
 }
 
-// KYTY_FLIP_WHEN_READY=1: a ready frame is presented as soon as one vblank period has passed since the
-// last flip, not at the next vblank tick. A frame that took 18 ms waited for the 33 ms tick (the display saw
-// 16.7 / 33.3 ms steps, 46-52 fps with a juddering frame time graph); now it shows at 18 ms, which a VRR
-// (G-Sync / FreeSync) display follows smoothly. The vblank itself keeps its 60 Hz (the game's clock), and
-// flips stay at most one per vblank period, so the game's speed and its movies are unchanged.
-// KYTY_FLIP_FPS=<fps>: the game's 3D view is shown at most that many frames a second, evenly spaced (e.g. 45, which
-// frame generation doubles to 90). Only frames with the game's TAA pass (gameplay and in-engine scenes); menus,
-// loading screens and movies keep their rate. Implies flip-when-ready (below). The vblank keeps its 60 Hz, the game's
-// clock: the game runs at that rate as on a slower frame, its speed unchanged.
-static uint32_t FlipFpsCap() {
-	static const uint32_t cap = [] {
+// KYTY_FLIP_FPS=<fps>: the game's 3D view is flipped at most that many times a second, a whole number of vblanks apart
+// (the launcher's Smooth Souls: 40 on a 120 Hz vblank, 3 vblanks). Menus, loading screens and movies keep their rate.
+static int FlipFpsFloor() {
+	static const int floor = [] {
 		const char* value = std::getenv("KYTY_FLIP_FPS");
 		const int   fps   = value != nullptr ? std::atoi(value) : 0;
-		const auto  result = static_cast<uint32_t>(std::clamp(fps, 0, 240));
-		if (result != 0) {
-			std::printf("Flips: the game's 3D view held to %u fps (KYTY_FLIP_FPS)\n", result);
-			std::fflush(stdout);
-		}
-		return result;
-	}();
-	return cap;
-}
-
-// KYTY_FLIP_PACE=1: even pacing. The game's 3D view is flipped at a steady rate: the median cost of the last 31 real
-// frames, rounded up to a whole number of vblank periods (60 / 30 / 20 fps at 60 Hz; finer on a 120 Hz vblank). A
-// frame's cost is the time between two completed game frames minus the time the guest spent blocked on flips, so the
-// pacer's own delays do not raise its target. Early flips wait; late ones (a spike) go at once and re-anchor
-// (ScheduleNextFlipLocked). It only delays: no guest frame is dropped or skipped, and every one is presented, with
-// DLSS-G, FSR3 FG or none. KYTY_FLIP_FPS, when set, is a floor on the spacing as before. Implies flip-when-ready.
-// KYTY_FLIP_PACE=2: drop cap. Uncapped while frames keep 60 fps; the first real frame slower than 17.5 ms (or than the
-// current cap + 1.5 ms) caps the 3D view at 50 fps at once (a further drop lowers it 2 fps at a time, down to 30), so a sudden drop shows as 180 -> 150 with FG x3 instead of
-// an uneven 40-57. Every second without a drop the cap rises by 2 fps (52, 54 ... 58) until 60, then it is lifted.
-// Measured on the real interval between completed game frames; frames slower than the cap still go at once.
-static int FlipPaceMode() {
-	static const int mode = [] {
-		const char* value = std::getenv("KYTY_FLIP_PACE");
-		const int   result = value != nullptr ? std::clamp(std::atoi(value), 0, 2) : 0;
-		if (result == 1) std::printf("Flips: the game's 3D view paced to the median frame time (KYTY_FLIP_PACE=1)\n");
-		if (result == 2) std::printf("Flips: drop cap 50 fps, -2 per drop (min 30), +2 per steady second up to 60 (KYTY_FLIP_PACE=2)\n");
+		if (fps <= 0) return 0;
+		const int result = std::max(0, static_cast<int>(std::lround(static_cast<double>(Config::GetVblankFrequency()) / fps)) - 1);
+		std::printf("Flips: the game's 3D view held to %u fps (KYTY_FLIP_FPS=%d, %d vblank(s) apart)\n",
+		            Config::GetVblankFrequency() / static_cast<uint32_t>(result + 1), fps, result + 1);
 		std::fflush(stdout);
 		return result;
 	}();
-	return mode;
+	return floor;
 }
 
-static bool FlipPace() { return FlipPaceMode() != 0; }
-
-static std::atomic<uint64_t> g_guest_blocked_qpc {0}; // total time guest threads waited in WaitFlipDone / for a slot
-static std::atomic<uint64_t> g_pace_step_qpc {0};     // the pacer's flip spacing (0: none yet)
-
-// Called under the flip queue's lock when a game-view frame becomes ready.
-static void PaceNoteFrame() {
-	static constexpr size_t kWindow = 31;
-	static std::array<uint64_t, kWindow> costs {};
-	static size_t   count = 0, next = 0;
-	static uint64_t last_ready = 0, last_blocked = 0, last_log = 0;
-	const uint64_t  now       = Common::Timer::QueryPerformanceCounter();
-	const uint64_t  blocked   = g_guest_blocked_qpc.load(std::memory_order_relaxed);
-	const auto      frequency = Common::Timer::QueryPerformanceFrequency();
-	const uint64_t  period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
-	if (last_ready != 0 && now - last_ready < frequency / 2) { // a pause (menu, load) of 0.5 s starts over
-		const uint64_t interval = now - last_ready;
-		const uint64_t idle     = std::min(blocked - last_blocked, interval);
-		costs[next] = interval - idle;
-		next        = (next + 1) % kWindow;
-		count       = std::min(count + 1, kWindow);
-	}
-	if (FlipPaceMode() == 2) {
-		static uint32_t cap_fps = 0;      // 0: uncapped (60)
-		static uint64_t level_since = 0;  // when the current level started without a drop
-		const uint64_t  interval    = last_ready != 0 ? now - last_ready : 0;
-		last_ready                  = now;
-		last_blocked                = blocked;
-		if (interval == 0 || interval >= frequency / 2) { level_since = now; return; } // pause, menu, load
-		const double limit_ms = cap_fps == 0 ? 17.5 : 1000.0 / cap_fps + 1.5;
-		const double ms       = static_cast<double>(interval) * 1000.0 / static_cast<double>(frequency);
-		const uint32_t before = cap_fps;
-		if (ms > limit_ms) {
-			cap_fps     = cap_fps == 0 ? 50 : std::max<uint32_t>(cap_fps - 2, 30);
-			level_since = now;
-		} else if (cap_fps != 0 && now - level_since >= frequency) {
-			cap_fps     = cap_fps + 2 >= 60 ? 0 : cap_fps + 2;
-			level_since = now;
-		}
-		if (cap_fps != before) {
-			g_pace_step_qpc.store(cap_fps == 0 ? 0 : frequency / cap_fps, std::memory_order_relaxed);
-			std::printf("[pace] cap %u fps (frame %.1f ms, was %u)\n", cap_fps == 0 ? 60u : cap_fps, ms, before == 0 ? 60u : before);
-			std::fflush(stdout);
-		}
-		return;
-	}
-	last_ready   = now;
-	last_blocked = blocked;
-	if (count < 8) return;
-	std::array<uint64_t, kWindow> sorted {};
-	std::copy_n(costs.begin(), count, sorted.begin());
-	std::nth_element(sorted.begin(), sorted.begin() + count / 2, sorted.begin() + count);
-	const uint64_t median    = sorted[count / 2];
-	const uint64_t tolerance = frequency / 2000; // 0.5 ms: a frame just over a period keeps that period
-	const uint64_t periods   = std::clamp<uint64_t>((median > tolerance ? median - tolerance : 0) / period + 1, 1, 4);
-	g_pace_step_qpc.store(periods * period, std::memory_order_relaxed);
-	if (now - last_log >= frequency) {
-		last_log = now;
-		std::printf("[pace] target %.1f fps (%llu vblank(s)), median frame cost %.2f ms over %zu frames\n",
-		            static_cast<double>(frequency) / static_cast<double>(periods * period),
-		            static_cast<unsigned long long>(periods), static_cast<double>(median) * 1000.0 / static_cast<double>(frequency),
-		            count);
-		std::fflush(stdout);
-	}
-}
-
-static bool FlipWhenReady() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_FLIP_WHEN_READY");
-		return (value != nullptr && *value != '\0' && *value != '0') || FlipFpsCap() != 0 || FlipPace();
-	}();
-	return enabled;
-}
-
-// KYTY_FLIP_DECOUPLE=1|2: the guest's flip completes when its frame is handed to the presentation thread, not when
-// the present call returns. A present that blocks (Streamline's Reflex sleep, DLSS-G's pacer, a full swapchain:
-// 24-35 ms a frame measured) then no longer holds the game's render thread in WaitFlipDone. The presented frame is
-// the presenter's own copy (PrepareFrame), so the guest may reuse its buffer at once. 1: the frame being presented
-// counts as done; 2: also the next ready frame behind it (one more frame of latency). No frame is dropped: the
-// flip queue's capacity (WaitForSubmitSlot) still bounds how far the guest runs ahead. All Streamline calls stay on
-// the presentation thread, in order, one token per presented frame.
-static int FlipDecouple() {
-	static const int depth = [] {
-		const char* value = std::getenv("KYTY_FLIP_DECOUPLE");
-		const int   result = value != nullptr ? std::clamp(std::atoi(value), 0, 2) : 0;
-		if (result != 0) {
-			std::printf("Flips: completed on hand-off to the presentation thread, %d frame(s) ahead (KYTY_FLIP_DECOUPLE)\n", result);
-			std::fflush(stdout);
-		}
-		return result;
-	}();
-	return depth;
-}
-
-// Minimum spacing between two flips (QueryPerformanceCounter units) in flip-when-ready mode.
-static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped, bool game_view) {
-	const auto     frequency = Common::Timer::QueryPerformanceFrequency();
-	const uint64_t period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
-	uint64_t       intervals = static_cast<uint64_t>(cfg.flip_rate) + 1u;
-	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) intervals = std::max<uint64_t>(intervals, ratio);
-	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) intervals = static_cast<uint64_t>(floor) + 1u;
-	uint64_t step = period * intervals;
-	if (const uint32_t cap = FlipFpsCap(); cap != 0 && game_view && !MoviePlaying()) step = std::max<uint64_t>(step, frequency / cap);
-	if (FlipPace() && game_view && !MoviePlaying()) step = std::max(step, g_pace_step_qpc.load(std::memory_order_relaxed));
-	return step;
-}
-
-// Called when a flip is about to be shown: schedules the earliest time for the next one. The schedule is
-// anchored, not measured from the moment the present returned: the present's own cost and the 1 ms poll
-// latency used to be added to every frame (16.7 + ~0.8 ms -> a steady 57 fps instead of 60). A flip that
-// comes late by less than a period keeps the phase (the next one may come a little sooner); a flip late by
-// a full period or more (a stall) re-anchors on now.
-static void ScheduleNextFlipLocked(VideoOutConfig& cfg, bool capped, bool game_view) {
-	const uint64_t now  = Common::Timer::QueryPerformanceCounter();
-	const uint64_t step = FlipStepQpc(cfg, capped, game_view);
-	const uint64_t due  = cfg.next_flip_due_qpc;
-	if (due == 0 || now >= due + step) {
-		cfg.next_flip_due_qpc = now + step;
-	} else {
-		cfg.next_flip_due_qpc = due + step;
-	}
-}
-
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
+// `floor`: at least floor + 1 vblanks since the last flip (beyond the game's own flip rate).
+static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, int floor) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	if (FlipWhenReady()) {
-		return Common::Timer::QueryPerformanceCounter() >= cfg.next_flip_due_qpc;
-	}
-	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) {
-		return cfg.vblank_status.count - cfg.last_flip_vblank >= ratio;
-	}
-	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) {
+	if (floor > cfg.flip_rate) {
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;
 	}
 	const int interval = cfg.flip_rate + 1;
@@ -998,40 +859,98 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	LocalPlatform::SetThreadName("Kyty.Present");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
 	int64_t total_wait = 0;
+	// VSync on a display refreshing at a whole multiple of the vblank rate: each vblank waits for `display_per_tick` of
+	// the display's (Presenter::DisplayVblanksPerTick, looked at again every 120 vblanks) instead of the timer. A display
+	// whose vblanks miss that rate keeps the timer for good: with a variable (or dynamic) refresh rate they follow the
+	// presents, and vblanks waiting for them would wait for the game.
+	uint32_t display_per_tick = 0;
+	uint64_t display_seen     = 0;
+	uint32_t display_check    = 0; // vblanks until DisplayVblanksPerTick
+	bool     display_refused  = false;
+	uint32_t display_ticks    = 0; // the vblanks timed since display_since (their average period checked every 120)
+	uint64_t display_since    = 0;
+	const auto refuse_display = [&](const char* what, double ms, double expected_ms) {
+		std::printf("VSync: %s %.3f ms, not %.3f ms (a variable refresh rate?): the vblanks keep their own clock\n", what, ms,
+		            expected_ms);
+		std::fflush(stdout);
+		display_refused  = true;
+		display_per_tick = 0;
+	};
 	while (!token.stop_requested()) {
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		const auto period  = std::max(frequency / refresh, uint64_t {1});
+
+		if (display_check-- == 0) {
+			display_check           = 120;
+			const uint32_t per_tick = display_refused ? 0 : m_presenter.DisplayVblanksPerTick(refresh);
+			if (per_tick != display_per_tick) {
+				if (per_tick != 0) {
+					std::printf("VSync: the %u Hz vblanks keep to the display's (%u to one)\n", refresh, per_tick);
+				} else {
+					std::printf("VSync: the display changed: the vblanks keep their own clock\n");
+				}
+				std::fflush(stdout);
+				display_per_tick = per_tick;
+				display_seen     = 0;
+				display_ticks    = 0;
+			}
+		}
+
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		bool       waited      = false; // for the display's vblanks
+		if (display_per_tick != 0) {
+			waited = true;
+			// Half a display refresh late: it has none at this rate. (The first wait: the display's thread may still be
+			// starting.)
+			const uint32_t interval_us = 1000000u / (refresh * display_per_tick);
+			bool           ok          = true;
+			uint64_t       last        = sleep_begin;
+			for (uint32_t i = 0; i < display_per_tick && ok; i++) {
+				const bool first = display_seen == 0;
+				last             = Common::Timer::QueryPerformanceCounter();
+				ok = m_presenter.WaitForDisplayVblank(display_seen, first ? 100000u : interval_us * 3 / 2);
+			}
+			const auto now = Common::Timer::QueryPerformanceCounter();
+			const auto ms  = [&](uint64_t ticks) { return static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency); };
+			if (!ok) {
+				refuse_display("no vblank from the display in", ms(now - last), interval_us / 1000.0);
+			} else if (display_ticks++ == 0) {
+				display_since = now;
+			} else if (display_ticks == 121) {
+				// (Within 1%: a 59.94 Hz display keeps 60 Hz vblanks, 0.1% slower; with a variable refresh rate the
+				// display waits for each present after a vblank, 3% or more.)
+				const double average  = ms(now - display_since) / 120.0;
+				const double expected = 1000.0 / refresh;
+				if (std::abs(average - expected) > expected * 0.01) {
+					refuse_display("a vblank kept to the display's took", average, expected);
+				}
+				display_ticks = 0;
+			}
+			total_wait = 0;
+		}
+		if (!waited && total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			if (FlipWhenReady() && !m_presenter.IsGuestPaused()) {
-				// Until the next vblank tick, in 1 ms steps: a frame that became ready is presented at once
-				// (IsFlipDueLocked keeps flips a vblank period apart).
-				const auto until = sleep_begin + static_cast<uint64_t>(total_wait);
-				while (!token.stop_requested() && Common::Timer::QueryPerformanceCounter() < until) {
-					if (!m_flip_queue.Flip(0)) Common::Thread::SleepMicro(1000);
-				}
-			} else {
-				Common::Thread::SleepMicro(static_cast<uint32_t>(
-				    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
-			}
+			Common::Thread::SleepMicro(static_cast<uint32_t>(
+			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
 		}
 		if (token.stop_requested()) {
 			break;
 		}
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
+		if (!waited) total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
-
+		// The frames go to the presenter's thread (Presenter::Submit): a present waiting for the display never holds
+		// up a vblank. Its idle refreshes (the last frame again, a blank one) only when it has nothing else.
 		if (m_presenter.IsGuestPaused()) {
-			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
-				m_presenter.Present(*frame, true);
+			if (m_presenter.PresentIdle()) {
+				if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+					m_presenter.Submit(*frame, true);
+				}
 			}
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
@@ -1041,19 +960,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented) presented = m_presenter.PresentSkippedIfDue();
-		// A shown overlay (the debug warp panel, a dialog) re-presented the last game frame at every vblank the
-		// game missed: an extra frame now and then (61-62 a second, uneven for frame generation such as
-		// Lossless Scaling), and so did every change of its text (the progress, the frame rate panel). While the game
-		// flips, its next frame carries the overlay; only a game stalled for 100 ms (a dialog, a loading pause) gets
-		// overlay-only presents.
-		static auto last_game_flip = std::chrono::steady_clock::now();
-		if (presented) last_game_flip = std::chrono::steady_clock::now();
-		const bool game_stalled = std::chrono::steady_clock::now() - last_game_flip > std::chrono::milliseconds(100);
-		if (!presented && game_stalled && m_presenter.NeedsSystemOverlayRefresh()) {
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && m_presenter.PresentIdle()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
-				m_presenter.Present(*frame, true);
-				presented = true;
+				m_presenter.Submit(*frame, true);
 			} else {
 				uint32_t width  = 0;
 				uint32_t height = 0;
@@ -1062,12 +971,11 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 					width  = m_video_out_ctx[0].width;
 					height = m_video_out_ctx[0].height;
 				}
-				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
-				m_presenter.Present(blank);
-				presented = true;
+				m_presenter.SubmitBlank(width, height, true);
 			}
+			presented = true;
 		}
-		if (!presented && total_wait < 0) {
+		if (!presented && total_wait < 0 && m_presenter.PresentIdle()) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
@@ -1080,8 +988,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				}
 			}
 			if (!any_open) {
-				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
-				m_presenter.Present(blank);
+				m_presenter.SubmitBlank(width, height, true);
 			}
 		}
 		VblankEnd();
@@ -1170,12 +1077,38 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	cfg.flip_status.gcQueueNum     = 0;
 }
 
+// KYTY_LOW_LATENCY=1 (off by default): a frame's flip is prepared only once the frames before it that wait for a vblank
+// were shown. A game faster than the display otherwise keeps about two frames queued (~30 ms from its flip to the
+// present at 60 Hz); held to one, input shows a frame sooner, but a frame late for its vblank is no longer covered by
+// a queued one. (At most 50 ms: a paused or closing port does not hold the GPU thread.)
+static bool LowLatency() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_LOW_LATENCY");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	return on;
+}
+
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
 	{
 		Common::LockGuard lock(m_mutex);
+		if (LowLatency()) {
+			const auto waiting = [&] {
+				return std::any_of(m_requests.begin(), m_requests.end(), [&](const auto& r) {
+					return r.id < request_id && (r.state == RequestState::Ready || r.state == RequestState::Presenting);
+				});
+			};
+			const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+			while (waiting()) {
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= until) break;
+				m_done_cond_var.WaitFor(&m_mutex,
+				                        static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(until - now).count()));
+			}
+		}
 		auto request = std::find_if(m_requests.begin(), m_requests.end(),
 		                            [request_id](const auto& r) { return r.id == request_id; });
 		if (request == m_requests.end()) {
@@ -1289,9 +1222,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
-		if (FlipPace() && Graphics::Presenter::IsGameView(*request->frame)) PaceNoteFrame();
 		m_submit_cond_var.Signal();
-		if (FlipDecouple() >= 2) m_done_cond_var.SignalAll();
 		m_mutex.Unlock();
 		return;
 	}
@@ -1316,9 +1247,7 @@ void FlipQueue::WaitForSubmitSlot() {
 		if (m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
-		const uint64_t begin = Common::Timer::QueryPerformanceCounter();
 		m_submit_slot_cond_var.Wait(&m_mutex);
-		g_guest_blocked_qpc.fetch_add(Common::Timer::QueryPerformanceCounter() - begin, std::memory_order_relaxed);
 	}
 }
 
@@ -1327,19 +1256,11 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 
 	auto has_request = [this, &cfg, index] {
 		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		// KYTY_FLIP_DECOUPLE=2: the oldest ready frame (next to be presented) is already the presenter's copy.
-		auto first_ready = FlipDecouple() >= 2 ? std::find_if(m_requests.begin(), m_requests.end(),
-		                                                      [](const auto& r) { return r.state == RequestState::Ready; })
-		                                       : m_requests.end();
-		for (auto it = m_requests.begin(); it != m_requests.end(); ++it) {
-			if (it != first_ready && matches(*it)) return true;
-		}
-		return std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
-		const uint64_t begin = Common::Timer::QueryPerformanceCounter();
 		m_done_cond_var.Wait(&m_mutex);
-		g_guest_blocked_qpc.fetch_add(Common::Timer::QueryPerformanceCounter() - begin, std::memory_order_relaxed);
 	}
 }
 
@@ -1367,16 +1288,19 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
-	const bool capped = r.frame != nullptr && Graphics::Presenter::FlipRateApplies(*r.frame);
-	if (!IsFlipDueLocked(*r.cfg, r.generation, capped)) {
+	int floor = 0;
+	if (r.frame != nullptr) {
+		if (Graphics::Presenter::FlipRateApplies(*r.frame)) floor = FlipRateFloor();
+		if (!Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, SceneFreeFloor());
+		if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
+		if (Graphics::Presenter::IsSceneFrame(*r.frame)) floor = std::max(floor, FlipFpsFloor());
+	}
+	if (!IsFlipDueLocked(*r.cfg, r.generation, floor)) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
 		m_done_cond_var.SignalAll();
 		return false;
-	}
-	if (FlipWhenReady()) {
-		ScheduleNextFlipLocked(*r.cfg, capped, r.frame != nullptr && Graphics::Presenter::IsGameView(*r.frame));
 	}
 
 	m_mutex.Lock();
@@ -1386,53 +1310,39 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
-	// The port is not locked while presenting (a present can wait for the swapchain): the GPU thread reserves the
-	// next flip under it. The presented frame is its own copy; a port closed meanwhile takes no status or event.
+	// The port is not locked while the frame goes to the presenter's thread (Presenter::Submit; the present itself
+	// waits for no vblank of the guest's): the GPU thread reserves the next flip under it. The presented frame is its
+	// own copy; a port closed meanwhile takes no status or event.
 	r.cfg->mutex.Unlock();
 
-	// Retires the request: flip status, the flip event, waiters in WaitFlipDone. Called with both locks held.
-	auto finish = [this, &r] {
-		if (m_requests.empty() || m_requests.front().id != r.id ||
-		    m_requests.front().state != RequestState::Presenting) {
-			EXIT("video-out flip queue changed while processing its front request\n");
-		}
-		m_requests.pop_front();
-
-		if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
-			r.cfg->flip_status.count++;
-			r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
-			r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
-			r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
-			r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-			r.cfg->flip_status.flipArg                  = r.flip_arg;
-			r.cfg->flip_status.currentBuffer            = r.index;
-			r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
-			if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
-				r.cfg->flip_status.gcQueueNum--;
-			}
-			TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
-		}
-		m_done_cond_var.SignalAll();
-		m_submit_slot_cond_var.Signal();
-	};
-	// KYTY_FLIP_DECOUPLE: retired on hand-off. The request leaves the queue, so Cancel and the destructor no longer
-	// see its frame; Present below consumes it. m_processing stays set until Present returns (one presenter).
-	const bool decoupled = FlipDecouple() != 0;
-	if (decoupled) {
-		r.cfg->mutex.Lock();
-		m_mutex.Lock();
-		finish();
-		m_mutex.Unlock();
-		r.cfg->mutex.Unlock();
-	}
-
-	m_presenter.Present(*r.frame);
+	m_presenter.Submit(*r.frame);
 
 	r.cfg->mutex.Lock();
 	m_mutex.Lock();
-	if (!decoupled) finish();
+	if (m_requests.empty() || m_requests.front().id != r.id ||
+	    m_requests.front().state != RequestState::Presenting) {
+		EXIT("video-out flip queue changed while processing its front request\n");
+	}
+	m_requests.pop_front();
+
+	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
+		r.cfg->flip_status.count++;
+		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
+		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
+		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
+		r.cfg->flip_status.flipArg                  = r.flip_arg;
+		r.cfg->flip_status.currentBuffer            = r.index;
+		r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+		if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
+			r.cfg->flip_status.gcQueueNum--;
+		}
+		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
+	}
+
 	m_processing = false;
 	m_done_cond_var.SignalAll();
+	m_submit_slot_cond_var.Signal();
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
 
@@ -1526,11 +1436,6 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
-	// (In the run log: the game's own flip rate caps it at 30 or 20 fps.)
-	if (ctx->flip_rate != rate) {
-		std::printf("Video out: the game set flip rate %d (%s)\n", rate, rate == 0 ? "every vblank" : rate == 1 ? "30 fps" : "20 fps");
-		std::fflush(stdout);
-	}
 	ctx->flip_rate = rate;
 
 	return OK;

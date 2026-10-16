@@ -10,6 +10,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 #include "local-platform.h"
 #include "slow-log.h"
 
@@ -18,12 +19,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 
 #ifdef min
 #undef min
@@ -1466,6 +1469,16 @@ static void LogAprRead(const std::string& host_path, uint64_t destination, uint6
 	}
 }
 
+// A PC's recording of the game's file opens (LocalPlatform::FollowKeptFiles) starts, on its first launch, as the
+// release's (tools/local/static-precompile/files-<title>_<version>.files: a tour of every world's opens): its first loads
+// are followed too (1-1 on a 16 GB laptop: 110 s of loading fog unfollowed, ~20 s followed).
+static void SeedFileRecording(const std::string& recording, const std::string& released) {
+	std::error_code error;
+	if (std::filesystem::exists(recording, error) || !std::filesystem::exists(released, error)) return;
+	std::filesystem::create_directories(std::filesystem::path(recording).parent_path(), error);
+	std::filesystem::copy_file(released, recording, error);
+}
+
 // A file of a game packed into a ZArchive ("game.zar!/dir/file"), kept open like LocalPlatform::OpenKeptReadFile's:
 // positional reads from any thread. Null: it is not in the archive.
 static const Common::ArchiveFile* KeptArchiveFile(const std::string& host_path) {
@@ -1548,6 +1561,18 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	// page protected again meanwhile faults as before). Copied through the write faults page by page, a level's banks
 	// went in at 0.3 GB/s (obj_bg_nex.bnk, 95 MB: 291 ms of copying on a job thread while the Nexus loaded, 10-12); with
 	// a preparation per 4 MiB piece each waited for the GPU thread (obj_bg_tow.bnk, 141 MB: 174 ms).
+	// (The game's opens followed: LocalPlatform::FollowKeptFiles. The recording is the game build's, as the shader caches.)
+	static std::once_flag follow;
+	std::call_once(follow, [] {
+		std::string title, version;
+		if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty()) return;
+		(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
+		const auto root      = Common::PathToString(LibKernel::FileSystem::GetRealFilename("/app0"));
+		const auto id        = title + (version.empty() ? "" : "_" + version);
+		const auto recording = "_PipelineCache/files/" + id + ".files";
+		SeedFileRecording(recording, "tools/local/static-precompile/files-" + id + ".files");
+		LocalPlatform::FollowKeptFiles(recording, root);
+	});
 	if (uint64_t kept_size = 0; const auto kept = LocalPlatform::OpenKeptReadFile(host_path, &kept_size)) {
 		opening = Clock::now() - start;
 		if (file_offset >= kept_size) {

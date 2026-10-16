@@ -5,6 +5,7 @@
 #include "live-census.h"
 
 #include "common/logging/log.h"
+#include "local-platform.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -57,6 +58,9 @@ bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
+std::atomic<bool> g_scene {false}; // the current guest frame ran the TAA pass
+std::atomic<bool> g_last_scene {false}; // ... the last one the guest flipped
+std::atomic<uint64_t> g_flips_taken {0}; // TakeScene calls (guest flips)
 
 float AsFloat(uint32_t word) {
 	float value = 0.0f;
@@ -414,6 +418,10 @@ void NoteGpuWaitMs(double) {}
 void NoteFlipPresentMs(double) {}
 #endif
 
+bool WantsCamera() {
+	return g_ready && !g_camera.valid;
+}
+
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
@@ -493,21 +501,42 @@ void Initialize() {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	// Streamline SDK binaries: KYTY_STREAMLINE_DIR, or the SDK unpacked next to the build.
-	std::filesystem::path dir;
-	if (const char* env = std::getenv("KYTY_STREAMLINE_DIR"); env != nullptr && *env != '\0') {
-		dir = env;
+	// NVIDIA's Streamline runtime, which no release ships (the user's own copy: the Streamline SDK's bin\x64):
+	// KYTY_STREAMLINE_DIR (the launcher's "Streamline..." folder, run-windows -StreamlineDir), else a "streamline"
+	// folder next to the emulator, else the SDK unpacked beside the build (_Build\deps\streamline\sdk). A folder
+	// may be the SDK's own (its bin\x64 is taken).
+	std::vector<std::filesystem::path> candidates;
+	wchar_t                            exe[MAX_PATH] {};
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	const auto exe_dir = std::filesystem::path(exe).parent_path();
+	// (Wide: a folder's name in any language.)
+	if (const wchar_t* env = _wgetenv(L"KYTY_STREAMLINE_DIR"); env != nullptr && *env != L'\0') {
+		candidates.emplace_back(env);
 	} else {
-		wchar_t exe[MAX_PATH] {};
-		GetModuleFileNameW(nullptr, exe, MAX_PATH);
-		// A package: streamline\ next to the emulator; a build tree: the SDK unpacked next to the build.
-		dir = std::filesystem::path(exe).parent_path() / "streamline";
-		if (!std::filesystem::exists(dir / "sl.interposer.dll")) {
-			dir = std::filesystem::path(exe).parent_path().parent_path() / "deps" / "streamline" / "sdk" /
-			      "bin" / "x64";
+		candidates.push_back(exe_dir / "streamline");
+		candidates.push_back(exe_dir.parent_path() / "deps" / "streamline" / "sdk");
+	}
+	std::filesystem::path dir;
+	for (const auto& candidate: candidates) {
+		for (const auto& folder: {candidate, candidate / "bin" / "x64"}) {
+			std::error_code error;
+			if (dir.empty() && std::filesystem::exists(folder / "sl.interposer.dll", error)) dir = folder;
 		}
 	}
+	if (dir.empty()) {
+		LOGF("frame generation: no sl.interposer.dll (KYTY_STREAMLINE_DIR or a streamline folder next to the emulator)\n");
+		std::printf("Frame generation: NVIDIA's Streamline runtime was not found (choose its folder in the launcher)\n");
+		g_generate = 0;
+		return;
+	}
 	const auto interposer = dir / "sl.interposer.dll";
+	// Only NVIDIA's own (Streamline then checks its plugins' signatures itself).
+	if (!LocalPlatform::IsNvidiaSigned(interposer.wstring())) {
+		LOGF("frame generation: %s is not signed by NVIDIA: not loaded\n", interposer.string().c_str());
+		std::printf("Frame generation: %s is not signed by NVIDIA, not loaded\n", interposer.string().c_str());
+		g_generate = 0;
+		return;
+	}
 	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {
 		// Graphics modules already loaded before Streamline (it must come first).
 		for (const char* name: {"vulkan-1.dll", "nvoglv64.dll", "opengl32.dll", "dxgi.dll", "d3d11.dll", "d3d12.dll",
@@ -911,6 +940,15 @@ void AfterPresent() {
 		return;
 	}
 	g_presented_frames.store(std::max(state.numFramesActuallyPresented, 1u), std::memory_order_relaxed);
+	// More generated frames asked for than the GPU makes (the launcher's 3x and up): as many as it makes.
+	if (state.numFramesToGenerateMax != 0 && static_cast<uint32_t>(g_generate) > state.numFramesToGenerateMax) {
+		LOGF("frame generation: %d generated frames asked for, the GPU makes up to %u\n", g_generate,
+		     state.numFramesToGenerateMax);
+		std::printf("Frame generation: %d generated frame(s) asked for, the GPU makes up to %u\n", g_generate,
+		            state.numFramesToGenerateMax);
+		g_generate    = static_cast<int>(state.numFramesToGenerateMax);
+		g_options_set = false;
+	}
 	if (presents % 600 == 1) {
 		LOGF("frame generation: status=0x%x presented=%u max_generated=%u vram=%" PRIu64 " MiB\n",
 		     static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
@@ -935,9 +973,7 @@ void SetStaticRect(float x0, float y0, float x1, float y1) {
 }
 
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
-	if (g_camera.valid || srt.size() < SrtJitter + 2 ||
-	    std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), vs_hash) ==
-	        GbufferVertexShaders.end()) {
+	if (g_camera.valid || srt.size() < SrtJitter + 2 || !IsGbufferVertexShader(vs_hash)) {
 		return;
 	}
 	for (uint32_t i = 0; i < 16; ++i) {
@@ -952,6 +988,25 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	}
 	g_camera.jitter_ndc = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
 	g_camera.valid      = true;
+}
+
+void NoteScene() {
+	g_scene.store(true, std::memory_order_relaxed);
+}
+
+bool TakeScene() {
+	const bool scene = g_scene.exchange(false, std::memory_order_relaxed);
+	g_last_scene.store(scene, std::memory_order_relaxed);
+	g_flips_taken.fetch_add(1, std::memory_order_relaxed);
+	return scene;
+}
+
+uint64_t GuestFlips() {
+	return g_flips_taken.load(std::memory_order_relaxed);
+}
+
+bool SceneNoted() {
+	return g_scene.load(std::memory_order_relaxed) || g_last_scene.load(std::memory_order_relaxed);
 }
 
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,

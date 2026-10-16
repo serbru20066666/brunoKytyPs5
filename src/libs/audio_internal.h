@@ -26,6 +26,10 @@ enum class Format {
 struct OutputParam {
 	int         handle = 0;
 	const void* data   = nullptr;
+	// One gain for each of the port's channels, from the guest's per-channel gain attribute
+	// (AudioOut2 port attribute 1), or null when the guest never set one: the pad's speaker and
+	// vibration ports ask for their level there, and without it they play far too quietly.
+	const float* gains = nullptr;
 };
 
 static constexpr int OUT_PORTS_MAX = 32;

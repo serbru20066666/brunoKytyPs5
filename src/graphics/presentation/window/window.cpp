@@ -901,7 +901,11 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	SDL_SetWindowResizable(context.window, SDL_FALSE);
+	// Resizable, so the title bar's maximize button is enabled: Windows greys it out for a
+	// fixed-size window. Only the presented image follows the window - the guest keeps rendering
+	// at its own resolution, the swapchain takes the new client size and the present blit scales
+	// the frame into it (KYTY_PRESENT_ASPECT=fit keeps the aspect ratio instead of stretching).
+	SDL_SetWindowResizable(context.window, SDL_TRUE);
 	context.UpdateIcon();
 	// SDL2 starts text input with the video subsystem, which keeps the IME attached to the
 	// window: with a Japanese/Chinese IME on, letter keys (the default Cross, WASD...) never
@@ -910,7 +914,10 @@ static void WindowCreate(WindowContext& context) {
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
-	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN);
+	// SDL_WINDOW_RESIZABLE is what makes the maximize button usable on Windows; the size the
+	// window opens at still comes from --screen-width/--screen-height.
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN) |
+	             static_cast<uint32_t>(SDL_WINDOW_RESIZABLE);
 	if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	}
@@ -941,6 +948,8 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+	g_window->render_context->GetPipelineCache().StopWarmup();
+	g_window->render_context->GetPipelineCache().ReportSession();
 	g_window->render_context->GetPipelineCache().Save();
 }
 

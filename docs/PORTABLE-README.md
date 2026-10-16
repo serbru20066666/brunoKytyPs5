@@ -66,17 +66,35 @@ fullscreen (optionally keeping 16:9 with black bars), the console language and r
 with buttons to play, to precompile the shaders (optionally on the efficiency cores only, so the PC
 stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
-console's 60 where the PC is fast enough: play keeps its speed, but pre-rendered movies play faster.
+console's 60 where the PC is fast enough: play keeps its speed, and movies, menus and loading screens
+stay at 60.
 "Render height" (1440 by default, as on the PS5) is the height the game renders its 3D at before it
 upscales it to its 4K picture; lower heights (1296, 1152, 1080, 900) are faster where the graphics card
 limits the frame rate (a laptop RTX 3080 at Boletaria's start: 20.7 fps at 1440, 24.8 at 1080) and
 less sharp. The interface stays 4K either way.
+"Aspect ratio" (16:9 by default, as on the PS5) renders the 3D wider for ultrawide displays: 21:9
+(3416x1440 at render height 1440) or 32:9, seeing more to the sides, not a stretched 16:9 picture. In
+play the HUD keeps its shape: health, magic, stamina and the equipment at the left edge, the souls at
+the right edge, the boss's health in the middle. The in-game menus are stretched to the width; the lock-on
+and enemy health bars stay on their targets; pre-rendered movies and loading screens are shown at 16:9
+with black bars. Pick the matching resolution (2560x1080, 3440x1440, 5120x2160, ...) or full screen.
 "Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low draws shadows from
 simpler meshes, picks the level of detail as for a 720-line picture and ends sun shadows at 125 m
 (250 m); Lowest picks detail as for 480 lines, ends sun shadows at 60 m and turns off ambient shadowing
 and the shadows of torches and other lamps. Each thing drawn costs the emulator processor time, so these
 help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing in Latria: 22.6 fps at
 Standard, 25.5 at Low, 25.8 at Lowest; 28.8 at Lowest with render height 1080).
+"Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
+runtime, which this package does not include: download the Streamline SDK (a release zip from
+https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
+"Streamline..." button (only files signed by NVIDIA are loaded). The frames shown are the game's times the
+multiplier; with VSync they are capped at the display's refresh rate (a 60 Hz display at 2x runs the game at 30 fps).
+"Overlay" (Off by default) shows the emulator's own panel at the top right of the game image: "Frame rate"
+the frames per second and a graph of the last frames' times (60 and 30 fps lines, hitches in red, the 1% low
+and the longest frame of the last 10 seconds); "Detailed" adds the render thread's time in each frame (orange),
+the graphics card (load, clock, temperature, power and video memory on NVIDIA cards), the processor's load
+with a bar for each core, and the memory in use. (The overlays seen in videos with temperatures and voltages
+of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.)
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -110,6 +128,7 @@ shortcut):
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
+| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides, in-game menus are stretched, movies stay 16:9 |
 | `-Quality low` | How much the game draws: `low` or `lowest` (simpler shadows and distant detail), faster where the processor limits the frame rate |
 
 ## Shader precompile (without it the game stutters)
@@ -131,14 +150,23 @@ There are two levels of preparation, both specific to the graphics card and driv
    result is a store the game reads pipeline by pipeline (`<title>_<version>.binaries`, about 2 GB, nothing to
    load at launch); with other drivers a cache each launch loads (with a progress bar).
    - Choose "Precompile first" in the dialog at launch, or double-click `precompile.cmd` on its own.
-   - The time depends on the CPU threads: about 55 minutes with 22 threads, about 1 hour 15 minutes with
-     16, about 2.5 hours with 8. The CPU is fully loaded meanwhile: running it overnight is a good idea.
+   - The time depends on the CPU: under an hour with 22 threads, about 1 hour 50 minutes on a 16-thread
+     laptop (Ryzen 9 5900HX), longer with fewer threads. The CPU is fully loaded meanwhile: running it
+     overnight is a good idea. Once "ready to play" shows (about halfway), what play needs is in place
+     and the game can be started; the rest follows.
    - Closing the window stops it; running it again continues where it stopped.
    - Coming from an older package with a precompiled `_PipelineCache\static\<title>.bin`: the precompile
      turns it into the store in a few minutes; the `.bin` is then unused and can be deleted (about 4 GB).
    - It compiles the shaders as the game uses them in play too: the package carries what was recorded
      while playing every world on the test PC (`tools\local\static-precompile\hints-<title>_<version>.hints`,
-     without the game's shader code), completed with the code of your own game files.
+     without the game's shader code), together with what your own play recorded, completed with the code of
+     your own game files. For those shaders it leaves out the guessed variants the game did not use (a fifth
+     of the time); `precompile.cmd -Full` compiles them too.
+   - Places and effects the test PC never recorded (bosses' deaths, for one) still compile when they first
+     appear. The launcher's "Export shader hints" button (or `precompile.cmd -ExportHints`) writes what your
+     own play recorded, without the game's shader code, to `my-hints-<title>_<version>.hints` (a few hundred
+     KB, nothing is compiled) and shows it in Explorer: attached to an issue, it goes into the hints of the
+     next packages.
    - **After a graphics driver update or a new graphics card it has to be done again**; the launcher
      asks again. It also asks after an update of the emulator that precompiles more: running it again
      then compiles only what is new.
@@ -187,7 +215,7 @@ can be warped too; one in the character creation cannot (it has no save yet).
 | `logs` | Run logs |
 | `game-path.txt` | The remembered game location |
 | `seeds-<title>_<version>.seeds` | The list of shaders the first launch collects from the game files (one per game version) (it contains the game's shader code: do not share it), for the precompile |
-| `hinted-<title>_<version>.seeds` | The recorded play of the package's hints with the code of your game files (made by each precompile; it contains the game's shader code: do not share it) |
+| `hinted-<title>_<version>.seeds` | The recorded play of the package's hints and of your own play with the code of your game files (made by each precompile, from `released-<title>_<version>.seeds` and `recorded-play-<title>_<version>.hints`; the `.seeds` files contain the game's shader code: do not share them) |
 | `launch.json` | The emulator's switches; normally left alone |
 
 ## Known issues

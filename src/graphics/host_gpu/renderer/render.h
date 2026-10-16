@@ -422,7 +422,9 @@ private:
 	// Table draws (src/local/table-xpr.inc).
 	struct TableXpr;
 	struct TablePair;
+	struct TableFlatStage;
 	struct TableVariant;
+	void TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat);
 	struct TableImageSet;
 	// Deferred: the pair's table variant is on its way (TableTry): the normal path draws, storing no native record.
 	enum class TableResult { Drawn, Native, Store, Deferred };

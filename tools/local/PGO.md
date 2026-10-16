@@ -29,3 +29,12 @@ profile 里改过的函数会因哈希不符而失去 PGO，需要重新训练�
 
 2026-10-01：9 月 27 日的 profile 换成新训练的之后，固定场景 43.83 → 45.17 fps
 （ab-exe 三轮，B 组每个窗口都高于 A 组）。
+
+2026-10-16（笔记本，16 GB 内存）：10-08 的 profile 已落后 232 个提交，在当前 HEAD 上重新训练三个场景后合并：
+- 默认基准存档（序章；它有两个角色，出生点会在隧道和雾中平原之间变化，对比前先看截图）；
+- `KYTY_BENCH_BASELINE=_Build\bench-baselines\user-20261001`（1-1 城门广场）；
+- `world-latria`。
+
+1-1 站立，ab-exe 两轮 ABBA（需要 `-StartupSeconds 240`：16 GB 下 1-1 要约 180 s 才到 HUD）：
+渲染线程 33.60 → 32.00 ms/帧（-4.8%），fps 22.87 → 23.12（站立时帧还在等游戏侧）。
+清理构建可以用 `ninja -C _Build\windows -t clean` 代替 `cmake --build ... --target clean`。

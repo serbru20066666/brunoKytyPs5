@@ -44,7 +44,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
                              const TranslateOptions& options);
 
 // A wave64 program whose results in each lane depend on no lane outside its 32-lane half (LaneLocal.cpp): on a host
-// with 32-wide subgroups it runs one GCN lane per invocation. `reason`: why not.
-bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr);
+// with 32-wide subgroups it runs one GCN lane per invocation. `reason`: why not; `uniform_loads`: whether it took a buffer
+// load at one address for a value the same in every lane (KYTY_LANE_LOCAL_UNIFORM_LOADS).
+bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr, bool* uniform_loads = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

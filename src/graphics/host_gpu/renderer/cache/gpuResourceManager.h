@@ -38,6 +38,10 @@ public:
 		return m_page_manager.WatchedSpan(vaddr, size, first, end);
 	}
 	void SyncProtection(uint64_t vaddr, uint64_t size) { m_page_manager.SyncProtection(vaddr, size); }
+	// (PageManager::WatchedRuns: for a holder of the guest address-space lock.)
+	void WatchedRuns(uint64_t vaddr, uint64_t size, std::vector<PageManager::WatchedRun>* runs) const {
+		m_page_manager.WatchedRuns(vaddr, size, runs);
+	}
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);

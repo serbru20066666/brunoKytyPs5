@@ -17,6 +17,11 @@
 // after the visit at +0xb9d1d0 had skipped 32 null children of the same parent, whose children vector changed size
 // and null slots between the skips. A null node is an empty one in each of them too (a collector returns the count
 // of its vector, unchanged).
+// An event's dispatch calls its listeners (object and member function pairs, 0x40 bytes apart) under a spin lock of the
+// object it is called on (01.007.000 eboot+0xc58440, and +0xc587f0 for another event, one template). A job worker called
+// the first on a null object at Latria (eboot+0xc5845a 10-16, from eboot+0x421827): the world's record of an entity,
+// looked up just before (eboot+0x1475a20), was missing, as the visits skipped null children. A null object has no
+// listeners: nothing is dispatched.
 #include "loader/demonsSoulsSceneGuard.h"
 
 #include "common/guardedCopy.h"
@@ -87,6 +92,9 @@ constexpr std::array<Traversal, 8> Traversals {{
 }};
 // Each begins with push rbp; mov rbp, rsp; push r15: its stub runs them, the jump to the stub replaces them.
 constexpr std::array<uint8_t, 6> Prologue {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+// The event dispatches up to their spin on the lock (the lock's offset in the object left out): every one found.
+constexpr const char* Dispatch = "55 48 89 e5 41 57 41 56 41 54 53 49 89 f6 48 89 fb 49 c7 c7 ff ff ff ff 31 c9 48 83 bb ?? ?? "
+                                 "00 00 00 74 ?? 66 66 66 2e 0f 1f 84 00 00 00 00 00 48 81 f9 10 27 00 00";
 
 // The children loops of the bit-passing traversals, as both builds have them: the increment and end test
 // (add r12, 8; cmp r12, [parent + 0x38]; je with a short or a near displacement), then the child's load
@@ -322,7 +330,11 @@ void Install(Program* program) {
 	// The list unlink: its mov rcx, [rax+0x58] (4 bytes in).
 	uint64_t unlink = 0;
 	if (const auto found = GuestCode::FindUnique(*program, GuestCode::Pattern(UnlinkCode))) unlink = *found + 4;
-	if (!traversals && loops.empty() && unlink == 0) return;
+	std::vector<uint64_t> dispatches;
+	for (const auto at: GuestCode::Find(*program, GuestCode::Pattern(Dispatch), 4))
+		if (std::memcmp(reinterpret_cast<const void*>(at), Prologue.data(), Prologue.size()) == 0) dispatches.push_back(at);
+	if (dispatches.empty()) std::printf("Demon's Souls scene guard: no event dispatch of a known build found; retaining their guest code\n");
+	if (!traversals && loops.empty() && unlink == 0 && dispatches.empty()) return;
 	const auto requested = program->base_vaddr + CaveOffset;
 	const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    requested, PageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_scene_guard", true);
@@ -335,17 +347,16 @@ void Install(Program* program) {
 	Xbyak::ClearError();
 	Xbyak::CodeGenerator c(PageSize, reinterpret_cast<void*>(allocated));
 	constexpr uint8_t save_fp[] {0x48, 0x0f, 0xae, 0x04, 0x24}; // FXSAVE64 [rsp]
-	std::array<const uint8_t*, Traversals.size()> stubs {};
-	for (size_t i = 0; i < Traversals.size() && traversals; i++) {
-		const auto   entry = entries[i];
+	// A function called on a null node or object: its prologue and on, or for a null one a printed skip returning `empty`.
+	const auto null_stub = [&](uint64_t entry, Empty empty) {
 		Xbyak::Label skip;
 		c.align(16);
-		stubs[i] = c.getCurr();
+		const auto* stub = c.getCurr();
 		c.test(rdi, rdi); // (flags are not preserved across a call)
 		c.jz(skip);
 		c.db(Prologue.data(), Prologue.size());
 		c.jmp(reinterpret_cast<const void*>(entry + Prologue.size()));
-		// A null node: printed (registers, flags and FP state kept), then nothing found or visited.
+		// A null one: printed (registers, flags and FP state kept), then nothing found, visited or dispatched.
 		c.L(skip);
 		c.pushfq();
 		for (const auto& reg: {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11})
@@ -365,15 +376,22 @@ void Install(Program* program) {
 		for (const auto& reg: {r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
 			c.pop(reg);
 		c.popfq();
-		if (Traversals[i].empty == Empty::Zero) {
+		if (empty == Empty::Zero) {
 			c.xor_(eax, eax);
 		} else {
 			c.mov(rax, ptr[rcx + 8]);
 			c.sub(rax, ptr[rcx]);
-			c.shr(rax, Traversals[i].empty == Empty::Count8 ? 3 : 5);
+			c.shr(rax, empty == Empty::Count8 ? 3 : 5);
 		}
 		c.ret();
-	}
+		return stub;
+	};
+	std::array<const uint8_t*, Traversals.size()> stubs {};
+	for (size_t i = 0; i < Traversals.size() && traversals; i++)
+		stubs[i] = null_stub(entries[i], Traversals[i].empty);
+	std::vector<const uint8_t*> dispatch_stubs;
+	for (const auto entry: dispatches)
+		dispatch_stubs.push_back(null_stub(entry, Empty::Zero));
 	// A children loop: the child's load, a null child continues with the next one, else the moved instruction and back.
 	std::vector<const uint8_t*> loop_stubs;
 	for (const auto& loop: loops) {
@@ -472,6 +490,8 @@ void Install(Program* program) {
 	for (size_t i = 0; i < loops.size(); i++)
 		patch(loops[i].load, loop_stubs[i], loops[i].moved);
 	if (unlink != 0) patch(unlink, unlink_stub, UnlinkMoved);
+	for (size_t i = 0; i < dispatches.size(); i++)
+		patch(dispatches[i], dispatch_stubs[i], 5);
 	if (traversals) {
 		std::string at;
 		for (const auto entry: entries) {
@@ -489,6 +509,9 @@ void Install(Program* program) {
 		            static_cast<unsigned long long>(unlink - program->base_vaddr));
 	else
 		std::printf("Demon's Souls scene guard: no list unlink of a known build found; retaining its guest code\n");
+	for (const auto entry: dispatches)
+		std::printf("Demon's Souls scene guard: installed (the event dispatch at eboot+0x%llx skips a null object)\n",
+		            static_cast<unsigned long long>(entry - program->base_vaddr));
 #endif
 }
 } // namespace Loader::DemonsSoulsSceneGuard

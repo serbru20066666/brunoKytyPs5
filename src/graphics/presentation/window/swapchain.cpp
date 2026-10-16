@@ -12,12 +12,22 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsWarp.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
 #include "local/fsr3-fg.h"
+#include "local-platform.h"
+#include "perf-overlay.h"
+#if defined(_WIN32)
+#include "SDL_syswm.h"
+#endif
+
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include <algorithm>
 #include <array>
@@ -49,6 +59,7 @@ struct Presenter::Frame {
 	bool                   reusing_last = false;
 	bool                   hdr          = false; // BT.2100 PQ pixels
 	bool                   blank        = false; // a cleared frame (no guest picture)
+	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -104,12 +115,17 @@ public:
 		return m_format;
 	}
 
-	Presenter::Frame* Acquire() {
+	// `wait`: until a frame is free (else none when none is).
+	Presenter::Frame* Acquire(bool wait = true) {
 		m_mutex.Lock();
 		if (m_frames.empty()) {
 			EXIT("prepared-frame pool was used before swapchain initialization\n");
 		}
 		while (m_free.empty()) {
+			if (!wait) {
+				m_mutex.Unlock();
+				return nullptr;
+			}
 			m_available.Wait(&m_mutex);
 		}
 		auto* frame = m_free.front();
@@ -302,8 +318,9 @@ public:
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay(SystemOverlayHud* hud = nullptr);
+	// `scene`: the frame shows the game's 3D view (Presenter::IsSceneFrame).
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-	                                           bool draw_system_overlay);
+	                                           bool draw_system_overlay, bool scene);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
 
@@ -335,6 +352,8 @@ public:
 		return extent.width != std::numeric_limits<uint32_t>::max() && extent.width != 0 && extent.height != 0 &&
 		       (extent.width != m_extent.width || extent.height != m_extent.height);
 	}
+	// The presents wait for the display's vertical blank (VSync: FIFO).
+	[[nodiscard]] bool IsFifo() const noexcept { return m_fifo.load(std::memory_order_relaxed); }
 
 private:
 	void                 Destroy();
@@ -344,6 +363,7 @@ private:
 	vk::SwapchainKHR            m_handle = nullptr;
 	vk::Format                  m_format = vk::Format::eUndefined;
 	std::atomic_bool            m_hdr_supported {false};
+	std::atomic_bool            m_fifo {true};
 	bool                        m_hdr_requested = false;
 	bool                        m_hdr_active    = false;
 	vk::Extent2D                m_extent {};
@@ -402,11 +422,68 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
-	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the game's presented
-	// frames times the frames DLSS-G shows for each).
+	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the emulator's own frame rate: the
+	// game's flips; with frame generation the frames presented, generated ones too, and the game's rate below), its
+	// frame-time graph with every present; 2: the GPU, processor and memory rows too (PerfOverlay's sampling thread).
 	SystemOverlayHud                      hud;
 	std::chrono::steady_clock::time_point hud_window {};
-	uint32_t                              hud_frames = 0;
+	uint32_t                              hud_frames      = 0;
+	bool                                  machine_started = false;
+
+	// The detailed panel's rows from the machine's last sample.
+	void UpdateMachineRows() {
+		const auto machine = PerfOverlay::LatestMachine();
+		auto&      perf    = hud.perf;
+		perf.rows.clear();
+		perf.core_load.clear();
+		perf.core_note.clear();
+		if (!machine.valid) return;
+		constexpr double Gb   = 1024.0 * 1024.0 * 1024.0;
+		const auto       text = [](const char* format, auto... values) {
+            std::array<char, 160> line {};
+            std::snprintf(line.data(), line.size(), format, values...);
+            return std::string(line.data());
+		};
+		std::string gpu = machine.gpu_name;
+		if (machine.gpu_valid)
+			gpu += text("   %u%%   %u MHz   %u\xC2\xB0" "C   %u W", machine.gpu_load, machine.gpu_clock,
+			            machine.gpu_temperature, machine.gpu_power);
+		perf.rows.push_back({"GPU", gpu});
+		std::string video;
+		if (machine.video_usage != 0) video = text("emulator %.1f GB", static_cast<double>(machine.video_usage) / Gb);
+		if (machine.gpu_memory_total != 0)
+			video += text("%sGPU %.1f / %.1f GB", video.empty() ? "" : "   |   ",
+			              static_cast<double>(machine.gpu_memory_used) / Gb, static_cast<double>(machine.gpu_memory_total) / Gb);
+		else if (machine.video_budget != 0)
+			video += text("  of %.1f GB", static_cast<double>(machine.video_budget) / Gb);
+		if (!video.empty()) perf.rows.push_back({"VRAM", video});
+		perf.rows.push_back({"CPU", machine.cpu_name + (machine.core_load.empty() ? std::string()
+		                                                                          : text("   %.0f%%", machine.cpu_load * 100.0f))});
+		perf.core_load = machine.core_load;
+		// A hybrid processor's performance cores (the higher efficiency class) apart from its efficiency cores.
+		const auto top = machine.core_class.empty() ? 0 : *std::max_element(machine.core_class.begin(), machine.core_class.end());
+		const bool hybrid = std::any_of(machine.core_class.begin(), machine.core_class.end(), [&](uint8_t c) { return c != top; });
+		perf.core_fast.assign(perf.core_load.size(), 0);
+		double   mhz[2] {};
+		uint32_t cores[2] {};
+		for (size_t i = 0; i < perf.core_load.size(); ++i) {
+			const bool fast = hybrid && i < machine.core_class.size() && machine.core_class[i] == top;
+			perf.core_fast[i] = fast ? 1 : 0;
+			if (i < machine.core_clock.size() && machine.core_clock[i] != 0) {
+				mhz[fast ? 1 : 0] += machine.core_clock[i];
+				cores[fast ? 1 : 0]++;
+			}
+		}
+		if (hybrid && cores[0] != 0 && cores[1] != 0)
+			perf.core_note = text("P-cores %.2f GHz   |   E-cores %.2f GHz", mhz[1] / cores[1] / 1000.0, mhz[0] / cores[0] / 1000.0);
+		else if (cores[0] + cores[1] != 0)
+			perf.core_note = text("%.2f GHz", (mhz[0] + mhz[1]) / (cores[0] + cores[1]) / 1000.0);
+		perf.rows.push_back({"Emulator", text("%.1f cores   |   render thread %.0f%%   |   RAM %.1f GB", machine.process_cores,
+		                                      machine.render_thread * 100.0f, static_cast<double>(machine.process_memory) / Gb)});
+		if (machine.ram_total != 0)
+			perf.rows.push_back({"RAM", text("%.1f / %.1f GB", static_cast<double>(machine.ram_used) / Gb,
+			                                 static_cast<double>(machine.ram_total) / Gb)});
+	}
 
 	// The shader prefetch's progress line while it runs, and for a few seconds after.
 	std::chrono::steady_clock::time_point prefetch_finished {};
@@ -417,8 +494,9 @@ struct Presenter::Impl {
 			return;
 		}
 		std::array<char, 128> line {};
-		if (progress.done < progress.total) {
-			std::snprintf(line.data(), line.size(), "Preparing shaders %zu%%  (%zu / %zu)", progress.done * 100 / progress.total,
+		if (progress.done < progress.total || progress.label != nullptr) {
+			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
+			              progress.label != nullptr ? progress.label : "Preparing shaders", progress.done * 100 / progress.total,
 			              progress.done, progress.total);
 		} else {
 			if (prefetch_finished == std::chrono::steady_clock::time_point {}) {
@@ -434,35 +512,63 @@ struct Presenter::Impl {
 	}
 
 	[[nodiscard]] SystemOverlayHud* UpdateHud(bool reuse) {
-		static const bool enabled = [] {
-			const char* value = std::getenv("KYTY_FPS_HUD");
-			return value != nullptr && *value != '\0' && std::string_view(value) != "0";
-		}();
-		const auto now = std::chrono::steady_clock::now();
+		const int  level = PerfOverlay::Level();
+		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
-		if (!enabled) {
+		if (level == 0) {
 			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
+		}
+		if (level >= 2 && !machine_started) {
+			// The GPU NVML reports on: the Vulkan device's.
+			machine_started = true;
+			vk::PhysicalDeviceIDProperties id {};
+			vk::PhysicalDeviceProperties2  properties {};
+			properties.pNext = &id;
+			window.graphic_ctx.physical_device.getProperties2(&properties);
+			std::string name = properties.properties.deviceName.data();
+			if (name.rfind("NVIDIA ", 0) == 0) name.erase(0, 7);
+			PerfOverlay::StartMachine(id.deviceUUID.data(), name);
 		}
 		if (hud_window == std::chrono::steady_clock::time_point {}) {
 			hud_window = now;
 		}
 		hud_frames += reuse ? 0u : 1u;
+		// The graph: the last 300 frames (5 seconds at 60 fps).
+		PerfOverlay::RecentFrames(300, &hud.perf.frame_ms, level >= 2 ? &hud.perf.busy_ms : nullptr);
 		const double seconds = std::chrono::duration<double>(now - hud_window).count();
 		if (seconds >= 1.0) {
-			const double   game  = hud_frames / seconds;
-			const uint32_t shown = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
+			// The emulator's own frame rate (the game's flips) is the number; with frame generation, the frames DLSS-G
+			// presents (those it got, each with its generated ones) are, and the game's rate is below it.
+			const double   game     = PerfOverlay::Summarize(seconds).fps;
+			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
-			std::snprintf(title.data(), title.size(), "%.0f FPS", game * shown);
-			if (shown > 1) {
-				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps",
-				              shown, game);
+			if (presents > 1) {
+				std::snprintf(title.data(), title.size(), "%.0f FPS", hud_frames / seconds * presents);
+				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
 			} else {
-				std::snprintf(detail.data(), detail.size(), "game %.0f fps", game);
+				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
 			}
 			hud.title  = title.data();
 			hud.detail = detail.data();
+			// The last 10 seconds' frames: their average time, the render thread's busy part, the worst 1% as
+			// fps and the longest.
+			const auto summary = PerfOverlay::Summarize(10.0);
+			std::array<char, 160> note {};
+			if (summary.fps <= 0) {
+				note[0] = '\0';
+			} else if (level >= 2 && !hud.perf.busy_ms.empty()) {
+				double busy = 0;
+				for (const float ms: hud.perf.busy_ms) busy += ms;
+				std::snprintf(note.data(), note.size(), "frame %.1f ms   |   render thread %.1f ms   |   1%% low %.0f fps   |   max %.0f ms",
+				              1000.0 / summary.fps, busy / static_cast<double>(hud.perf.busy_ms.size()), summary.low1, summary.max_ms);
+			} else {
+				std::snprintf(note.data(), note.size(), "frame %.1f ms   |   1%% low %.0f fps   |   max %.0f ms",
+				              1000.0 / summary.fps, summary.low1, summary.max_ms);
+			}
+			hud.perf.graph_note = note.data();
+			if (level >= 2) UpdateMachineRows();
 			hud_window = now;
 			hud_frames = 0;
 		}
@@ -478,14 +584,64 @@ struct Presenter::Impl {
 		}
 		return &hud;
 	}
+	// The presenter's thread (Presenter::PresentLoop) and what it presents next (Submit, SubmitBlank).
+	struct Waiting {
+		Frame*   frame  = nullptr;
+		bool     reuse  = false;
+		bool     blank  = false; // a cleared frame to make (width, height, opaque)
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		bool     opaque = false;
+		[[nodiscard]] bool Empty() const noexcept { return frame == nullptr && !blank; }
+	};
+	std::mutex                  waiting_mutex;
+	std::condition_variable_any waiting_changed;
+	Waiting                     waiting;
+	bool                        presenting = false; // (waiting_mutex) the thread took one and has not presented it yet
+	std::jthread                thread;
+	// A frame the vblank thread put in place of one still waiting: that one goes back to the pool unshown.
+	void Replace(const Waiting& next) {
+		Waiting dropped;
+		{
+			std::lock_guard lock(waiting_mutex);
+			dropped = std::exchange(waiting, next);
+		}
+		waiting_changed.notify_one();
+		// (A last frame shown again stays the last one.)
+		if (dropped.frame != nullptr) frames.Release(dropped.frame, dropped.reuse);
+	}
+
+	// A cleared frame: into `producer` (the GPU thread's command buffer, a guest flip of a blank buffer), else on the
+	// presenter's own scheduler (its thread's blank frames).
+	void ClearFrame(Frame& frame, uint32_t width, uint32_t height, bool opaque, CommandBuffer* producer) {
+		frame.fg.valid = false;
+		frame.hdr      = false;
+		frame.blank    = true;
+		frame.scene    = false;
+		frame.Configure(window.graphic_ctx, {width, height}, frames.GetFormat());
+		vk::ClearColorValue clear {};
+		clear.float32[3] = opaque ? 1.0f : 0.0f;
+		if (producer != nullptr) {
+			frame.Clear(*producer, clear);
+		} else {
+			auto& command = present_scheduler.BeginCommand();
+			frame.Clear(command, clear);
+			frame.present_tick = present_scheduler.Submit();
+		}
+	}
+
 #if defined(_WIN32)
 	// Presents faster than the display refreshes only pile up in the compositor, and on Windows
 	// a present blocked there holds the driver's device lock (see Swapchain::Present).
 	std::chrono::steady_clock::time_point last_present {};
 	std::chrono::nanoseconds              min_present_interval {-1}; // -1: not queried yet
-	// A frame PresentDue turned away that no newer present replaced: the vblank thread shows it once the display can
-	// take it (Presenter::PresentSkippedIfDue).
-	bool skipped_unshown = false;
+
+	// When PresentDue lets the next present go ahead.
+	[[nodiscard]] std::chrono::steady_clock::time_point NextPresentDue() {
+		(void)PresentDue(false); // (the display's refresh, queried once)
+		return min_present_interval.count() > 0 ? last_present + min_present_interval * 3 / 4
+		                                         : std::chrono::steady_clock::time_point {};
+	}
 
 	// `commit`: the present goes ahead now (the next one is timed from it).
 	[[nodiscard]] bool PresentDue(bool commit = true) {
@@ -620,6 +776,7 @@ void Swapchain::Create() {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
+	m_fifo.store(create_info.presentMode == vk::PresentModeKHR::eFifo, std::memory_order_relaxed);
 	create_info.clipped          = VK_TRUE;
 	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
 	if (!m_fsr3) {
@@ -784,7 +941,7 @@ bool Swapchain::PrepareSystemOverlay(SystemOverlayHud* hud) {
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-                                      bool draw_system_overlay) {
+                                      bool draw_system_overlay, bool scene) {
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
 		     static_cast<void*>(source.image), static_cast<int>(source.state.layout));
@@ -816,13 +973,23 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		const char* value = std::getenv("KYTY_PRESENT_ASPECT");
 		return value != nullptr && std::string_view(value) == "fit";
 	}();
-	int dst_x = 0, dst_y = 0;
-	int dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
-	if (aspect_fit && source.extent.width != 0 && source.extent.height != 0) {
-		const double scale = std::min(static_cast<double>(m_extent.width) / source.extent.width,
-		                              static_cast<double>(m_extent.height) / source.extent.height);
-		dst_w = std::max(1, static_cast<int>(std::lround(source.extent.width * scale)));
-		dst_h = std::max(1, static_cast<int>(std::lround(source.extent.height * scale)));
+	// KYTY_RENDER_ASPECT: the game's 3D was rendered wider and squeezed into its 16:9 output; a frame showing it is
+	// shown at that aspect, the others (movies, menus, loading screens) at their own 16:9, both fitted to the window
+	// (within 2% of the window's aspect: filling it).
+	int          dst_x = 0, dst_y = 0;
+	int          dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
+	const double frame_aspect = source.extent.height != 0
+	                                ? static_cast<double>(source.extent.width) / source.extent.height
+	                                : 0.0;
+	const double wide         = Loader::DemonsSoulsRenderSize::WideAspect();
+	double       aspect       = wide > 0.0 ? (scene ? wide : frame_aspect) : aspect_fit ? frame_aspect : 0.0;
+	if (const double window = static_cast<double>(m_extent.width) / std::max(1u, m_extent.height);
+	    wide > 0.0 && std::fabs(aspect / window - 1.0) < 0.02) {
+		aspect = 0.0;
+	}
+	if (aspect > 0.0 && source.extent.width != 0 && source.extent.height != 0) {
+		dst_w = std::max(1, static_cast<int>(std::lround(std::min<double>(m_extent.width, m_extent.height * aspect))));
+		dst_h = std::max(1, static_cast<int>(std::lround(std::min<double>(m_extent.height, m_extent.width / aspect))));
 		dst_x = (static_cast<int>(m_extent.width) - dst_w) / 2;
 		dst_y = (static_cast<int>(m_extent.height) - dst_h) / 2;
 		if (dst_w != static_cast<int>(m_extent.width) || dst_h != static_cast<int>(m_extent.height)) {
@@ -946,9 +1113,15 @@ Swapchain::Status Swapchain::Present() {
 	return Status::Success;
 }
 
-Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
+Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {
+	m_impl->thread = std::jthread([this](std::stop_token token) { PresentLoop(std::move(token)); });
+}
 
-Presenter::~Presenter() = default;
+Presenter::~Presenter() {
+	// The presenter's thread ends before what it presents with (a frame still waiting is not shown).
+	m_impl->thread.request_stop();
+	if (m_impl->thread.joinable()) m_impl->thread.join();
+}
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
 	KYTY_PROFILER_FUNCTION();
@@ -972,6 +1145,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->scene    = FrameGen::TakeScene();
 	frame->fg.valid = false;
 	if (FrameGen::Capturing()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
@@ -983,26 +1157,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
-	auto              format = m_impl->frames.GetFormat();
-	auto*             frame  = m_impl->frames.Acquire();
-	// Into the GPU thread's command buffer (its flip) under the renderer's lock; the present thread's blank frame
-	// (no producer) touches only the presenter's own scheduler and frame, as Present does.
-	std::optional<RenderLockGuard> render_lock;
-	if (producer != nullptr) render_lock.emplace(m_impl->renderer.GetMutex());
-	frame->fg.valid = false;
-	frame->hdr      = false;
-	frame->blank    = true;
-	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
-	vk::ClearColorValue clear {};
-	clear.float32[3] = opaque ? 1.0f : 0.0f;
-	if (producer != nullptr) {
-		EXIT_IF(producer->IsInvalid());
-		frame->Clear(*producer, clear);
-	} else {
-		auto& command = m_impl->present_scheduler.BeginCommand();
-		frame->Clear(command, clear);
-		frame->present_tick = m_impl->present_scheduler.Submit();
-	}
+	EXIT_IF(producer == nullptr || producer->IsInvalid());
+	auto*           frame = m_impl->frames.Acquire();
+	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
+	m_impl->ClearFrame(*frame, width, height, opaque, producer);
 	return *frame;
 }
 
@@ -1010,22 +1168,80 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 	return m_impl->frames.AcquireLast();
 }
 
-bool Presenter::PresentSkippedIfDue() {
+void Presenter::Submit(Frame& frame, bool reuse) {
+	m_impl->frames.ValidateForPresent(&frame, reuse);
+	m_impl->Replace({.frame = &frame, .reuse = reuse});
+}
+
+void Presenter::SubmitBlank(uint32_t width, uint32_t height, bool opaque) {
+	m_impl->Replace({.blank = true, .width = width, .height = height, .opaque = opaque});
+}
+
+bool Presenter::PresentIdle() {
+	std::lock_guard lock(m_impl->waiting_mutex);
+	return m_impl->waiting.Empty() && !m_impl->presenting;
+}
+
+void Presenter::PresentLoop(std::stop_token token) {
+	LocalPlatform::SetThreadName("Kyty.Present");
+	auto& impl = *m_impl;
+	for (;;) {
+		Impl::Waiting next;
+		{
+			std::unique_lock lock(impl.waiting_mutex);
+			impl.presenting = false;
+			if (!impl.waiting_changed.wait(lock, token, [&] { return !impl.waiting.Empty(); })) return;
 #if defined(_WIN32)
-	// A game above the display's rate had every frame that came within a refresh of the one before turned away, and
-	// the refresh after it showed nothing new when the next frame was late (a 69 fps game on a 60 Hz display: 52
-	// frames a second shown). Each refresh shows the latest frame now. (Frame generation paces its own frames.)
-	if (!m_impl->skipped_unshown || FrameGen::Enabled() || Fsr3::Active() || !m_impl->PresentDue(false)) return false;
-	auto* frame = PrepareLastFrame();
-	if (frame == nullptr) {
-		m_impl->skipped_unshown = false; // (the GPU thread took it for a newer frame)
-		return false;
-	}
-	Present(*frame, true);
-	return true;
-#else
-	return false;
+			// Held until the display can take it (Impl::PresentDue), a newer one taking its place meanwhile. (A frame
+			// DLSS-G or FSR 3 generates frames for goes at once: it paces its presents itself.)
+			for (;;) {
+				const auto& w = impl.waiting;
+				if (w.frame != nullptr && !w.reuse && w.frame->fg.valid && (FrameGen::Enabled() || Fsr3::Active())) break;
+				const auto due = impl.NextPresentDue();
+				if (std::chrono::steady_clock::now() >= due) break;
+				impl.waiting_changed.wait_until(lock, token, due, [] { return false; });
+				if (token.stop_requested()) return;
+			}
 #endif
+			next            = std::exchange(impl.waiting, {});
+			impl.presenting = true;
+		}
+		if (next.blank) {
+			// A free frame, else none: each frame held is a guest picture on its way here.
+			auto* frame = impl.frames.Acquire(false);
+			if (frame == nullptr) continue;
+			impl.ClearFrame(*frame, next.width, next.height, next.opaque, nullptr);
+			Present(*frame, false);
+		} else {
+			Present(*next.frame, next.reuse);
+		}
+	}
+}
+
+uint32_t Presenter::DisplayVblanksPerTick(uint32_t vblank_hz) {
+#if defined(_WIN32)
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VSYNC_LOCK");
+		return value == nullptr || std::atoi(value) != 0;
+	}();
+	if (!enabled || vblank_hz == 0 || !m_impl->swapchain.IsFifo() || m_impl->window.window == nullptr) return 0;
+	SDL_SysWMinfo info {};
+	SDL_VERSION(&info.version);
+	if (SDL_GetWindowWMInfo(m_impl->window.window, &info) != SDL_TRUE || info.subsystem != SDL_SYSWM_WINDOWS) return 0;
+	// (A 59.94 Hz mode reports 59.)
+	const int  refresh = LocalPlatform::DisplayRefreshHz(info.info.win.window);
+	const auto hz      = static_cast<int>(vblank_hz);
+	const int  k       = static_cast<int>(std::lround(static_cast<double>(refresh) / hz));
+	if (refresh <= 0 || k < 1 || std::abs(refresh - k * hz) > 1) return 0;
+	return LocalPlatform::StartDisplayVblanks(info.info.win.window) ? static_cast<uint32_t>(k) : 0;
+#else
+	(void)vblank_hz;
+	return 0;
+#endif
+}
+
+bool Presenter::WaitForDisplayVblank(uint64_t& seen, uint32_t timeout_us) {
+	return LocalPlatform::WaitDisplayVblank(seen, timeout_us);
 }
 
 bool Presenter::IsGuestPaused() const noexcept {
@@ -1058,15 +1274,23 @@ bool Presenter::IsGameView(const Frame& frame) noexcept {
 	return frame.fg.valid;
 }
 
+bool Presenter::IsSceneFrame(const Frame& frame) noexcept {
+	return frame.scene;
+}
+
+bool Presenter::GeneratesFrames() noexcept {
+	return FrameGen::Enabled() || Fsr3::Active();
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 #if defined(_WIN32)
-	if (!m_impl->PresentDue()) {
-		// A frame the display could not show anyway (menus and movies run far above it); it
-		// stays the latest frame for an idle refresh, and the next vblank that finds the display
-		// ready and no newer frame shows it (PresentSkippedIfDue).
-		m_impl->skipped_unshown = true;
+	// (A frame DLSS-G generates frames for goes to it whatever the display's rate: it paces its presents itself, and
+	// held to the refresh it got 57 of a 102 fps game's frames a second on a 60 Hz display, 5x showing 285, not 500.)
+	const bool generated = (FrameGen::Enabled() || Fsr3::Active()) && frame.fg.valid && !reuse;
+	if (!generated && !m_impl->PresentDue()) {
+		// (PresentLoop waited until it was due.)
 		m_impl->frames.Release(&frame, true);
 		return;
 	}
@@ -1123,7 +1347,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
 			// KYTY_FSR3_FG: the HUD as a layer FSR 3 composites over every frame shown, and the frame without it in the
 			// backbuffer (generated frames then have no HUD to drag).
 			if (swapchain.IsFsr3() && !draw_system_overlay)
@@ -1174,9 +1398,6 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
-#if defined(_WIN32)
-		m_impl->skipped_unshown = false;
-#endif
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;

@@ -696,6 +696,9 @@ struct Program: ResourcePlan {
 	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
 	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
 	bool                          lane_local     = false;
+	// Its proof took buffer loads at one address for values the same in every lane: two lanes per invocation after
+	// all where the specialization has a buffer that adds the lane to its index (ADD_TID; CompileProgram).
+	bool                          lane_local_uniform_loads = false;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

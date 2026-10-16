@@ -5,6 +5,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <set>
@@ -24,7 +26,12 @@
 #include <windows.h>
 #include <dxgi1_4.h>
 #include <psapi.h>
+#include <softpub.h>
 #include <tlhelp32.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 #include <atomic>
 #include <cstdio>
 #include <fcntl.h>
@@ -500,6 +507,7 @@ struct KeptFile {
 	HANDLE   handle     = INVALID_HANDLE_VALUE;
 	uint64_t size       = 0;
 	bool     prefetched = false;
+	bool     ahead      = false; // opened by FollowKeptFiles's threads, not read by the game yet
 };
 std::mutex                                g_kept_files_mutex;
 std::unordered_map<std::string, KeptFile> g_kept_files; // (never closed: the game's files, read-only)
@@ -548,12 +556,108 @@ void PrefetchThread() {
 }
 } // namespace
 
-uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
-	const std::lock_guard lock(g_kept_files_mutex);
-	if (const auto found = g_kept_files.find(path); found != g_kept_files.end()) {
-		*size = found->second.size;
-		return reinterpret_cast<uint64_t>(found->second.handle);
+// FollowKeptFiles: the recorded opens and the files queued for the openers. A 16 GB laptop loading 1-1 opened 28,528
+// files for 31,390 reads, one after another on the game's file thread (0.9 ms a read at the median, 11 ms at p90:
+// metadata and the antivirus's scan of each first open); its file thread was 60% in CreateFileW over the ~100 s
+// loading fog.
+struct FileFollow {
+	std::mutex                                mutex; // (never held with g_kept_files_mutex)
+	std::condition_variable                   ready;
+	std::unordered_map<std::string, uint32_t> index; // host path -> place in the recording
+	std::vector<const std::string*>           paths; // index's keys in recorded order
+	std::vector<uint8_t>                      queued; // per place: queued, opened or opened by the game
+	std::deque<uint32_t>                      queue;
+	std::string                               root; // (with its separator)
+	FILE*                                     out       = nullptr;
+	uint32_t                                  unflushed = 0;
+	bool                                      on        = false;
+};
+FileFollow g_follow;
+// The opens wait (metadata, the antivirus), each thread one at a time: the 1-1 fog took 28.5-30.7 s with 4 threads and
+// windows of 256, 24.3 s with 8 and 512, 17.6-20.6 s with 16 and 1024, 18.8 s with 32 and 2048. (KYTY_FILE_FOLLOW_WINDOW,
+// KYTY_FILE_FOLLOW_THREADS: other counts.)
+uint32_t g_follow_window = 1024, g_follow_threads = 16;
+
+void FollowOpenThread() {
+	SetThreadName("Kyty.FileOpen");
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	for (;;) {
+		std::string path;
+		{
+			std::unique_lock lock(g_follow.mutex);
+			g_follow.ready.wait(lock, [] { return !g_follow.queue.empty(); });
+			path = *g_follow.paths[g_follow.queue.front()];
+			g_follow.queue.pop_front();
+		}
+		{
+			const std::lock_guard lock(g_kept_files_mutex);
+			if (g_kept_files.contains(path)) continue;
+		}
+		const auto wide = WidePath(path);
+		if (wide.empty()) continue;
+		HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		                            FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (handle == INVALID_HANDLE_VALUE) continue; // (a file of an earlier session gone)
+		LARGE_INTEGER length {};
+		if (GetFileSizeEx(handle, &length) == 0) {
+			CloseHandle(handle);
+			continue;
+		}
+		const std::lock_guard lock(g_kept_files_mutex);
+		const auto [kept, added] =
+		    g_kept_files.try_emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart), false, true});
+		if (!added) CloseHandle(handle);
 	}
+}
+
+// The game opened (or first read) `path`: the recorded files after it queued, or it recorded.
+void FollowFrom(const std::string& path) {
+	std::lock_guard lock(g_follow.mutex);
+	if (!g_follow.on) return;
+	const auto found = g_follow.index.find(path);
+	if (found == g_follow.index.end()) {
+		const auto place = static_cast<uint32_t>(g_follow.paths.size());
+		const auto added = g_follow.index.emplace(path, place).first;
+		g_follow.paths.push_back(&added->first);
+		g_follow.queued.push_back(1);
+		if (g_follow.out != nullptr) {
+			const bool under = !g_follow.root.empty() && path.starts_with(g_follow.root);
+			std::fprintf(g_follow.out, "%s\n", path.c_str() + (under ? g_follow.root.size() : 0));
+			if (++g_follow.unflushed >= 32) {
+				std::fflush(g_follow.out);
+				g_follow.unflushed = 0;
+			}
+		}
+		return;
+	}
+	g_follow.queued[found->second] = 1;
+	// Ahead of the windows queued before (the game left them, or is past them): the next file first.
+	const auto end = std::min<size_t>(size_t {found->second} + 1 + g_follow_window, g_follow.paths.size());
+	bool       any = false;
+	for (auto place = end; place-- > size_t {found->second} + 1;)
+		if (g_follow.queued[place] == 0) {
+			g_follow.queued[place] = 1;
+			g_follow.queue.push_front(static_cast<uint32_t>(place));
+			any = true;
+		}
+	if (any) g_follow.ready.notify_all();
+}
+
+uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
+	{
+		std::unique_lock lock(g_kept_files_mutex);
+		if (const auto found = g_kept_files.find(path); found != g_kept_files.end()) {
+			*size              = found->second.size;
+			const auto handle  = reinterpret_cast<uint64_t>(found->second.handle);
+			const bool first   = std::exchange(found->second.ahead, false);
+			lock.unlock();
+			if (first) FollowFrom(path);
+			return handle;
+		}
+	}
+	FollowFrom(path);
+	// Opened outside the lock: a 16 GB laptop's opens took 100-390 ms while the game streamed a level in, and each
+	// read of a file kept open already (an audio stream's next piece) waited for them behind it (open=150-250 ms).
 	const auto wide = WidePath(path);
 	if (wide.empty()) return 0;
 	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -564,9 +668,11 @@ uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 		CloseHandle(handle);
 		return 0;
 	}
-	g_kept_files.emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart)});
-	*size = static_cast<uint64_t>(length.QuadPart);
-	return reinterpret_cast<uint64_t>(handle);
+	const std::lock_guard lock(g_kept_files_mutex);
+	const auto [kept, added] = g_kept_files.try_emplace(path, KeptFile {handle, static_cast<uint64_t>(length.QuadPart)});
+	if (!added) CloseHandle(handle); // (another thread opened it meanwhile: its handle is the one kept)
+	*size = kept->second.size;
+	return reinterpret_cast<uint64_t>(kept->second.handle);
 }
 
 uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size) {
@@ -577,6 +683,46 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	DWORD got     = 0;
 	if (ReadFile(reinterpret_cast<HANDLE>(file), buffer, size, &got, &at) == 0) return 0;
 	return got;
+}
+
+void FollowKeptFiles(const std::string& recording, const std::string& root) {
+	static std::once_flag once;
+	std::call_once(once, [&] {
+		if (const char* value = std::getenv("KYTY_FILE_FOLLOW"); value != nullptr && std::string_view(value) == "0") return;
+		if (const char* value = std::getenv("KYTY_FILE_FOLLOW_WINDOW"); value != nullptr && *value != '\0')
+			g_follow_window = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 65536u);
+		if (const char* value = std::getenv("KYTY_FILE_FOLLOW_THREADS"); value != nullptr && *value != '\0')
+			g_follow_threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
+		std::lock_guard lock(g_follow.mutex);
+		g_follow.root = root;
+		if (!g_follow.root.empty() && g_follow.root.back() != '/' && g_follow.root.back() != '\\') g_follow.root += '/';
+		if (FILE* in = std::fopen(recording.c_str(), "rb")) {
+			std::string line;
+			for (int c; (c = std::fgetc(in)) != EOF;) {
+				if (c != '\n') {
+					line += static_cast<char>(c);
+					continue;
+				}
+				if (!line.empty() && line.back() == '\r') line.pop_back();
+				if (!line.empty()) {
+					// (Relative: under the root. Absolute: a drive or a separator first.)
+					const bool absolute = line.size() > 1 && (line[1] == ':' || line[0] == '/' || line[0] == '\\');
+					auto       full     = absolute ? line : g_follow.root + line;
+					const auto place    = static_cast<uint32_t>(g_follow.paths.size());
+					if (const auto [added, inserted] = g_follow.index.emplace(std::move(full), place); inserted)
+						g_follow.paths.push_back(&added->first);
+				}
+				line.clear();
+			}
+			std::fclose(in);
+		}
+		g_follow.queued.assign(g_follow.paths.size(), 0);
+		std::error_code error;
+		std::filesystem::create_directories(std::filesystem::path(recording).parent_path(), error);
+		g_follow.out = std::fopen(recording.c_str(), "ab");
+		g_follow.on  = true;
+		for (uint32_t t = 0; t < g_follow_threads; ++t) std::thread(FollowOpenThread).detach();
+	});
 }
 
 void PrefetchKeptFile(const std::string& path) {
@@ -671,6 +817,138 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 
 void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+}
+
+namespace {
+// d3dkmthk.h (WDK) structures for the display's vertical blank, taken from gdi32 at run time.
+using KmtHandle = UINT;
+struct KmtOpenAdapterFromGdiDisplayName {
+	WCHAR     DeviceName[32];
+	KmtHandle hAdapter;
+	LUID      AdapterLuid;
+	UINT      VidPnSourceId;
+};
+struct KmtWaitForVerticalBlankEvent {
+	KmtHandle hAdapter;
+	KmtHandle hDevice;
+	UINT      VidPnSourceId;
+};
+struct KmtCloseAdapter {
+	KmtHandle hAdapter;
+};
+using KmtOpenFn  = LONG(APIENTRY*)(KmtOpenAdapterFromGdiDisplayName*);
+using KmtWaitFn  = LONG(APIENTRY*)(const KmtWaitForVerticalBlankEvent*);
+using KmtCloseFn = LONG(APIENTRY*)(const KmtCloseAdapter*);
+
+struct DisplayVblanks {
+	std::mutex              mutex;
+	std::condition_variable changed;
+	uint64_t                count = 0;
+	std::atomic<HWND>       window {nullptr};
+	std::atomic<bool>       started {false};
+};
+DisplayVblanks g_display_vblanks;
+
+bool MonitorDevice(HWND window, HMONITOR& monitor, MONITORINFOEXW& info) {
+	monitor     = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+	info        = {};
+	info.cbSize = sizeof(info);
+	return monitor != nullptr && GetMonitorInfoW(monitor, &info) != FALSE;
+}
+
+void CountDisplayVblanks(KmtOpenFn open, KmtWaitFn wait, KmtCloseFn close) {
+	SetThreadName("Kyty.DisplayVblank");
+	MakeCriticalThread();
+	HMONITOR  monitor = nullptr;
+	KmtHandle adapter = 0;
+	UINT      source  = 0;
+	uint32_t  waits   = 0;
+	const auto release = [&] {
+		if (adapter != 0) {
+			const KmtCloseAdapter request {adapter};
+			(void)close(&request);
+			adapter = 0;
+		}
+	};
+	for (;;) {
+		// The window's display: at the start, after a failed wait and every 120 vblanks (the window may have moved).
+		if (adapter == 0 || ++waits >= 120) {
+			waits = 0;
+			HMONITOR       now = nullptr;
+			MONITORINFOEXW info {};
+			if (!MonitorDevice(g_display_vblanks.window.load(), now, info)) {
+				release();
+				Sleep(100);
+				continue;
+			}
+			if (adapter == 0 || now != monitor) {
+				release();
+				KmtOpenAdapterFromGdiDisplayName request {};
+				wcsncpy_s(request.DeviceName, info.szDevice, _TRUNCATE);
+				if (open(&request) != 0) {
+					Sleep(100);
+					continue;
+				}
+				monitor = now;
+				adapter = request.hAdapter;
+				source  = request.VidPnSourceId;
+			}
+		}
+		const KmtWaitForVerticalBlankEvent request {adapter, 0, source};
+		if (wait(&request) != 0) {
+			release();
+			Sleep(16);
+			continue;
+		}
+		{
+			std::lock_guard lock(g_display_vblanks.mutex);
+			g_display_vblanks.count++;
+		}
+		g_display_vblanks.changed.notify_all();
+	}
+}
+} // namespace
+
+int DisplayRefreshHz(void* window) {
+	HMONITOR       monitor = nullptr;
+	MONITORINFOEXW info {};
+	if (!MonitorDevice(static_cast<HWND>(window), monitor, info)) return 0;
+	DEVMODEW mode {};
+	mode.dmSize = sizeof(mode);
+	if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) == FALSE) return 0;
+	return mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) : 0;
+}
+
+bool StartDisplayVblanks(void* window) {
+	g_display_vblanks.window.store(static_cast<HWND>(window));
+	if (g_display_vblanks.started.load()) return true;
+	HMODULE    gdi   = GetModuleHandleW(L"gdi32.dll");
+	if (gdi == nullptr) gdi = LoadLibraryW(L"gdi32.dll");
+	const auto open  = gdi != nullptr ? reinterpret_cast<KmtOpenFn>(reinterpret_cast<void*>(
+	                                       GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName")))
+	                                  : nullptr;
+	const auto wait  = gdi != nullptr ? reinterpret_cast<KmtWaitFn>(reinterpret_cast<void*>(
+	                                       GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent")))
+	                                  : nullptr;
+	const auto close = gdi != nullptr ? reinterpret_cast<KmtCloseFn>(reinterpret_cast<void*>(
+	                                        GetProcAddress(gdi, "D3DKMTCloseAdapter")))
+	                                  : nullptr;
+	if (open == nullptr || wait == nullptr || close == nullptr) return false;
+	if (!g_display_vblanks.started.exchange(true)) std::thread(CountDisplayVblanks, open, wait, close).detach();
+	return true;
+}
+
+bool WaitDisplayVblank(uint64_t& seen, uint32_t timeout_us) {
+	if (!g_display_vblanks.started.load()) return false;
+	std::unique_lock lock(g_display_vblanks.mutex);
+	if (seen == 0) seen = g_display_vblanks.count; // (a caller's first wait: the next vblank)
+	if (!g_display_vblanks.changed.wait_for(lock, std::chrono::microseconds(timeout_us),
+	                                        [&] { return g_display_vblanks.count > seen; })) {
+		return false;
+	}
+	// One vblank a call: those that came while the caller was away are caught up, four at most.
+	seen = std::max(seen + 1, g_display_vblanks.count > 4 ? g_display_vblanks.count - 4 : uint64_t {0});
+	return true;
 }
 
 uint64_t OpenScratchFile() {
@@ -1274,6 +1552,36 @@ bool QuerySharedGpuMemory(uint64_t* usage) {
 	return true;
 }
 
+bool IsNvidiaSigned(const std::wstring& path) {
+	WINTRUST_FILE_INFO file {};
+	file.cbStruct      = sizeof(file);
+	file.pcwszFilePath = path.c_str();
+	WINTRUST_DATA data {};
+	data.cbStruct            = sizeof(data);
+	data.dwUIChoice          = WTD_UI_NONE;
+	data.fdwRevocationChecks = WTD_REVOKE_NONE;
+	data.dwUnionChoice       = WTD_CHOICE_FILE;
+	data.pFile               = &file;
+	data.dwStateAction       = WTD_STATEACTION_VERIFY;
+	data.dwProvFlags         = WTD_CACHE_ONLY_URL_RETRIEVAL;
+	GUID       action        = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+	const LONG status        = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+	bool       nvidia        = false;
+	if (status == ERROR_SUCCESS) {
+		// The signer: the leaf certificate of the first signature's chain.
+		auto* provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+		auto* signer   = provider != nullptr ? WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0) : nullptr;
+		auto* cert     = signer != nullptr ? WTHelperGetProvCertFromChain(signer, 0) : nullptr;
+		wchar_t name[256] {};
+		if (cert != nullptr && cert->pCert != nullptr &&
+		    CertGetNameStringW(cert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, 256) > 1)
+			nvidia = std::wstring(name) == L"NVIDIA Corporation";
+	}
+	data.dwStateAction = WTD_STATEACTION_CLOSE;
+	(void)WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+	return nvidia;
+}
+
 #else
 
 void SetThreadName(const char* name) {
@@ -1339,6 +1647,8 @@ uint32_t ReadOpenFileAt(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/
 }
 
 void PrefetchKeptFile(const std::string& /*path*/) {}
+
+void FollowKeptFiles(const std::string& /*recording*/, const std::string& /*root*/) {}
 
 std::vector<std::pair<uint32_t, std::string>> ProcessThreads() {
 	return {};
@@ -1427,6 +1737,18 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 
 void MakeCriticalThread() {}
 
+int DisplayRefreshHz(void* /*window*/) {
+	return 0;
+}
+
+bool StartDisplayVblanks(void* /*window*/) {
+	return false;
+}
+
+bool WaitDisplayVblank(uint64_t& /*seen*/, uint32_t /*timeout_us*/) {
+	return false;
+}
+
 // Handles are the file descriptor + 1 (0: none).
 uint64_t OpenScratchFile() {
 	const char* directory = std::getenv("TMPDIR");
@@ -1514,6 +1836,10 @@ bool QueryVideoMemory(uint64_t* /*usage*/, uint64_t* /*budget*/) {
 }
 
 bool QuerySharedGpuMemory(uint64_t* /*usage*/) {
+	return false;
+}
+
+bool IsNvidiaSigned(const std::wstring& /*path*/) {
 	return false;
 }
 

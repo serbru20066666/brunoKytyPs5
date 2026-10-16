@@ -954,10 +954,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}();
 		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
 		std::string reason;
-		result.lane_local = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr);
+		bool        uniform_loads = false;
+		result.lane_local         = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr, &uniform_loads);
+		result.lane_local_uniform_loads = result.lane_local && uniform_loads;
 		if (log)
 			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
-			            result.lane_local ? "yes" : reason.c_str());
+			            result.lane_local ? (uniform_loads ? "yes (uniform loads)" : "yes") : reason.c_str());
 	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
@@ -1054,8 +1056,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
-			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u && !result.lane_local &&
-			    total_threads % 64u != 0u) {
+			// (Also a lane-local program that may run two lanes per invocation after all: CompileProgram.)
+			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+			    (!result.lane_local || result.lane_local_uniform_loads) && total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
 			}

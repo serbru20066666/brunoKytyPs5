@@ -965,6 +965,84 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	// KYTY_FPS_HUD: the frame-time graph (the frames green, hitches red; the render thread's busy part of each
+	// orange; lines at 60 and 30 fps) and the detailed panel's rows with the processor's cores as bars.
+	void DrawPerf(const SystemOverlayPerf& perf, float unit) {
+		const ImU32 green = IM_COL32(118, 186, 0, 255), red = IM_COL32(235, 64, 52, 255),
+		            orange = IM_COL32(255, 160, 40, 110), grid = IM_COL32(255, 255, 255, 60),
+		            dim = IM_COL32(255, 255, 255, 150);
+		auto*       draw  = ImGui::GetWindowDrawList();
+		const float width = 420.0f * unit;
+		if (!perf.frame_ms.empty()) {
+			const float height = 100.0f * unit;
+			ImGui::Dummy({0.0f, 8.0f * unit});
+			ImGui::PushFont(hud_font, 16.0f * unit);
+			ImGui::TextColored({1.0f, 1.0f, 1.0f, 0.75f}, "%s", perf.graph_note.c_str());
+			ImGui::PopFont();
+			ImGui::Dummy({0.0f, 3.0f * unit});
+			const ImVec2 origin = ImGui::GetCursorScreenPos();
+			ImGui::Dummy({width, height});
+			draw->AddRectFilled(origin, {origin.x + width, origin.y + height}, IM_COL32(0, 0, 0, 110), 4.0f * unit);
+			// 0 to 40 ms (longer frames reach the top): the 60 fps line 42% of the way up, the 30 fps one 83%.
+			constexpr float top = 40.0f;
+			const auto      y   = [&](float ms) { return origin.y + height - std::min(ms / top, 1.0f) * height; };
+			const auto  n = perf.frame_ms.size();
+			const auto  x = [&](size_t i) {
+                return origin.x + (n > 1 ? width * static_cast<float>(i) / static_cast<float>(n - 1) : 0.0f);
+			};
+			const float step = n > 1 ? width / static_cast<float>(n - 1) : width;
+			for (size_t i = 0; i < perf.busy_ms.size() && i < n; ++i)
+				draw->AddRectFilled({x(i) - step * 0.5f, y(perf.busy_ms[i])}, {x(i) + step * 0.5f, origin.y + height}, orange);
+			ImGui::PushFont(hud_font, 13.0f * unit);
+			for (const auto& [ms, label]: {std::pair {1000.0f / 60.0f, "60"}, std::pair {1000.0f / 30.0f, "30"}}) {
+				if (ms >= top) continue;
+				draw->AddLine({origin.x, y(ms)}, {origin.x + width, y(ms)}, grid, 1.0f * unit);
+				draw->AddText({origin.x + 4.0f * unit, y(ms) - 15.0f * unit}, dim, label);
+			}
+			ImGui::PopFont();
+			for (size_t i = 1; i < n; ++i) {
+				// (A frame half again as long as the one before it, and over 20 ms: a hitch.)
+				const bool hitch = perf.frame_ms[i] > 20.0f && perf.frame_ms[i] > perf.frame_ms[i - 1] * 1.5f;
+				draw->AddLine({x(i - 1), y(perf.frame_ms[i - 1])}, {x(i), y(perf.frame_ms[i])}, hitch ? red : green,
+				              (hitch ? 2.0f : 1.5f) * unit);
+			}
+		}
+		if (perf.rows.empty()) return;
+		ImGui::Dummy({0.0f, 8.0f * unit});
+		ImGui::PushFont(hud_font, 17.0f * unit);
+		const float value_x = 64.0f * unit;
+		for (const auto& row: perf.rows) {
+			const float left = ImGui::GetCursorPosX();
+			ImGui::TextColored({0.62f, 0.78f, 1.0f, 1.0f}, "%s", row.label.c_str());
+			ImGui::SameLine(left + value_x);
+			ImGui::TextUnformatted(row.value.c_str());
+			if (row.label == "CPU" && !perf.core_load.empty()) {
+				// The cores as bars, a hybrid processor's performance cores brighter.
+				const float  bar_height = 26.0f * unit, gap = 2.0f * unit;
+				const auto   count      = static_cast<float>(perf.core_load.size());
+				const float  bar_width  = std::min(14.0f * unit, (width - value_x - gap * (count - 1.0f)) / count);
+				ImGui::SetCursorPosX(left + value_x);
+				const ImVec2 origin = ImGui::GetCursorScreenPos();
+				ImGui::Dummy({count * (bar_width + gap), bar_height + 4.0f * unit});
+				for (size_t i = 0; i < perf.core_load.size(); ++i) {
+					const bool  fast = i < perf.core_fast.size() && perf.core_fast[i] != 0;
+					const float x0   = origin.x + static_cast<float>(i) * (bar_width + gap);
+					draw->AddRectFilled({x0, origin.y}, {x0 + bar_width, origin.y + bar_height}, IM_COL32(255, 255, 255, 40));
+					draw->AddRectFilled({x0, origin.y + bar_height * (1.0f - std::clamp(perf.core_load[i], 0.0f, 1.0f))},
+					                    {x0 + bar_width, origin.y + bar_height},
+					                    fast ? IM_COL32(110, 170, 255, 255) : IM_COL32(60, 200, 190, 255));
+				}
+				if (!perf.core_note.empty()) {
+					ImGui::SetCursorPosX(left + value_x);
+					ImGui::PushFont(hud_font, 15.0f * unit);
+					ImGui::TextColored({1.0f, 1.0f, 1.0f, 0.75f}, "%s", perf.core_note.c_str());
+					ImGui::PopFont();
+				}
+			}
+		}
+		ImGui::PopFont();
+	}
+
 	// Top right of the game image, below the game's own corner icon: the frame rate (KYTY_FPS_HUD)
 	// and under it the progress line.
 	void DrawHud(SystemOverlayHud& hud) {
@@ -998,9 +1076,12 @@ struct SystemOverlay::Impl {
 				ImGui::PushFont(hud_font, 46.0f * unit);
 				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
 				ImGui::PopFont();
-				ImGui::PushFont(hud_font, 21.0f * unit);
-				ImGui::TextUnformatted(hud.detail.c_str());
-				ImGui::PopFont();
+				if (!hud.detail.empty()) {
+					ImGui::PushFont(hud_font, 21.0f * unit);
+					ImGui::TextUnformatted(hud.detail.c_str());
+					ImGui::PopFont();
+				}
+				DrawPerf(hud.perf, unit);
 			});
 		}
 		if (!hud.status.empty()) {
