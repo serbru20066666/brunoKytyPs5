@@ -63,6 +63,7 @@ struct Sources {
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
 bool g_taa_dlss = false; // KYTY_TAA_REPLACE=dlss: DLSS (DLAA) in place of the game's TAA
+double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
@@ -400,6 +401,10 @@ bool Requested() {
 	return g_generate > 0;
 }
 
+double RealFrameInterval() {
+	return g_ready ? g_real_interval : 0.0;
+}
+
 bool StreamlineLoaded() {
 	return g_generate > 0 || g_dlss_sr || g_taa_dlss;
 }
@@ -722,6 +727,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		}
 		if (cap != 0 && g_generate > 0) {
 			reflex.frameLimitUs = static_cast<uint32_t>(1000000.0 * (g_generate + 1) / cap);
+			g_real_interval     = static_cast<double>(g_generate + 1) / cap;
 			std::printf("Frame generation: shown frames held under %u fps (rendered at most %.1f, Reflex limit %u us)\n", cap,
 			            static_cast<double>(cap) / (g_generate + 1), reflex.frameLimitUs);
 		}

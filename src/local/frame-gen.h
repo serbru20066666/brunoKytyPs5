@@ -75,6 +75,10 @@ void Initialize();
 [[nodiscard]] bool Requested();
 // Streamline is loaded (DLSS frame generation or DLSS super resolution): it is the Vulkan loader then.
 [[nodiscard]] bool StreamlineLoaded();
+// DLSS-G under the G-SYNC cap (KYTY_VRR_CAP_FPS): the real frames' least interval in seconds, 0 when none. The flip
+// queue holds the game to it (videoOut.cpp): Reflex's limit alone held the presents, and the game made 60 a second at
+// x6 (37.3 shown real): the rest dropped, a stutter.
+[[nodiscard]] double RealFrameInterval();
 // Frames to generate per rendered frame (KYTY_FRAMEGEN; 0 when off).
 [[nodiscard]] int  GeneratedFrames();
 // The present thread's stages around a DLSS-G present, timed into the [dlssg] line: the swapchain image acquire, the

@@ -25,6 +25,7 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 #include "local/fsr3-fg.h"
+#include "local/frame-gen.h"
 
 #include <algorithm>
 #include <array>
@@ -1301,7 +1302,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// a second were dropped (a stutter). Half a vblank early is due (the flips land on the nearest vblank).
 	static std::chrono::steady_clock::time_point s_paced_next {};
 	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying()
-	                                  ? Graphics::Fsr3::RealFrameInterval()
+	                                  ? std::max(Graphics::Fsr3::RealFrameInterval(), Graphics::FrameGen::RealFrameInterval())
 	                                  : 0.0;
 	const auto   paced_now      = std::chrono::steady_clock::now();
 	const auto   paced_step     = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
