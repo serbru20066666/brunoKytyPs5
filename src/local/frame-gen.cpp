@@ -968,57 +968,6 @@ bool TaaReplaceWanted() {
 	return g_taa_dlss;
 }
 
-bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
-#ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_taa_dlss || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
-	const auto& color_b = images[0];
-	const auto& depth_b = images[1];
-	const auto& mv_b    = images[3];
-	const auto& out_b   = images[6];
-	if (!color_b.image_id || !depth_b.image_id || !mv_b.image_id || !out_b.image_id || color_b.image_view == nullptr ||
-	    depth_b.image_view == nullptr || mv_b.image_view == nullptr || out_b.image_view == nullptr)
-		return false;
-	auto& color  = g_cache->GetImage(color_b.image_id);
-	auto& depth  = g_cache->GetImage(depth_b.image_id);
-	auto& motion = g_cache->GetImage(mv_b.image_id);
-	auto& output = g_cache->GetImage(out_b.image_id);
-	const vk::Extent2D render {color.backing.extent.width, color.backing.extent.height};
-	if (output.backing.extent.width != render.width || output.backing.extent.height != render.height ||
-	    depth.backing.extent.width != render.width || motion.backing.extent.width != render.width)
-		return false;
-	static bool                  reset   = true;
-	static uint64_t              last    = 0;
-	const uint64_t               frame   = g_guest_frame;
-	reset = reset || frame > last + 2; // (a gap: menus, loading screens or movies in between)
-	last  = frame;
-#if defined(KYTY_LOCAL_VULKAN_RECORDING)
-	LocalVulkanRecording::Drain();
-#endif
-	DlssLayouts layouts;
-	layouts.color  = color_b.layout;
-	layouts.depth  = depth_b.layout;
-	layouts.motion = mv_b.layout;
-	layouts.output = out_b.layout;
-	const bool done = DlssEvaluate(static_cast<VkCommandBuffer>(vk_command), color.backing, color_b.image_view, depth.backing,
-	                               depth_b.image_view, motion.backing, mv_b.image_view, output.backing, out_b.image_view,
-	                               render, render, g_camera, reset, true, layouts);
-	command.InvalidateGraphicsState();
-	static uint32_t logs = 0;
-	if (done && logs < 2) {
-		++logs;
-		std::printf("TAA: replaced by DLSS (DLAA %ux%u, camera %s)\n", render.width, render.height,
-		            g_camera.valid ? "valid" : "none");
-		std::fflush(stdout);
-	}
-	if (done) reset = false;
-	return done;
-#else
-	(void)command;
-	(void)vk_command;
-	(void)images;
-	return false;
-#endif
-}
 
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count) {
@@ -1661,6 +1610,58 @@ void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D e
 	RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr, &g_up_output_view), "upscaling output view");
 }
 } // namespace
+
+bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_taa_dlss || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
+	const auto& color_b = images[0];
+	const auto& depth_b = images[1];
+	const auto& mv_b    = images[3];
+	const auto& out_b   = images[6];
+	if (!color_b.image_id || !depth_b.image_id || !mv_b.image_id || !out_b.image_id || color_b.image_view == nullptr ||
+	    depth_b.image_view == nullptr || mv_b.image_view == nullptr || out_b.image_view == nullptr)
+		return false;
+	auto& color  = g_cache->GetImage(color_b.image_id);
+	auto& depth  = g_cache->GetImage(depth_b.image_id);
+	auto& motion = g_cache->GetImage(mv_b.image_id);
+	auto& output = g_cache->GetImage(out_b.image_id);
+	const vk::Extent2D render {color.backing.extent.width, color.backing.extent.height};
+	if (output.backing.extent.width != render.width || output.backing.extent.height != render.height ||
+	    depth.backing.extent.width != render.width || motion.backing.extent.width != render.width)
+		return false;
+	static bool                  reset   = true;
+	static uint64_t              last    = 0;
+	const uint64_t               frame   = g_guest_frame;
+	reset = reset || frame > last + 2; // (a gap: menus, loading screens or movies in between)
+	last  = frame;
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	LocalVulkanRecording::Drain();
+#endif
+	DlssLayouts layouts;
+	layouts.color  = color_b.layout;
+	layouts.depth  = depth_b.layout;
+	layouts.motion = mv_b.layout;
+	layouts.output = out_b.layout;
+	const bool done = DlssEvaluate(static_cast<VkCommandBuffer>(vk_command), color.backing, color_b.image_view, depth.backing,
+	                               depth_b.image_view, motion.backing, mv_b.image_view, output.backing, out_b.image_view,
+	                               render, render, g_camera, reset, true, layouts);
+	command.InvalidateGraphicsState();
+	static uint32_t logs = 0;
+	if (done && logs < 2) {
+		++logs;
+		std::printf("TAA: replaced by DLSS (DLAA %ux%u, camera %s)\n", render.width, render.height,
+		            g_camera.valid ? "valid" : "none");
+		std::fflush(stdout);
+	}
+	if (done) reset = false;
+	return done;
+#else
+	(void)command;
+	(void)vk_command;
+	(void)images;
+	return false;
+#endif
+}
 
 namespace {
 std::atomic<uint64_t> g_taa_diag_count {0};
