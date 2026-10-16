@@ -17,7 +17,7 @@ $fgModes = @(
 	@('   Frame generation AMD x2',                     'fsr3.json'),
 	@('   Frame generation AMD x3',                     'fsr3-x3.json'),
 	@('   Frame generation AMD x4',                     'fsr3-x4.json'),
-	@('   120 FPS AMD Smooth Souls',                    'fsr3-x3-120.json'),
+	@('   135 FPS AMD Smooth Souls',                    'fsr3-x3-135.json'),
 	@('---------- NVIDIA (RTX) ----------',             ''),
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
@@ -95,6 +95,8 @@ function Start-Game {
 	# Smooth Souls (config *-120.json): vblank de 120 Hz (-Fps120, con la velocidad del juego corregida) para que
 	# KYTY_FLIP_FPS=40 sea 3 vblanks; a 60 Hz quedaba en 2 (30 fps reales, 90 mostrados).
 	if ($config -like '*-120.json') { $psargs += '-Fps120' }
+	# 45 x 3 = 135: vblank de 180 Hz (45 fps = 4 vblanks; videos y menus siguen a 60 = 3 vblanks).
+	if ($config -like '*-135.json') { $psargs += @('-Vblank', '180') }
 	$height = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)][1]
 	if ($height -ne 1440) { $psargs += @('-RenderHeight', "$height") }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
