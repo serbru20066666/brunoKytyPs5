@@ -615,7 +615,9 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 		// tools/local/fsr3-mfg) when it creates the swapchain; AMD's signed DLL ignores it and stays at x2.
 		const char* frames = std::getenv("KYTY_FSR3_FG_FRAMES");
 		if (frames != nullptr && std::atoi(frames) >= 2) {
-			std::printf("FSR3 FG: KYTY_FSR3_FG_FRAMES=%s: 2 generated frames per real frame (x3, patched DLL only)\n", frames);
+			const int generated = std::atoi(frames) >= 3 ? 3 : 2;
+			std::printf("FSR3 FG: KYTY_FSR3_FG_FRAMES=%s: %d generated frames per real frame (x%d, patched DLL only)\n", frames,
+			            generated, generated + 1);
 			std::fflush(stdout);
 		}
 	}
