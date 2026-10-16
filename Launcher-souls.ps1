@@ -92,14 +92,10 @@ function Start-Game {
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
-	# Smooth Souls (config *-120.json): vblank de 120 Hz (-Fps120, con la velocidad del juego corregida) para que
-	# KYTY_FLIP_FPS=40 sea 3 vblanks; a 60 Hz quedaba en 2 (30 fps reales, 90 mostrados).
-	if ($config -like '*-120.json') { $psargs += '-Fps120' }
-	# 45 x 3 = 135: vblank de 180 Hz (45 fps = 4 vblanks; videos y menus siguen a 60 = 3 vblanks).
-	if ($config -like '*-135.json') { $psargs += @('-Vblank', '180') }
-	# 52 x 3 = 156: 52 no cabe en vblanks junto a los 60 de videos y menus; el limitador del FSR3
-	# (KYTY_VRR_CAP_FPS=156) espera los frames reales a 52 y un vblank de 240 Hz (videos y menus 60) los deja salir finos.
-	if ($config -like '*-156.json') { $psargs += @('-Vblank', '240') }
+	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
+	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
+	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
+	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	$height = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)][1]
 	if ($height -ne 1440) { $psargs += @('-RenderHeight', "$height") }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
