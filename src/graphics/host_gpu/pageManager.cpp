@@ -94,8 +94,8 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		uint32_t write_watchers  : 31 = 0;
+		uint32_t access_watchers : 1  = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -126,7 +126,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == 0x7fffffffu) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -141,7 +141,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 4);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
