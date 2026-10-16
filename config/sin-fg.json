@@ -51,8 +51,7 @@
     "KYTY_HITCH_LOG_MS": "25",
     "KYTY_FPS_LOG": "1",
     "KYTY_SYNC_STATS": "0",
-    "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
-    "KYTY_BACKING_ON_DEMAND": "1"
+    "KYTY_ASYNC_DRAW_SYNC_SMALL": "0"
   },
   "command": [
     "--",

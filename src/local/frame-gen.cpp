@@ -619,10 +619,13 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	// G-SYNC: the frames shown (rendered x (1 + generated)) must stay under the monitor's refresh, or the ones past it
 	// leave the variable refresh range (a doubled / jumping picture at 227-228 of 240 Hz). Reflex's limiter holds the
 	// rendered frames to cap / (1 + generated), the way NVIDIA's own G-SYNC + Reflex cap does (240 Hz: 224 shown,
-	// 56 rendered at x4). KYTY_VRR_CAP_FPS=<shown fps> sets it, 0 turns it off; default: refresh - refresh^2 / 3600.
+	// 56 rendered at x4). KYTY_VRR_CAP_FPS=<shown fps> or auto (refresh - refresh^2 / 3600); unset: off.
 	{
 		uint32_t cap = 0;
-		if (const char* text = std::getenv("KYTY_VRR_CAP_FPS"); text != nullptr && *text != '\0') {
+		const char* text = std::getenv("KYTY_VRR_CAP_FPS");
+		if (text == nullptr || *text == '\0') {
+			cap = 0; // off unless asked for: no frame limit by default
+		} else if (std::string(text) != "auto") {
 			cap = static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
 		} else {
 			DEVMODEA mode {};

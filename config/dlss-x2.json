@@ -50,11 +50,10 @@
     "KYTY_ASYNC_DRAW_WAIT_MS": "3",
     "KYTY_HITCH_LOG_MS": "25",
     "KYTY_FPS_LOG": "1",
-    "KYTY_SYNC_STATS": "1",
+    "KYTY_SYNC_STATS": "0",
     "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
     "KYTY_FRAMEGEN": "1",
-    "KYTY_FLIP_DECOUPLE": "1",
-    "KYTY_BACKING_ON_DEMAND": "1"
+    "KYTY_FLIP_DECOUPLE": "1"
   },
   "command": [
     "--",

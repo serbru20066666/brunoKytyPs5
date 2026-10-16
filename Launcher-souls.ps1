@@ -16,11 +16,13 @@ $fgModes = @(
 	@('---------- AMD (todas las graficas) ----------', ''),
 	@('   Frame generation AMD x2',                     'fsr3.json'),
 	@('   Frame generation AMD x3',                     'fsr3-x3.json'),
+	@('   Frame generation AMD x4',                     'fsr3-x4.json'),
+	@('   120 FPS AMD Smooth Souls',                    'fsr3-x3-120.json'),
 	@('---------- NVIDIA (RTX) ----------',             ''),
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
-	@('   Smooth Souls',                                'dlss-x3-120.json')
+	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
