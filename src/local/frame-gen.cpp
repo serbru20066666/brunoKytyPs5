@@ -808,8 +808,9 @@ bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageVie
 	if (set_render != render || set_output != upscale) {
 		const double ratio = static_cast<double>(upscale.height) / render.height;
 		sl::DLSSOptions options {};
+		// (NGX refuses DLSS's ultra quality mode, 0xbad00010 "unsupported parameter" on every evaluate: 1.3x renders
+		// in the quality mode, whose render size range reaches up to the output size.)
 		options.mode = ratio < 1.05   ? sl::DLSSMode::eDLAA
-		               : ratio < 1.4  ? sl::DLSSMode::eUltraQuality
 		               : ratio < 1.6  ? sl::DLSSMode::eMaxQuality
 		               : ratio < 1.85 ? sl::DLSSMode::eBalanced
 		               : ratio < 2.5  ? sl::DLSSMode::eMaxPerformance
@@ -888,14 +889,21 @@ bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageVie
 	if (g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)), cmd) != sl::Result::eOk)
 		return false;
 	const sl::BaseStructure* inputs[] {&viewport};
+	static uint32_t failures = 0;
 	if (const auto result = g_api.evaluate(sl::kFeatureDLSS, *token, inputs, 1, cmd); result != sl::Result::eOk) {
-		static uint32_t errors = 0;
-		if (errors++ < 4) {
+		if (failures < 4) {
 			std::printf("Upscaling: DLSS evaluate failed (%d)\n", static_cast<int>(result));
 			std::fflush(stdout);
 		}
+		// Each failed evaluate tries to create the NGX feature again (slow): off after 30 in a row.
+		if (++failures >= 30) {
+			std::printf("Upscaling: DLSS keeps failing: off (the game scales its 3D image itself)\n");
+			std::fflush(stdout);
+			g_sr_ready = false;
+		}
 		return false;
 	}
+	failures = 0;
 	return true;
 }
 #endif
