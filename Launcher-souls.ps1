@@ -13,13 +13,14 @@ $iniFile  = Join-Path $root 'launcher.ini'
 # Modos de frame generation: texto del desplegable -> config. Se recuerda el indice en launcher.ini.
 $fgModes = @(
 	@('Sin frame generation',                          'sin-fg.json'),
-	@('Frame generation AMD x2',                          'fsr3.json'),
-	@('Frame generation AMD x3',                          'fsr3-x3.json'),
-	@('Frame generation DLSS x2 (NVIDIA)',                'dlss-x2.json'),
-	@('Frame generation DLSS x3 (NVIDIA)',                'dlss-x3.json'),
-	@('Frame generation DLSS x4 (NVIDIA)',                'dlss-x4.json'),
-	@('Frame generation DLSS x3 120 fps',                 'dlss-x3-120.json'),
-	@('Frame generation DLSS x4 240 fps',                 'dlss-x4-240.json')
+	@('---------- AMD (todas las graficas) ----------', ''),
+	@('   Frame generation AMD x2',                     'fsr3.json'),
+	@('   Frame generation AMD x3',                     'fsr3-x3.json'),
+	@('---------- NVIDIA (RTX) ----------',             ''),
+	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
+	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
+	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
+	@('   Smooth Souls',                                'dlss-x3-120.json')
 )
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
@@ -159,7 +160,15 @@ $cmbFg.Location  = New-Object System.Drawing.Point(350, 56)
 $cmbFg.Size      = New-Object System.Drawing.Size(300, 34)
 foreach ($m in $fgModes) { [void]$cmbFg.Items.Add($m[0]) }
 $cmbFg.SelectedIndex = [math]::Min([math]::Max(0, (Get-FgIndex)), $fgModes.Count - 1)
-$cmbFg.Add_SelectedIndexChanged({ Set-FgIndex $cmbFg.SelectedIndex })
+if (-not $fgModes[$cmbFg.SelectedIndex][1]) { $cmbFg.SelectedIndex = [math]::Min($cmbFg.SelectedIndex + 1, $fgModes.Count - 1) }
+$cmbFg.Add_SelectedIndexChanged({
+	# Section titles are not modes: move to the first mode under them.
+	if ($cmbFg.SelectedIndex -ge 0 -and -not $fgModes[$cmbFg.SelectedIndex][1]) {
+		$cmbFg.SelectedIndex = [math]::Min($cmbFg.SelectedIndex + 1, $fgModes.Count - 1)
+		return
+	}
+	Set-FgIndex $cmbFg.SelectedIndex
+})
 $panel.Controls.Add($cmbFg)
 
 function New-Check([string]$text, $x, $y, $w, [string]$key) {
