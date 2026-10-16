@@ -154,6 +154,11 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 // KYTY_TAA_DIAG=1: true for the TAA dispatches of the frames logged ([taa] lines: the first 6 scene frames, then every
 // 600th); the composite's images are logged in those frames too.
 [[nodiscard]] bool TaaDiagFrame();
+// KYTY_TAA_REPLACE=dlss: the game's TAA dispatch replaced by DLSS (DLAA at the render size) on the dispatch's own images:
+// color 0 (jittered), depth 1, motion 3, output 6 (renderCompute.cpp, in place of the dispatch, its descriptors bound).
+// False: the dispatch runs as usual.
+[[nodiscard]] bool TaaReplaceWanted();
+bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,

@@ -34,6 +34,7 @@ $fgModes = @(
 # "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
 	@('1440p nativo',   1440, '',     0),
+	@('DLSS sin TAA',   1440, 'taa-dlss', 0),
 	@('DLSS DLAA',      1440, 'dlss', 0),
 	@('DLSS U.calidad', 1108, 'dlss', 0),
 	@('DLSS Calidad',   960,  'dlss', 0),
@@ -129,15 +130,16 @@ function Start-Game {
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
 	# el dispositivo grafico. Con AMD: FSR o XeSS para reescalar.
-	if ($res[2] -eq 'dlss' -and $config -like 'fsr3*') {
+	if ($res[2] -like '*dlss' -and $config -like 'fsr3*') {
 		[System.Windows.Forms.MessageBox]::Show('El reescalado DLSS va con "Sin frame generation" o con DLSS frame generation. Con la generacion de AMD usa FSR o XeSS para reescalar.', 'Launcher', 'OK', 'Warning') | Out-Null
 		return
 	}
 	if ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
-	if ($res[2]) { $psargs += @('-Upscale', $res[2]) }
+	if ($res[2] -like 'taa-*') { $psargs += @('-TaaReplace', $res[2].Substring(4)) }
+	elseif ($res[2]) { $psargs += @('-Upscale', $res[2]) }
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
-	if ($res[2] -eq 'dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
+	if ($res[2] -like '*dlss' -and $preset) { $psargs += @('-DlssPreset', $preset) }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
 	$form.WindowState = 'Minimized'
 }
@@ -291,7 +293,7 @@ function Fill-Res {
 	$titles = @{ 'dlss' = '--- NVIDIA DLSS ---'; 'xess' = '--- Intel XeSS ---'; 'fsr' = '--- AMD FSR 3.1 ---'; 'juego' = '--- Del juego ---' }
 	$shown  = @()
 	foreach ($family in (Get-ResFamilies)) {
-		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } else { $_[2] }) -eq $family })
+		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } elseif ($_[2] -like 'taa-*') { $_[2].Substring(4) } else { $_[2] }) -eq $family })
 		if ($family -eq '') { $modes = @($resModes | Where-Object { $_[0] -eq '1440p nativo' }) }
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }

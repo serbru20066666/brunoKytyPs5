@@ -62,6 +62,7 @@ struct Sources {
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
+bool g_taa_dlss = false; // KYTY_TAA_REPLACE=dlss: DLSS (DLAA) in place of the game's TAA
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
@@ -389,8 +390,10 @@ bool Enabled() {
 }
 
 bool DlssUpscaleWanted();
+bool TaaReplaceWanted();
 bool Capturing() {
-	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted() || Xess::Wanted();
+	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted() || Xess::Wanted() ||
+	       TaaReplaceWanted();
 }
 
 bool Requested() {
@@ -398,7 +401,7 @@ bool Requested() {
 }
 
 bool StreamlineLoaded() {
-	return g_generate > 0 || g_dlss_sr;
+	return g_generate > 0 || g_dlss_sr || g_taa_dlss;
 }
 
 int GeneratedFrames() {
@@ -441,7 +444,7 @@ bool WantsCamera() {
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
-	if ((g_generate == 0 && !g_dlss_sr) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+	if ((g_generate == 0 && !g_dlss_sr && !g_taa_dlss) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
 		return;
 	}
 	// The real loader: Streamline itself forwards to it.
@@ -516,8 +519,10 @@ void Initialize() {
 	{
 		const char* upscale = std::getenv("KYTY_UPSCALE");
 		g_dlss_sr           = upscale != nullptr && std::string(upscale) == "dlss";
+		const char* taa     = std::getenv("KYTY_TAA_REPLACE");
+		g_taa_dlss          = taa != nullptr && std::string(taa) == "dlss";
 	}
-	if (g_generate == 0 && !g_dlss_sr) {
+	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -548,6 +553,7 @@ void Initialize() {
 		std::printf("Frame generation: NVIDIA's Streamline runtime was not found (choose its folder in the launcher)\n");
 		g_generate = 0;
 		g_dlss_sr  = false;
+		g_taa_dlss = false;
 		return;
 	}
 	const auto interposer = dir / "sl.interposer.dll";
@@ -557,6 +563,7 @@ void Initialize() {
 		std::printf("Frame generation: %s is not signed by NVIDIA, not loaded\n", interposer.string().c_str());
 		g_generate = 0;
 		g_dlss_sr  = false;
+		g_taa_dlss = false;
 		return;
 	}
 	if (std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr) {
@@ -572,6 +579,7 @@ void Initialize() {
 		std::printf("Frame generation: cannot load %s\n", interposer.string().c_str());
 		g_generate = 0;
 		g_dlss_sr  = false;
+		g_taa_dlss = false;
 		return;
 	}
 	const auto load = [&](auto& function, const char* name) {
@@ -588,6 +596,7 @@ void Initialize() {
 		LOGF("frame generation: sl.interposer.dll lacks an entry point\n");
 		g_generate = 0;
 		g_dlss_sr  = false;
+		g_taa_dlss = false;
 		return;
 	}
 	static const std::wstring plugin_dir = dir.wstring();
@@ -604,7 +613,7 @@ void Initialize() {
 	}
 	// DLSS super resolution (KYTY_UPSCALE=dlss): its plugin too; alone without frame generation.
 	if (g_generate == 0) features.clear();
-	if (g_dlss_sr) features.push_back(sl::kFeatureDLSS);
+	if (g_dlss_sr || g_taa_dlss) features.push_back(sl::kFeatureDLSS);
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
@@ -626,6 +635,7 @@ void Initialize() {
 		std::printf("Frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		g_generate = 0;
 		g_dlss_sr  = false;
+		g_taa_dlss = false;
 		return;
 	}
 	// SDL loads the interposer as the Vulkan loader: every instance/device/swapchain call then
@@ -638,20 +648,21 @@ void Initialize() {
 	LOGF("frame generation: this build has no Streamline support\n");
 	g_generate = 0;
 		g_dlss_sr  = false;
+		g_taa_dlss = false;
 #endif
 }
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
-	if (g_generate == 0 && !g_dlss_sr) {
+	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
 	bool loaded              = false;
-	if (g_dlss_sr) {
+	if (g_dlss_sr || g_taa_dlss) {
 		bool dlss_loaded = false;
 		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) != sl::Result::eOk ||
 		    g_api.is_feature_loaded(sl::kFeatureDLSS, dlss_loaded) != sl::Result::eOk || !dlss_loaded ||
@@ -803,13 +814,34 @@ sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D r
 }
 
 // DLSS super resolution of the composite's 3D image (UpscaleComposite): viewport 1, its own frame indices.
+// The images' layouts as given (the composite path: color, depth and motion SHADER_READ_ONLY, output GENERAL; the TAA
+// path: as the TAA dispatch's descriptors have them). `taa`: in place of the game's TAA (viewport 2): its color is
+// jittered (the camera's jitter given), its output the TAA's.
+struct DlssLayouts {
+	vk::ImageLayout color  = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::ImageLayout depth  = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::ImageLayout motion = vk::ImageLayout::eShaderReadOnlyOptimal;
+	vk::ImageLayout output = vk::ImageLayout::eGeneral;
+};
+bool DlssEvaluate(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
+                  vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
+                  vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset,
+                  bool taa, const DlssLayouts& layouts);
 bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
                  vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
                  vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset) {
+	return DlssEvaluate(command, color, color_view, depth, depth_view, motion, motion_view, output, output_view, render,
+	                    upscale, camera, reset, false, DlssLayouts {});
+}
+bool DlssEvaluate(VkCommandBuffer command, const VulkanImage& color, vk::ImageView color_view, const VulkanImage& depth,
+                  vk::ImageView depth_view, const VulkanImage& motion, vk::ImageView motion_view, const VulkanImage& output,
+                  vk::ImageView output_view, vk::Extent2D render, vk::Extent2D upscale, const Camera& camera, bool reset,
+                  bool taa, const DlssLayouts& layouts) {
 	if (!g_sr_ready || g_api.dlss_set_options == nullptr || g_api.evaluate == nullptr) return false;
-	const sl::ViewportHandle viewport {1};
-	static vk::Extent2D      set_render {}, set_output {};
-	if (set_render != render || set_output != upscale) {
+	const sl::ViewportHandle viewport {taa ? 2u : 1u};
+	static vk::Extent2D      set_render[2] {}, set_output[2] {};
+	const int                slot = taa ? 1 : 0;
+	if (set_render[slot] != render || set_output[slot] != upscale) {
 		const double ratio = static_cast<double>(upscale.height) / render.height;
 		sl::DLSSOptions options {};
 		// (NGX refuses DLSS's ultra quality mode, 0xbad00010 "unsupported parameter" on every evaluate: 1.3x renders
@@ -842,19 +874,28 @@ bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageVie
 			g_sr_ready = false;
 			return false;
 		}
-		set_render = render;
-		set_output = upscale;
+		set_render[slot] = render;
+		set_output[slot] = upscale;
 		std::printf("Upscaling: DLSS %ux%u -> %ux%u, mode %u, preset %u\n", render.width, render.height, upscale.width,
 		            upscale.height, static_cast<uint32_t>(options.mode), static_cast<uint32_t>(preset));
 		std::fflush(stdout);
 	}
-	static uint32_t index = 0;
-	++index;
+	static uint32_t indices[2] {};
+	uint32_t        index = ++indices[slot];
 	sl::FrameToken* token = nullptr;
 	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) return false;
 	auto constants = MakeConstants(camera.valid, camera, render);
-	// The game's TAA already resolved its jitter into the image.
-	constants.jitterOffset = sl::float2(0.0f, 0.0f);
+	// After the game's TAA its jitter is resolved in the image; in its place the color is jittered (MakeConstants: the
+	// camera's, KYTY_TAA_JITTER_SIGN=-1 the other way round).
+	if (!taa) {
+		constants.jitterOffset = sl::float2(0.0f, 0.0f);
+	} else {
+		static const float jitter_sign = [] {
+			const char* value = std::getenv("KYTY_TAA_JITTER_SIGN");
+			return value != nullptr && std::atof(value) < 0 ? -1.0f : 1.0f;
+		}();
+		constants.jitterOffset = sl::float2(jitter_sign * constants.jitterOffset.x, jitter_sign * constants.jitterOffset.y);
+	}
 	constants.reset        = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	if (!camera.valid) {
 		// (No camera this frame: the vectors as they are, in UV units towards the motion.)
@@ -877,10 +918,10 @@ bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageVie
 		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
 		return r;
 	};
-	auto in_color  = resource(color, color_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-	auto in_depth  = resource(depth, depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-	auto in_motion = resource(motion, motion_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-	auto out_color = resource(output, output_view, vk::ImageLayout::eGeneral);
+	auto in_color  = resource(color, color_view, layouts.color);
+	auto in_depth  = resource(depth, depth_view, layouts.depth);
+	auto in_motion = resource(motion, motion_view, layouts.motion);
+	auto out_color = resource(output, output_view, layouts.output);
 	const sl::Extent render_extent {0, 0, render.width, render.height};
 	const sl::Extent output_extent {0, 0, upscale.width, upscale.height};
 	const sl::ResourceTag tags[] {
@@ -914,6 +955,62 @@ bool DlssUpscale(VkCommandBuffer command, const VulkanImage& color, vk::ImageVie
 
 bool DlssUpscaleWanted() {
 	return g_dlss_sr;
+}
+
+bool TaaReplaceWanted() {
+	return g_taa_dlss;
+}
+
+bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_taa_dlss || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
+	const auto& color_b = images[0];
+	const auto& depth_b = images[1];
+	const auto& mv_b    = images[3];
+	const auto& out_b   = images[6];
+	if (!color_b.image_id || !depth_b.image_id || !mv_b.image_id || !out_b.image_id || color_b.image_view == nullptr ||
+	    depth_b.image_view == nullptr || mv_b.image_view == nullptr || out_b.image_view == nullptr)
+		return false;
+	auto& color  = g_cache->GetImage(color_b.image_id);
+	auto& depth  = g_cache->GetImage(depth_b.image_id);
+	auto& motion = g_cache->GetImage(mv_b.image_id);
+	auto& output = g_cache->GetImage(out_b.image_id);
+	const vk::Extent2D render {color.backing.extent.width, color.backing.extent.height};
+	if (output.backing.extent.width != render.width || output.backing.extent.height != render.height ||
+	    depth.backing.extent.width != render.width || motion.backing.extent.width != render.width)
+		return false;
+	static bool                  reset   = true;
+	static uint64_t              last    = 0;
+	const uint64_t               frame   = g_guest_frame;
+	reset = reset || frame > last + 2; // (a gap: menus, loading screens or movies in between)
+	last  = frame;
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	LocalVulkanRecording::Drain();
+#endif
+	DlssLayouts layouts;
+	layouts.color  = color_b.layout;
+	layouts.depth  = depth_b.layout;
+	layouts.motion = mv_b.layout;
+	layouts.output = out_b.layout;
+	const bool done = DlssEvaluate(static_cast<VkCommandBuffer>(vk_command), color.backing, color_b.image_view, depth.backing,
+	                               depth_b.image_view, motion.backing, mv_b.image_view, output.backing, out_b.image_view,
+	                               render, render, g_camera, reset, true, layouts);
+	command.InvalidateGraphicsState();
+	static uint32_t logs = 0;
+	if (done && logs < 2) {
+		++logs;
+		std::printf("TAA: replaced by DLSS (DLAA %ux%u, camera %s)\n", render.width, render.height,
+		            g_camera.valid ? "valid" : "none");
+		std::fflush(stdout);
+	}
+	if (done) reset = false;
+	return done;
+#else
+	(void)command;
+	(void)vk_command;
+	(void)images;
+	return false;
+#endif
 }
 
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,

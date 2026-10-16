@@ -1104,7 +1104,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		const auto timing = DispatchTiming::Begin(m_context.GetGraphics(), vk_buffer, program.shader_hash, &bindings,
 		                                          &m_context.GetBufferCache(), input_info.stage.resources.flattened_srt);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		// KYTY_TAA_REPLACE=dlss: DLSS in place of the game's TAA, on the TAA's images.
+		const bool taa_replaced = FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaReplaceWanted() &&
+		                          FrameGen::ReplaceTaa(buffer, vk_buffer, std::span<const TextureBinding> {bindings.images});
+		if (!taa_replaced) vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
 		                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
 		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,
