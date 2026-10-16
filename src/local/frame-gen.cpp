@@ -611,8 +611,9 @@ void Initialize() {
 		if (text.find("reflex") != std::string::npos) features.push_back(sl::kFeatureReflex);
 		if (text.find("pcl") != std::string::npos) features.push_back(sl::kFeaturePCL);
 	}
-	// DLSS super resolution (KYTY_UPSCALE=dlss): its plugin too; alone without frame generation.
-	if (g_generate == 0) features.clear();
+	// DLSS super resolution (KYTY_UPSCALE=dlss, KYTY_TAA_REPLACE=dlss): its plugin too. Without frame generation the
+	// same plugins are loaded all the same (DLSS-G then stays off): with only the DLSS plugin the emulator closed as the
+	// Vulkan device was made (logs 005353, 013603), with the frame generation set it ran.
 	if (g_dlss_sr || g_taa_dlss) features.push_back(sl::kFeatureDLSS);
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
