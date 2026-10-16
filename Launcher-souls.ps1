@@ -24,6 +24,14 @@ $fgModes = @(
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
+# Resolucion 3D (reescalado del propio juego a 4K): texto -> altura (run-windows.ps1 -RenderHeight). 1440 = la del juego.
+$resModes = @(
+	@('3D 1440p', 1440),
+	@('3D 1260p', 1260),
+	@('3D 1080p', 1080),
+	@('3D 900p',  900),
+	@('3D 720p',  720)
+)
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
 		$text = Get-Content -LiteralPath $iniFile -Raw
@@ -84,6 +92,8 @@ function Start-Game {
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
+	$height = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)][1]
+	if ($height -ne 1440) { $psargs += @('-RenderHeight', "$height") }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
 	$form.WindowState = 'Minimized'
 }
@@ -190,6 +200,19 @@ $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
 $panel.Controls.Add($chkHdr)
 $panel.Controls.Add($chkVsync)
+
+$cmbRes = New-Object System.Windows.Forms.ComboBox
+$cmbRes.DropDownStyle = 'DropDownList'
+$cmbRes.Font     = $smallFont
+$cmbRes.Location = New-Object System.Drawing.Point(555, 100)
+$cmbRes.Size     = New-Object System.Drawing.Size(100, 26)
+foreach ($m in $resModes) { [void]$cmbRes.Items.Add($m[0]) }
+$resIndex = 0
+[void][int]::TryParse((Get-IniValue 'resmode' '0'), [ref]$resIndex)
+$cmbRes.SelectedIndex = [math]::Min([math]::Max(0, $resIndex), $resModes.Count - 1)
+$cmbRes.Add_SelectedIndexChanged({ Set-IniValue 'resmode' "$($cmbRes.SelectedIndex)" })
+$tips.SetToolTip($cmbRes, 'Resolucion a la que el juego dibuja el 3D (la salida sigue en 4K). Menos = mas fps, menos nitidez.')
+$panel.Controls.Add($cmbRes)
 
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
 $btnPre = New-Button 'Precompilar shaders' ($W - 610) 46 230 58 $false
