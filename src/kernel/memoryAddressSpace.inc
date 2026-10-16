@@ -69,8 +69,16 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// KYTY_BACKING_ON_DEMAND=1: the section is only reserved and each range is committed when a guest
+		// mapping first covers it (ReplacePlaceholderView). SEC_COMMIT charged the whole 13.5 GiB to the
+		// commit limit at launch: 17.5-18.7 GB committed for 5-10 GB resident (MEMORY_MANAGEMENT reboots).
+		m_on_demand = [] {
+			const char* v = std::getenv("KYTY_BACKING_ON_DEMAND");
+			return v != nullptr && v[0] == '1';
+		}();
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr,
+		    PAGE_EXECUTE_READWRITE | (m_on_demand ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -184,6 +192,9 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool m_on_demand = false;
+#endif
 
 	// Locking: m_mutex (shared) keeps the mappings stable; mapping changes take it exclusively.
 	// m_data_mutex serializes the copies into and out of the backing (the write fence below
@@ -1302,6 +1313,14 @@ private:
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr = nullptr;
+		// Committing through the writable alias commits the section's pages for every view of them.
+		if (m_on_demand &&
+		    VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: commit of %" PRIu64 " bytes failed: 0x%08" PRIx32 "\n",
+			           size, static_cast<uint32_t>(GetLastError()));
+			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
+			return nullptr;
+		}
 		{
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapView, vaddr, size);
 			ptr = MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr), backing_offset, size,

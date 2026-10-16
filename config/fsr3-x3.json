@@ -54,7 +54,8 @@
     "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
     "KYTY_FSR3_FG": "1",
     "KYTY_FSR3_FG_FRAMES": "2",
-    "KYTY_FSR3_HUD_LAYER": "0"
+    "KYTY_FSR3_HUD_LAYER": "0",
+    "KYTY_BACKING_ON_DEMAND": "1"
   },
   "command": [
     "--",

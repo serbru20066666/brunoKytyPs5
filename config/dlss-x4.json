@@ -53,7 +53,8 @@
     "KYTY_SYNC_STATS": "1",
     "KYTY_ASYNC_DRAW_SYNC_SMALL": "0",
     "KYTY_FRAMEGEN": "3",
-    "KYTY_FLIP_DECOUPLE": "1"
+    "KYTY_FLIP_DECOUPLE": "1",
+    "KYTY_BACKING_ON_DEMAND": "1"
   },
   "command": [
     "--",
