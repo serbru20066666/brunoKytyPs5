@@ -92,6 +92,9 @@ function Start-Game {
 	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
 	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
 	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
+	# Smooth Souls (config *-120.json): vblank de 120 Hz (-Fps120, con la velocidad del juego corregida) para que
+	# KYTY_FLIP_FPS=40 sea 3 vblanks; a 60 Hz quedaba en 2 (30 fps reales, 90 mostrados).
+	if ($config -like '*-120.json') { $psargs += '-Fps120' }
 	$height = $resModes[[math]::Max(0, $cmbRes.SelectedIndex)][1]
 	if ($height -ne 1440) { $psargs += @('-RenderHeight', "$height") }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
