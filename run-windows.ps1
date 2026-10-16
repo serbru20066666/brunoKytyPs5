@@ -577,8 +577,10 @@ if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 }
 $memory = @()
 if ($ram -lt 24GB) {
-	$memory += ("This PC has {0:N0} GB of RAM: the game runs, but loading takes longer (the emulator takes about 14 GB " +
-		"while a save loads and keeps using a few GB in play; 32 GB recommended).") -f ($ram / 1GB)
+	$memory += ("This PC has {0:N0} GB of RAM. The game asks Windows for about 25 GB (RAM plus page file), more with " +
+		"frame generation: set the page file to 'System managed size' on a disk with at least 20 GB free, or the game " +
+		"(or Windows) can stop in the middle of play. Settings > System > About > Advanced system settings > " +
+		"Performance > Settings > Advanced > Virtual memory. 32 GB of RAM recommended.") -f ($ram / 1GB)
 }
 if ($commit -lt 34GB) {
 	$memory += ("Windows can give programs only {0:N0} GB more memory (RAM plus page file) and the emulator needs about 34 GB: " +
