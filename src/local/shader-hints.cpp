@@ -35,7 +35,10 @@ using LocalShaderWarmup::Record;
 using LocalShaderWarmup::Writer;
 using Libs::Graphics::ShaderType;
 
-constexpr std::string_view Identity = "KytyShaderHints1:";
+constexpr std::string_view Identity = "KytyShaderHints2:";
+// A hint file of record schema 3 (pixel shaders without their wave size): read as wave64, completed with the wave
+// size of the seed file's program.
+constexpr std::string_view LegacyIdentity = "KytyShaderHints1:";
 // A hint file's body, uncompressed (a recorded seed file's records without code: ~13 MiB for 15000 pipelines).
 constexpr size_t MaxBodyBytes = Cache::MaxBytes;
 
@@ -63,8 +66,9 @@ Code CodeOf(const Record& record) {
 	        static_cast<uint32_t>(record.back_code.size()), Hash(record.code), Hash(record.back_code)};
 }
 
-bool Decode(const std::vector<uint32_t>& words, Record& record) {
+bool Decode(const std::vector<uint32_t>& words, Record& record, uint32_t schema = LocalShaderWarmup::RecordSchema) {
 	Reader reader {words};
+	reader.schema = schema;
 	return LocalShaderWarmup::Visit(reader, record) && reader.cursor == words.size();
 }
 
@@ -87,8 +91,8 @@ std::vector<uint32_t> HintOf(Record record) {
 }
 
 // The code a hint names, or nullopt where its record does not decode.
-std::optional<Code> NamedCode(const std::vector<uint32_t>& hint, Record& record) {
-	if (!Decode(hint, record) || record.code.size() != 3 || record.back_code.size() != 3) return std::nullopt;
+std::optional<Code> NamedCode(const std::vector<uint32_t>& hint, Record& record, uint32_t schema) {
+	if (!Decode(hint, record, schema) || record.code.size() != 3 || record.back_code.size() != 3) return std::nullopt;
 	return Code {static_cast<uint32_t>(record.stage), record.code[0], record.back_code[0],
 	             record.code[1] | (uint64_t(record.code[2]) << 32u), record.back_code[1] | (uint64_t(record.back_code[2]) << 32u)};
 }
@@ -100,6 +104,7 @@ std::vector<uint32_t> Completed(Record& hint, const Record& program) {
 	if (hint.stage == ShaderType::Vertex || hint.stage == ShaderType::Mesh) {
 		BuildStageStaticKey(hint.vertex, hint.static_key);
 	} else if (hint.stage == ShaderType::Pixel) {
+		hint.pixel.wave_size = program.pixel.wave_size; // (the program's: a property of its code)
 		BuildStageStaticKey(hint.pixel, hint.static_key);
 	} else {
 		BuildStageStaticKey(hint.compute, hint.static_key);
@@ -292,8 +297,10 @@ static bool OtherRegion(std::string_view identity, std::string_view game_id) {
 int Apply(const fs::path& hints, const fs::path& seeds, const fs::path& out, const std::string& game_id) {
 	// The hint file: identity line, checksum, one zstd frame.
 	const auto identity = Cache::FileIdentity(hints);
-	if (!identity.starts_with(Identity) || !identity.ends_with('\n') ||
-	    (!game_id.empty() && identity != std::string(Identity) + game_id + "\n" && !OtherRegion(identity, game_id))) {
+	const bool legacy   = identity.starts_with(LegacyIdentity);
+	const auto prefix   = std::string(legacy ? LegacyIdentity : Identity);
+	if (!identity.starts_with(prefix) || !identity.ends_with('\n') ||
+	    (!game_id.empty() && identity != prefix + game_id + "\n" && !OtherRegion(identity, game_id))) {
 		std::fprintf(stderr, "%s: not a hint file of %s\n", Utf8(hints).c_str(), game_id.c_str());
 		return 1;
 	}
@@ -329,7 +336,7 @@ int Apply(const fs::path& hints, const fs::path& seeds, const fs::path& out, con
 	size_t                missing = 0;
 	for (size_t i = 0; i < records.size(); i++) {
 		Record     hint;
-		const auto code  = NamedCode(records[i], hint);
+		const auto code  = NamedCode(records[i], hint, legacy ? 3u : LocalShaderWarmup::RecordSchema);
 		const auto found = code ? programs.find(*code) : programs.end();
 		Record     program;
 		if (found == programs.end() || !Decode(seed_records[found->second], program)) {

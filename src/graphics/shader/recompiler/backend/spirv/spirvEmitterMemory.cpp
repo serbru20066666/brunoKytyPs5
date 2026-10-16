@@ -22,12 +22,13 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	if (state.lane_count == 2) {
 		target = Binary(state, OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
-	const auto shuffled = state.builder.AllocateId();
+	const auto host_target = EmitGuestLaneToHost(state, target);
+	const auto shuffled    = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-	                           ConstantU32(state, ScopeSubgroup), source, target});
+	                           ConstantU32(state, ScopeSubgroup), source, host_target});
 	const auto source_exec = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-	                           ConstantU32(state, ScopeSubgroup), exec, target});
+	                           ConstantU32(state, ScopeSubgroup), exec, host_target});
 	const auto source_active =
 	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
@@ -1122,7 +1123,8 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), result,
-	                           ConstantU32(state, ScopeSubgroup), atomic, source_lane});
+	                           ConstantU32(state, ScopeSubgroup), atomic,
+	                           EmitGuestLaneToHost(state, source_lane)});
 	return result;
 }
 

@@ -1063,7 +1063,7 @@ bool PipelineCache::StaticInputsCurrent(GraphicContext& graphics, const std::fil
 	const auto seeded = std::filesystem::last_write_time(seeds, error);
 	if (error || written < seeded ||
 	    LocalShaderWarmup::Cache::FileIdentity(path) !=
-	        "KytyShaderWarmup3:" + PipelineCacheTitleId() + ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()))
+	        "KytyShaderWarmup4:" + PipelineCacheTitleId() + ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()))
 		return false;
 	// A wave64 GPU's inputs made before 1ad4dccb hold no compute record (their static keys had the seeds' subgroup
 	// size): fewer records than the seed file (1.07: 11,676 for its 20,141, else 28,742), so they are made again.

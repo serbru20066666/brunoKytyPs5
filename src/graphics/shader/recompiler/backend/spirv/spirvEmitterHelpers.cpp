@@ -115,7 +115,11 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	return {subid, ConstantBool(state, true)};
 }
 
-uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+bool GuestWave32Halves(const EmitterState& state) {
+	return state.program.wave_size == 32u && state.lane_count == 1u && state.lane_half == 0u;
+}
+
+uint32_t EmitHostSubgroupLaneId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -123,6 +127,40 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	state.builder.AddFunction(
 	    {OpLoad, TypeU32(state), value, state.subgroup_local_invocation_id_variable});
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+// The GCN lane: for a wave32 program, the lane within the invocation's 32-lane half of the host subgroup.
+uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	const auto host = EmitHostSubgroupLaneId(state);
+	if (!GuestWave32Halves(state)) return host;
+	return EmitBinaryU32(state, OpBitwiseAnd, host, ConstantU32(state, 31));
+}
+
+uint32_t EmitGuestLaneToHost(EmitterState& state, uint32_t guest_lane) {
+	if (!GuestWave32Halves(state)) return guest_lane;
+	const auto base = EmitBinaryU32(state, OpBitwiseAnd, EmitHostSubgroupLaneId(state), ConstantU32(state, ~31u));
+	const auto lane = EmitBinaryU32(state, OpBitwiseAnd, guest_lane, ConstantU32(state, 31));
+	return EmitBinaryU32(state, OpBitwiseOr, base, lane);
+}
+
+// A host ballot (uvec4) reduced to the invocation's own guest wave: its 32-bit word in .x, the rest zero.
+uint32_t EmitNarrowBallotToHalf(EmitterState& state, uint32_t ballot) {
+	if (!GuestWave32Halves(state)) return ballot;
+	const auto low     = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	const auto in_high = state.builder.AllocateId();
+	const auto word    = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
+	state.builder.AddFunction({OpINotEqual, TypeBool(state), in_high,
+	                           EmitBinaryU32(state, OpBitwiseAnd, EmitHostSubgroupLaneId(state),
+	                                         ConstantU32(state, 32)),
+	                           ConstantU32(state, 0)});
+	state.builder.AddFunction({OpSelect, TypeU32(state), word, in_high, high, low});
+	state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(state, 4), result, word,
+	                           ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0)});
+	return result;
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -210,7 +248,7 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
 	                           ConstantU32(state, ScopeSubgroup), ConstantBool(state, true)});
-	return EmitBallotLaneActiveBool(state, active_ballot, lane);
+	return EmitBallotLaneActiveBool(state, EmitNarrowBallotToHalf(state, active_ballot), lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();

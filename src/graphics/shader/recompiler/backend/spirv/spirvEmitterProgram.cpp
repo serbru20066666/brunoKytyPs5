@@ -456,7 +456,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	    {OpGroupNonUniformBallot, ballot_type, low, scope,
 	     other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)});
 	if (other_half == nullptr) {
-		return low;
+		return EmitNarrowBallotToHalf(state, low);
 	}
 	const auto high      = state.builder.AllocateId();
 	const auto low_word  = state.builder.AllocateId();
@@ -502,8 +502,8 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto scope = ConstantU32(state, ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
-		state.builder.AddFunction(
-		    {OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), lane});
+		state.builder.AddFunction({OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
+		                           EmitGuestLaneToHost(state, lane)});
 		return low;
 	}
 	const auto physical_lane = EmitBinaryU32(state, OpBitwiseAnd, lane, ConstantU32(state, 31));

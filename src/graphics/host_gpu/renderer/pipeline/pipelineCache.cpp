@@ -1615,6 +1615,8 @@ struct PipelineCache::ProgramCache {
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.wave_size = input_info.wave_size;
 		}
 		// Table mode: a program the normal path compiled first, in the table form of its specialization, translated
 		// by a compile worker (table_pending until then); a refused one keeps an empty permutation.
@@ -2544,7 +2546,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		std::filesystem::path adopt_from;
 		std::error_code       error;
 		if ((file == nullptr || *file == 0) && !std::filesystem::exists(path, error)) {
-			const auto gpu = "KytyShaderWarmup3:" + title + device.substr(0, 1 + 8 + 1 + 8 + 1);
+			const auto gpu = "KytyShaderWarmup4:" + title + device.substr(0, 1 + 8 + 1 + 8 + 1);
 			std::filesystem::file_time_type newest {};
 			for (const auto& entry: std::filesystem::directory_iterator(root, error)) {
 				const auto candidate = entry.path() / (PipelineCacheGameId() + ".shaders");

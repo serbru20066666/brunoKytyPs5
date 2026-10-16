@@ -56,10 +56,15 @@ struct Writer {
     bool Good() const { return true; }
 };
 
+// Schema 4: a pixel shader record ends with its wave size (SPI_PS_IN_CONTROL.PS_W32_EN). A schema 3 file (an older
+// hint file) is read with wave64 pixel shaders, as those builds translated every one.
+inline constexpr uint32_t RecordSchema = 4;
+
 struct Reader {
     std::span<const uint32_t> words;
     size_t cursor = 0;
     bool good = true;
+    uint32_t schema = RecordSchema;
     template<class T> void operator()(T& value) {
         if (cursor == words.size()) { good = false; return; }
         const auto word = words[cursor++];
@@ -129,7 +134,12 @@ template<class A> bool Visit(A& a, Record& r) {
             s.ps_sample_mask_export_enable, s.ps_sample_shading, s.ps_early_z, s.ps_execute_on_noop);
         Array(a, s.interpolator_settings); Array(a, s.target_output_mode);
         for (auto& mapping : s.target_export_mapping) a(mapping.packed);
-        if (s.input_num > 32) return false;
+        if constexpr (std::is_same_v<A, Reader>) {
+            if (a.schema >= 4) a(s.wave_size); else s.wave_size = 64;
+        } else {
+            a(s.wave_size);
+        }
+        if (s.input_num > 32 || (s.wave_size != 32 && s.wave_size != 64)) return false;
     } else if (r.stage == ShaderType::Compute) {
         auto& s = r.compute;
         Workgroup(a, s); Array(a, s.dispatch_threads_num); Array(a, s.group_id);
@@ -156,6 +166,7 @@ inline ShaderRecompiler::CompileOptions Options(Record& r, std::span<const uint3
         if (r.stage == ShaderType::Mesh) o.wave_size = r.vertex.mesh.wave_size;
     } else if (r.stage == ShaderType::Pixel) {
         o.input_info.pixel = &r.pixel; o.scratch_dwords = r.pixel.scratch_size_dwords;
+        o.wave_size = r.pixel.wave_size;
     } else {
         o.input_info.compute = &r.compute; o.scratch_dwords = r.compute.scratch_size_dwords;
         o.wave_size = r.compute.wave_size;
@@ -222,7 +233,7 @@ public:
         StopWriter();
         records.clear(); pipelines.clear(); record_index.clear(); pipeline_index.clear();
         changed = false; total_bytes = 8;
-        path = location; identity = "KytyShaderWarmup3:" + signature;
+        path = location; identity = "KytyShaderWarmup4:" + signature;
         if (!std::filesystem::exists(path)) return true;
         return Load(path, identity);
     }
@@ -244,7 +255,7 @@ public:
     bool Adopt(const std::filesystem::path& from) {
         if (!Enabled() || !records.empty() || !pipelines.empty()) return false;
         const auto signature = FileIdentity(from);
-        if (!signature.starts_with("KytyShaderWarmup3:") || !Load(from, signature)) return false;
+        if (!signature.starts_with("KytyShaderWarmup4:") || !Load(from, signature)) return false;
         changed = true;
         return true;
     }
@@ -302,7 +313,7 @@ public:
                           std::vector<std::vector<uint32_t>>& out_pipelines) {
         const auto signature = FileIdentity(location);
         std::vector<uint32_t> contents;
-        return signature.starts_with("KytyShaderSeeds2:") && ReadFile(location, signature, contents) &&
+        return signature.starts_with("KytyShaderSeeds3:") && ReadFile(location, signature, contents) &&
                Parse(contents, out_records, out_pipelines);
     }
     // A seed file, or a warmup file of any device signature (kyty_shader_precompile --make-hints reads recordings).
@@ -310,7 +321,7 @@ public:
                            std::vector<std::vector<uint32_t>>& out_pipelines) {
         const auto signature = FileIdentity(location);
         std::vector<uint32_t> contents;
-        return (signature.starts_with("KytyShaderSeeds2:") || signature.starts_with("KytyShaderWarmup3:")) &&
+        return (signature.starts_with("KytyShaderSeeds3:") || signature.starts_with("KytyShaderWarmup4:")) &&
                ReadFile(location, signature, contents) && Parse(contents, out_records, out_pipelines);
     }
 

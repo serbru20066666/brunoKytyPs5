@@ -154,6 +154,9 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_shading            = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	// SPI_PS_IN_CONTROL.PS_W32_EN: the program runs in wave32 (32-bit EXEC/VCC). Translated as wave64 it leaves
+	// the upper 32 lanes of a 64-lane host subgroup (AMD) outside every EXEC change the program makes.
+	uint32_t                                       wave_size                    = 64;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
@@ -287,6 +290,8 @@ bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
+// 32 when SPI_PS_IN_CONTROL.PS_W32_EN is set (and KYTY_PS_WAVE32 is not 0), else 64.
+uint32_t ShaderPsWaveSize(uint32_t ps_in_control);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
 bool ShaderAddressValid(uint64_t addr);
 

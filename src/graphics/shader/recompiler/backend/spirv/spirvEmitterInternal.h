@@ -690,6 +690,15 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 
+// A wave32 program on a host whose subgroups may have 64 lanes (AMD fragment and vertex shaders: the driver picks
+// the size there, subgroup size control covers compute only): each 32-lane half of a host subgroup is one guest
+// wave. Lane ids, ballots and shuffles are then those of the invocation's own half (GCN lane = host lane & 31).
+// On a 32-lane host (NVIDIA) all of this reduces to the identity.
+bool     GuestWave32Halves(const EmitterState& state);
+uint32_t EmitHostSubgroupLaneId(EmitterState& state);
+uint32_t EmitGuestLaneToHost(EmitterState& state, uint32_t guest_lane);
+uint32_t EmitNarrowBallotToHalf(EmitterState& state, uint32_t ballot);
+
 uint32_t EmitAddU32(EmitterState& state, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs);

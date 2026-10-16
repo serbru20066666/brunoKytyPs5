@@ -24,11 +24,13 @@
 #include <bit>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -664,6 +666,19 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	return true;
 }
 
+// SPI_PS_IN_CONTROL bit 15 (PS_W32_EN). KYTY_PS_WAVE32=0 translates every pixel shader as wave64 (the old
+// behavior, for comparison).
+uint32_t ShaderPsWaveSize(uint32_t ps_in_control) {
+	static const bool honor = [] {
+		const char* value = std::getenv("KYTY_PS_WAVE32");
+		const bool  on    = value == nullptr || *value == '\0' || std::string_view(value) != "0";
+		std::printf("Pixel shader wave32 (PS_W32_EN): %s\n", on ? "honored" : "ignored (KYTY_PS_WAVE32=0)");
+		std::fflush(stdout);
+		return on;
+	}();
+	return honor && ((ps_in_control >> 15u) & 1u) != 0u ? 32u : 64u;
+}
+
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
@@ -704,6 +719,16 @@ static void ShaderGetStaticInputInfoPS(
 	     !sh.db_shader_control.shader_z_export_enable &&
 	     !sh.db_shader_control.shader_mask_export_enable);
 	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
+	ps_info.wave_size          = ShaderPsWaveSize(sh.ps_in_control);
+	if (ps_info.wave_size == 32u) {
+		// (Diagnostics: whether the game has wave32 pixel shaders at all.)
+		static std::atomic<uint32_t> seen {0};
+		const auto n = seen.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (n == 1u || n == 1000u || n == 100000u) {
+			std::printf("Pixel shader wave32: %u draw setups so far (SPI_PS_IN_CONTROL=0x%08x)\n", n, sh.ps_in_control);
+			std::fflush(stdout);
+		}
+	}
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -810,6 +835,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
+	key.push_back(info.wave_size);
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;

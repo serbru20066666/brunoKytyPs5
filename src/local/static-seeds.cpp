@@ -19,6 +19,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -71,7 +72,7 @@ constexpr uint8_t TypeCs = 0, TypePs = 1, TypeGs = 2;
 // The host GPU as precompile.py assumes it: no wave64 compute, fragment subgroup reduction.
 constexpr uint32_t HostSubgroupSize = 32, LodStatsSubgroup = 1;
 // precompile.py SEED_IDENTITY: Demon's Souls' title, whatever the game.
-constexpr std::string_view SeedIdentity = "KytyShaderSeeds2:PPSA01341\n";
+constexpr std::string_view SeedIdentity = "KytyShaderSeeds3:PPSA01341\n";
 
 #ifdef _WIN32
 // pathlib's Windows paths: '\' separates too, and paths compare, hash and match patterns case-insensitively.
@@ -801,6 +802,13 @@ uint32_t SystemInputBase(uint32_t addr) {
 	return base;
 }
 
+// SPI_PS_IN_CONTROL.PS_W32_EN, as the emulator reads it (ShaderPsWaveSize, KYTY_PS_WAVE32).
+uint32_t PsWaveSize(uint32_t ps_in_control) {
+	const char* value = std::getenv("KYTY_PS_WAVE32");
+	const bool  honor = value == nullptr || *value == '\0' || std::string_view(value) != "0";
+	return honor && ((ps_in_control >> 15u) & 1u) != 0u ? 32u : 64u;
+}
+
 // keys.pixel_record: a pixel shader drawn after `vertex` (whose outputs feed its interpolators).
 std::vector<uint32_t> PixelRecord(Bytes code, const Agc& agc, const Agc& vertex) {
 	const auto     reg         = [&](uint32_t offset) { return RegFirst(agc.cx_registers, offset).value_or(0); };
@@ -834,8 +842,10 @@ std::vector<uint32_t> PixelRecord(Bytes code, const Agc& agc, const Agc& vertex)
 	const uint32_t sample_shading  = (active & 0x11u) != 0;
 	const uint32_t early_z         = z_order == 1 && kill == 0 && z_export == 0 && mask_export == 0;
 	const uint32_t execute_on_noop = (control >> 10u) & 1u;
+	const uint32_t wave_size       = PsWaveSize(reg(SpiPsInControl));
 	std::vector<uint32_t> key {scratch, input_num, base,      custom,         center, pos_x,    pos_y,       pos_z,
-	                           pos_w,   front_face, ancillary, no_perspective, kill,   z_export, mask_export, early_z};
+	                           pos_w,   front_face, ancillary, no_perspective, kill,   z_export, mask_export, early_z,
+	                           wave_size};
 	for (uint32_t i = 0; i < 8; i++) key.push_back((col >> (4 * i)) & 0xfu); // target_output_mode
 	// target_export_mapping: the identity channel order of the render targets the game binds, 4 a word.
 	key.push_back(IdentityExportMapping * 0x01010101u);
@@ -849,6 +859,7 @@ std::vector<uint32_t> PixelRecord(Bytes code, const Agc& agc, const Agc& vertex)
 	info.resize(info.size() + (32 - input_num), 0);
 	for (uint32_t i = 0; i < 8; i++) info.push_back((col >> (4 * i)) & 0xfu);
 	info.resize(info.size() + 8, IdentityExportMapping);
+	info.push_back(wave_size); // (schema 4: after the export mapping)
 	const auto rsrc2 = RegFirst(agc.sh_registers, SpiShaderPgmRsrc2Ps).value_or(0);
 	return RecordWords(StagePixel, code, UserDataCount(rsrc2), key, info);
 }

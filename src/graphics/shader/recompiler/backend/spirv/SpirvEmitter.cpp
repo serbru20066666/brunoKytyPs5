@@ -309,6 +309,10 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 			}
 		}
 	}
+	// A wave32 program reads its host lane to find its half of a 64-lane host subgroup (GuestWave32Halves).
+	if (program.wave_size == 32u && (requirements.subgroup_ballot || requirements.subgroup_shuffle)) {
+		requirements.subgroup_local_invocation_id = true;
+	}
 	program.spirv_requirements.emplace(requirements);
 }
 
