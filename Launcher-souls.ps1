@@ -1,4 +1,4 @@
-﻿# KytyPS5 - Demon's Souls: lanzador (ventana). Launcher.cmd lo abre.
+# KytyPS5 - Demon's Souls: lanzador (ventana). Launcher.cmd lo abre.
 #   Jugar                -> arranca el juego; con "Frame generation AMD x2" (config\fsr3.json) o
 #                           "x3" (config\fsr3-x3.json, 2 frames generados), si no, sin FG (config\sin-fg.json). Copia de las partidas antes.
 #   Settings             -> carpeta del juego volcado (game-path.txt). La casilla se recuerda en launcher.ini.
@@ -26,7 +26,8 @@ $fgModes = @(
 )
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
 # (-UpscaleHeight; 0 = 1440). DLSS (NVIDIA RTX): DLAA 1x, Ultra calidad 1.3x, Calidad 1.5x, Equilibrado 1.72x,
-# Rendimiento 2x, Ultra rendimiento 3x (720 -> 2160). FSR 3.1 (todas las graficas, para las de bajo rendimiento).
+# Rendimiento 2x, Ultra rendimiento 3x (720 -> 2160). XeSS 3 (todas las graficas): AA 1x, Ultra calidad plus 1.3x,
+# Ultra calidad 1.5x, Calidad 1.7x, Equilibrado 2x, Rendimiento 2.3x (940 -> 2160). FSR 3.1 (graficas de bajo rendimiento).
 # "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
 	@('1440p nativo',   1440, '',     0),
@@ -36,6 +37,12 @@ $resModes = @(
 	@('DLSS Equilib.',  836,  'dlss', 0),
 	@('DLSS Rendim.',   720,  'dlss', 0),
 	@('DLSS U.rendim.', 720,  'dlss', 2160),
+	@('XeSS AA',        1440, 'xess', 0),
+	@('XeSS U.cal.+',   1108, 'xess', 0),
+	@('XeSS U.calidad', 960,  'xess', 0),
+	@('XeSS Calidad',   848,  'xess', 0),
+	@('XeSS Equilib.',  720,  'xess', 0),
+	@('XeSS Rendim.',   940,  'xess', 2160),
 	@('FSR U.calidad',  1108, 'fsr',  0),
 	@('FSR Calidad',    960,  'fsr',  0),
 	@('FSR Equilib.',   848,  'fsr',  0),

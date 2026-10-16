@@ -166,6 +166,19 @@ jobs:
           Move-Item $header.Directory.Parent.FullName _Build\deps\streamline\sdk
           Get-ChildItem _Build\deps\streamline\sdk\bin\x64 -File | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
 
+      # Intel XeSS SDK (super resolution, src/local/xess-sr.cpp; the upscale branch): its headers and libxess.dll
+      # (Intel's redistributable binary) from Intel's public repository, never committed.
+      - name: XeSS SDK
+        if: ${{ github.ref_name == 'upscale' }}
+        shell: pwsh
+        env:
+          XESS_VERSION: v3.0.2
+        run: |
+          git clone --depth 1 --branch $env:XESS_VERSION https://github.com/intel/xess _Build\deps\xess
+          if ($LASTEXITCODE) { throw 'XeSS clone failed' }
+          if (!(Test-Path _Build\deps\xess\inc\xess\xess_vk.h) -or !(Test-Path _Build\deps\xess\bin\libxess.dll)) { throw 'no xess_vk.h or libxess.dll' }
+          Get-Item _Build\deps\xess\bin\libxess.dll | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
@@ -208,6 +221,12 @@ jobs:
           Get-ChildItem "$build\kyty_emulator_*.map" -ErrorAction SilentlyContinue | Select-Object -First 1 |
             ForEach-Object { Copy-Item $_.FullName "$out\kyty_emulator.map" }
           # DLSS Frame Generation (KYTY_FRAMEGEN): Streamline's production DLLs (bin\x64), dlss-prueba builds only.
+          # XeSS super resolution: libxess.dll next to the emulator, with Intel's license.
+          if (Test-Path _Build\deps\xess\bin\libxess.dll) {
+            Copy-Item _Build\deps\xess\bin\libxess.dll $out
+            New-Item -ItemType Directory -Force "$out\LICENSES" | Out-Null
+            Copy-Item _Build\deps\xess\LICENSE.txt "$out\LICENSES\XeSS-LICENSE.txt"
+          }
           if (Test-Path _Build\deps\streamline\sdk\bin\x64) {
             New-Item -ItemType Directory -Force "$out\streamline" | Out-Null
             Copy-Item _Build\deps\streamline\sdk\bin\x64\*.dll "$out\streamline"

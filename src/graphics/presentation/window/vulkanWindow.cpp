@@ -39,6 +39,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 #include "frame-gen.h"
+#include "local/xess-sr.h"
 #include "local/fsr3-fg.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -1023,6 +1024,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		fault_features.pNext       = const_cast<void*>(create_info.pNext);
 		create_info.pNext          = &fault_features;
 	}
+	// XeSS (KYTY_UPSCALE=xess): its mutableDescriptorType feature, with its extension.
+	create_info.pNext = Libs::Graphics::Xess::ChainDeviceFeatures(device_extensions, const_cast<void*>(create_info.pNext));
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1467,6 +1470,10 @@ void WindowContext::CreateVulkan() {
 					device_extensions.push_back(name);
 			}
 		}
+		// KYTY_UPSCALE=xess: what XeSS's Vulkan backend asks for (VK_EXT_mutable_descriptor_type).
+		if (Libs::Graphics::Xess::Wanted())
+			Libs::Graphics::Xess::AddDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions,
+			                                          device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 	}
@@ -1524,6 +1531,7 @@ void WindowContext::CreateVulkan() {
 	}
 	Libs::Graphics::Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
+	Libs::Graphics::Xess::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

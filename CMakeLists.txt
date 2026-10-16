@@ -386,6 +386,7 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
 	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
+	"${KYTY_SOURCE_DIR}/local/xess-sr.cpp"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.h"
 	"${KYTY_SOURCE_DIR}/local/sync-stats.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
@@ -835,6 +836,15 @@ endif()
 # dlopen/dlsym/dladdr for RenderDoc.
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
+
+# Intel XeSS super resolution (src/local/xess-sr.cpp): the XeSS SDK's headers when they were fetched beside the
+# build (_Build/deps/xess, the CI's upscale builds); libxess.dll is loaded at run time.
+set(KYTY_XESS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/xess" CACHE PATH "Intel XeSS SDK (inc/xess/xess_vk.h)")
+if (WIN32 AND EXISTS "${KYTY_XESS_SDK}/inc/xess/xess_vk.h")
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/xess-sr.cpp" APPEND PROPERTY INCLUDE_DIRECTORIES "${KYTY_XESS_SDK}/inc")
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/local/xess-sr.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KYTY_XESS=1)
+	message(STATUS "XeSS SDK: ${KYTY_XESS_SDK}")
+endif()
 
 # Local frame generation experiments (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it
 # was unpacked under _Build/deps (never part of the repository). Its DLLs are loaded at run time.

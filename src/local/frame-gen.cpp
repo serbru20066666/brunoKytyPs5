@@ -1,5 +1,6 @@
 #include "frame-gen.h"
 #include "fsr3-fg.h"
+#include "xess-sr.h"
 #include "graphics/presentation/videoOut.h"
 #include <chrono>
 #include "live-census.h"
@@ -389,7 +390,7 @@ bool Enabled() {
 
 bool DlssUpscaleWanted();
 bool Capturing() {
-	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted();
+	return Enabled() || Fsr3::Active() || Fsr3::UpscaleWanted() || DlssUpscaleWanted() || Xess::Wanted();
 }
 
 bool Requested() {
@@ -1547,7 +1548,8 @@ void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D e
 
 void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std::span<TextureBinding> images) {
 	const bool dlss = DlssUpscaleWanted();
-	if ((!Fsr3::UpscaleWanted() && !dlss) || g_cache == nullptr || g_graphics_ctx == nullptr) return;
+	const bool xess = Xess::Wanted();
+	if ((!Fsr3::UpscaleWanted() && !dlss && !xess) || g_cache == nullptr || g_graphics_ctx == nullptr) return;
 	if (!g_sources.valid) {
 		g_up_reset = true; // menus, loading screens and movies: no TAA pass, the history starts again after them
 		return;
@@ -1624,6 +1626,21 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 		done = DlssUpscale(desc.command, color.backing, scene->image_view, g_up_depth, g_up_depth_view, g_up_motion,
 		                   g_up_motion_view, g_up_output, g_up_output_view, render, output, g_camera, g_up_reset);
 #endif
+	} else if (xess) {
+		Xess::UpscaleDesc x;
+		x.command     = desc.command;
+		x.color       = &color.backing;
+		x.color_view  = scene->image_view;
+		x.depth       = &g_up_depth;
+		x.depth_view  = g_up_depth_view;
+		x.motion      = &g_up_motion;
+		x.motion_view = g_up_motion_view;
+		x.output      = &g_up_output;
+		x.output_view = g_up_output_view;
+		x.render      = render;
+		x.upscale     = output;
+		x.reset       = g_up_reset;
+		done          = Xess::Upscale(x);
 	} else {
 		done = Fsr3::Upscale(*g_graphics_ctx, desc);
 	}
