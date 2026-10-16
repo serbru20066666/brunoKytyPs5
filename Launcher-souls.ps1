@@ -17,7 +17,7 @@ $fgModes = @(
 	@('   Frame generation AMD x2',                     'fsr3.json'),
 	@('   Frame generation AMD x3',                     'fsr3-x3.json'),
 	@('   Frame generation AMD x4',                     'fsr3-x4.json'),
-	@('   150 FPS AMD Smooth Souls',                    'fsr3-x3-150.json'),
+	@('   120 FPS AMD Smooth Souls',                    'fsr3-x3-120.json'),
 	@('---------- NVIDIA (RTX) ----------',             ''),
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
