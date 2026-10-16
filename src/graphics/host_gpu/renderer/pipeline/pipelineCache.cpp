@@ -35,6 +35,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1414,6 +1415,42 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_libraries = std::make_unique<PipelineLibraryCache>(m_graphics, m_driver_cache);
 		m_program_cache->workers = m_libraries.get();
 	}
+	if (m_driver_cache != nullptr) {
+		m_autosave_thread =
+		    std::jthread([this](const std::stop_token& stop) { AutosaveThread(stop); });
+	}
+}
+
+void PipelineCache::AutosaveThread(const std::stop_token& stop) {
+	KYTY_PROFILER_THREAD("PipelineCacheAutosave");
+	// KYTY_PIPELINE_AUTOSAVE_S=<seconds> changes the interval; 0 saves only at exit.
+	static const int64_t interval_s = [] {
+		const char* text = std::getenv("KYTY_PIPELINE_AUTOSAVE_S");
+		return text != nullptr ? std::strtoll(text, nullptr, 10) : 90;
+	}();
+	if (interval_s <= 0) {
+		return;
+	}
+	std::mutex                  sleep_mutex;
+	std::condition_variable_any sleep;
+	for (;;) {
+		{
+			std::unique_lock lock(sleep_mutex);
+			(void)sleep.wait_for(lock, stop, std::chrono::seconds(interval_s), [] { return false; });
+			if (stop.stop_requested()) {
+				return;
+			}
+		}
+		if (m_unsaved_pipelines.load(std::memory_order_relaxed) == 0) {
+			continue;
+		}
+		std::lock_guard lock(m_cache_file_mutex);
+		if (m_driver_cache == nullptr || stop.stop_requested()) {
+			return;
+		}
+		m_unsaved_pipelines.store(0, std::memory_order_relaxed);
+		(void)WriteDriverCacheFile();
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -1694,6 +1731,10 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 void PipelineCache::Save() {
 	// Join before acquiring the cache mutex or destroying the driver cache. This also covers
 	// the WindowRun shutdown path, which calls Save before the PipelineCache destructor.
+	if (m_autosave_thread.joinable()) {
+		m_autosave_thread.request_stop();
+		m_autosave_thread.join();
+	}
 	WaitForPrecompile();
 	if (m_libraries != nullptr) {
 		// The link thread writes to the driver cache, which is saved and destroyed below.
@@ -1701,10 +1742,17 @@ void PipelineCache::Save() {
 	}
 	Common::LockGuard lock(m_mutex);
 	m_program_cache->recording.Close();
+	std::lock_guard file_lock(m_cache_file_mutex);
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	if (WriteDriverCacheFile()) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
+}
 
+bool PipelineCache::WriteDriverCacheFile() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -1725,7 +1773,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -1733,7 +1781,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -1750,12 +1798,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	return true;
 }
 
 // Copies what preparing a non-tessellated draw's stage inputs reads (see GraphicsStageRegisters).
@@ -2367,6 +2414,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	                           ps_input_info, programs, static_params, m_libraries.get(),
 	                           m_driver_cache, may_defer && LinkLaterEnabled());
 	m_graphics_pipelines_created++;
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 	if (PermutationLogEnabled()) [[unlikely]] {
 		// "libs=" lists the library parts compiled: vertex input, pre-rasterization, fragment
 		// shader, fragment output ("-" when all were cached); "mono" is a monolithic pipeline.
@@ -2746,6 +2794,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		                       m_driver_cache);
 	}
 	m_compute_pipelines_created++;
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 	if (PermutationLogEnabled()) [[unlikely]] {
 		const auto now = std::chrono::steady_clock::now();
 		std::printf("pipeline: cs=%llu ms=%.1f%s t=%.3f\n",

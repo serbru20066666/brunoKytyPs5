@@ -64,6 +64,9 @@ struct ConfigOptions {
 	// Resolution reported to the game as the console output: 0 follows the current rule
 	// (4K unless the game's param.json asks for detection), 1 reports 1080p, 2 reports 2160p.
 	uint32_t               reported_resolution         = 0;
+	// Added to the level of detail of pixel shader samples that pick their mip level from screen
+	// derivatives: below zero, textures keep finer mips when the game renders below the output.
+	float                  texture_lod_bias            = 0.0f;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -128,6 +131,7 @@ bool     VrEnabled();
 bool     AmdCpuEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetReportedResolution();
+float    GetTextureLodBias();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

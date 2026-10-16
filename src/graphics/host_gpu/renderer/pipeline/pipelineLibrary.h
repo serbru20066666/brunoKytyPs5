@@ -89,6 +89,11 @@ public:
 	// session; the pipeline cache file does. KYTY_DEBUG_FAST_LINK_NO_CACHE=1 links without it.
 	[[nodiscard]] vk::PipelineCache FastLinkCache() const;
 
+	// The draw path just built a pipeline it waits for. The optimized links hold off until the
+	// draw path has built none for a while: on AMD, a fast link that runs while an optimized link
+	// compiles waits for it, for up to seconds.
+	void NoteForegroundLink();
+
 	// Diagnostics: worker jobs running now, and whether an optimized link is running.
 	[[nodiscard]] uint32_t BusyCompiles() const { return m_busy_compiles.load(); }
 	[[nodiscard]] bool     LinkBusy() const { return m_link_busy.load(); }
@@ -116,7 +121,9 @@ private:
 	};
 
 	void LinkThread(const std::stop_token& stop);
-	void CompileThread(const std::stop_token& stop);
+	void CompileThread(const std::stop_token& stop, size_t index);
+	// Raises the priority of the worker compiling `key`, which the draw path now waits for.
+	void BoostRunning(const std::string& key);
 	// Queues a compile job; m_compile_mutex must be held.
 	void EnqueueLocked(CompileJob&& job, bool urgent);
 	// Runs the job of `key` on the calling thread if no worker has started it, instead of waiting
@@ -140,8 +147,13 @@ private:
 	std::deque<CompileJob>      m_compile_jobs;
 	bool                        m_compile_stopped = false;
 
+	// The key each worker compiles now (empty when idle), under m_compile_mutex.
+	std::vector<std::string> m_running_keys;
+
 	std::atomic_uint32_t m_busy_compiles = 0;
 	std::atomic_bool     m_link_busy     = false;
+	// steady_clock time of the draw path's last pipeline build, in nanoseconds.
+	std::atomic_int64_t  m_last_foreground_ns = 0;
 
 	std::jthread              m_link_thread;
 	std::vector<std::jthread> m_compile_threads;

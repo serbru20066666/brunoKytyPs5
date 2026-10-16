@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
@@ -893,10 +894,27 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[0] = spv::ImageOperandsLodMask;
 			operands[1] = lod;
 			operand_count = 2;
-		} else if (layout.bias != NoImageComponent) {
-			operands[0] = spv::ImageOperandsBiasMask;
-			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
-			operand_count = 2;
+		} else {
+			// --texture-lod-bias: only samples whose mip level comes from screen derivatives, so
+			// post-processing that reads a chosen mip (explicit LOD) is left alone.
+			const float extra_bias = ::Config::GetTextureLodBias();
+			uint32_t    bias       = 0;
+			if (layout.bias != NoImageComponent) {
+				bias = AddressF32(ctx, mem, *address, layout.bias);
+				if (extra_bias != 0.0f) {
+					const auto sum = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpFAdd, TypeF32(state), sum, bias,
+					                          ConstantF32Value(state, extra_bias));
+					bias = sum;
+				}
+			} else if (extra_bias != 0.0f) {
+				bias = ConstantF32Value(state, extra_bias);
+			}
+			if (bias != 0) {
+				operands[0]   = spv::ImageOperandsBiasMask;
+				operands[1]   = bias;
+				operand_count = 2;
+			}
 		}
 		const auto& samplers = state.program.info.samplers.at(mem.sampler).indirect_resources;
 		uint32_t sampler_index = 0;

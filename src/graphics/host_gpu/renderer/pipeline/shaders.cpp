@@ -862,6 +862,7 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
         return std::chrono::duration<double, std::milli>(Clock::now() - from).count();
 	};
 
+	libraries.NoteForegroundLink();
 	const auto push_stages = LibraryPushStages(state);
 	CreateGraphicsLayouts(graphics, pipeline, state, push_stages);
 	const double layouts_ms = elapsed_ms(step_start);
@@ -960,6 +961,7 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 			            built);
 		}
 	}
+	libraries.NoteForegroundLink();
 	libraries.QueueOptimizedLink(&pipeline, parts, layout);
 	pipeline.optimize_pending = true;
 	return built;

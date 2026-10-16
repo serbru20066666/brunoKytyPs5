@@ -232,12 +232,30 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto              result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result == vk::Result::eErrorOutOfDeviceMemory ||
+	    result == vk::Result::eErrorOutOfHostMemory) {
+		// An 8 GB card runs out of video memory in EA SPORTS FC 27's heavier scenes. An image in
+		// system memory is slower to read, but the session goes on instead of ending.
+		LogMemoryBudget();
+		alloc_info.requiredFlags  = 0;
+		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		result                    = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+            &native_image, &image.allocation, nullptr));
+		static std::atomic_uint32_t fallbacks {0};
+		if (result == vk::Result::eSuccess && fallbacks.fetch_add(1) % 64 == 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Video memory full: image {}x{} placed in system memory ({} so far)\n",
+			    image_info.extent.width, image_info.extent.height, fallbacks.load()));
+		}
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
+		Log::WriteToConsoleAndLog(fmt::format("vmaCreateImage failed: {}\n", vk::to_string(result)));
 		return false;
 	}
 

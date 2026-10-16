@@ -34,14 +34,52 @@ void LowerThreadPriority() {
 #endif
 }
 
+int64_t SteadyNowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+// How long the draw path must build no pipeline before an optimized link starts.
+// KYTY_LTO_QUIET_MS=<ms> changes it (0 links at once, as before); KYTY_NO_LTO=1 never relinks.
+int64_t LinkQuietNs() {
+	static const int64_t quiet = [] {
+		const char* text = std::getenv("KYTY_LTO_QUIET_MS");
+		const auto  ms   = text != nullptr ? std::strtoll(text, nullptr, 10) : 2500;
+		return std::max<int64_t>(ms, 0) * 1000000;
+	}();
+	return quiet;
+}
+
 } // namespace
 
 PipelineLibraryCache::PipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache)
-    : m_graphics(graphics), m_driver_cache(driver_cache),
+    : m_graphics(graphics), m_driver_cache(driver_cache), m_running_keys(CompileThreadCount),
       m_link_thread([this](const std::stop_token& stop) { LinkThread(stop); }) {
-	for (uint32_t i = 0; i < CompileThreadCount; i++) {
-		m_compile_threads.emplace_back([this](const std::stop_token& stop) { CompileThread(stop); });
+	for (size_t i = 0; i < CompileThreadCount; i++) {
+		m_compile_threads.emplace_back(
+		    [this, i](const std::stop_token& stop) { CompileThread(stop, i); });
 	}
+}
+
+void PipelineLibraryCache::NoteForegroundLink() {
+	m_last_foreground_ns.store(SteadyNowNs(), std::memory_order_relaxed);
+}
+
+void PipelineLibraryCache::BoostRunning(const std::string& key) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::lock_guard lock(m_compile_mutex);
+	for (size_t i = 0; i < m_running_keys.size() && i < m_compile_threads.size(); i++) {
+		if (m_running_keys[i] == key) {
+			// The worker lowers itself again before its next job.
+			SetThreadPriority(static_cast<HANDLE>(m_compile_threads[i].native_handle()),
+			                  THREAD_PRIORITY_ABOVE_NORMAL);
+			return;
+		}
+	}
+#else
+	(void)key;
+#endif
 }
 
 PipelineLibraryCache::~PipelineLibraryCache() {
@@ -79,6 +117,11 @@ PipelineLibraryCache::Found PipelineLibraryCache::Find(const std::string& key) {
 		KYTY_PROFILER_BLOCK("PipelineLibraryCache::WaitForPrefetch");
 		if (entry.pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
 			RunIfQueued(key);
+			// A below-normal worker loses its core to the game's threads while the draw path
+			// waits for it.
+			if (entry.pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+				BoostRunning(key);
+			}
 		}
 		entry.pipeline = entry.pending.get();
 		entry.pending  = {};
@@ -316,6 +359,34 @@ void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 			job = m_link_jobs.front();
 			m_link_jobs.pop_front();
 		}
+		static const bool no_lto = std::getenv("KYTY_NO_LTO") != nullptr;
+		if (no_lto) {
+			std::lock_guard lock(m_link_mutex);
+			m_optimized.emplace(job.target, nullptr);
+			continue;
+		}
+		// Wait for a pause in the draw path's pipeline builds; see NoteForegroundLink.
+		bool stopping = false;
+		for (;;) {
+			const auto since = SteadyNowNs() - m_last_foreground_ns.load(std::memory_order_relaxed);
+			std::unique_lock lock(m_link_mutex);
+			if (m_link_stopped || stop.stop_requested()) {
+				stopping = true;
+				break;
+			}
+			if (since >= LinkQuietNs()) {
+				break;
+			}
+			const auto wait =
+			    std::chrono::nanoseconds(std::max<int64_t>(LinkQuietNs() - since, 1000000));
+			(void)m_link_available.wait_for(lock, stop, wait, [this] { return m_link_stopped; });
+		}
+		if (stopping) {
+			// Shutting down: the fast-linked pipeline stays.
+			std::lock_guard lock(m_link_mutex);
+			m_optimized.emplace(job.target, nullptr);
+			return;
+		}
 		vk::PipelineLibraryCreateInfoKHR libraries {};
 		libraries.libraryCount = job.part_count;
 		libraries.pLibraries   = job.parts.data();
@@ -338,18 +409,21 @@ void PipelineLibraryCache::LinkThread(const std::stop_token& stop) {
 	}
 }
 
-void PipelineLibraryCache::CompileThread(const std::stop_token& stop) {
+void PipelineLibraryCache::CompileThread(const std::stop_token& stop, size_t index) {
 	KYTY_PROFILER_THREAD("PipelinePrefetch");
-	LowerThreadPriority();
 	for (;;) {
+		// Also undoes a BoostRunning of the previous job.
+		LowerThreadPriority();
 		CompileJob job;
 		{
 			std::unique_lock lock(m_compile_mutex);
+			m_running_keys[index].clear();
 			if (!m_compile_available.wait(lock, stop, [this] { return !m_compile_jobs.empty(); })) {
 				return;
 			}
 			job = std::move(m_compile_jobs.front());
 			m_compile_jobs.pop_front();
+			m_running_keys[index] = job.key;
 		}
 		m_busy_compiles++;
 		auto pipeline = job.compile();

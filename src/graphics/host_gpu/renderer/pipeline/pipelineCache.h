@@ -303,8 +303,16 @@ private:
 	std::jthread                                            m_precompile_thread;
 	std::mutex                                              m_precompile_join_mutex;
 	std::atomic_bool                                        m_precompile_done {true};
+	// Pipelines created since the cache file was last written; the autosave thread writes it
+	// again while the game runs, so a session that crashes or is killed keeps its pipelines.
+	std::atomic_uint64_t                                    m_unsaved_pipelines {0};
+	std::mutex                                              m_cache_file_mutex;
+	std::jthread                                            m_autosave_thread;
 
 	void InitializeDriverCache();
+	void AutosaveThread(const std::stop_token& stop);
+	// Writes the driver cache to its file; m_cache_file_mutex must be held.
+	bool WriteDriverCacheFile();
 	void InitializeShaderPrecompile();
 	void InstallOptimizedPipeline(Pipeline& pipeline, CommandBuffer& command);
 	void WaitForPrecompile();

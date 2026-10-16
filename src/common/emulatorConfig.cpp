@@ -97,6 +97,11 @@ uint32_t GetReportedResolution() {
 	return g_config->reported_resolution;
 }
 
+float GetTextureLodBias() {
+	// Shader recompiler tests run without a configuration.
+	return g_config != nullptr ? g_config->texture_lod_bias : 0.0f;
+}
+
 uint32_t GetConsoleLanguage() {
 	return g_config->console_language;
 }
