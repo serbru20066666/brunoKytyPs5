@@ -73,6 +73,8 @@ void Initialize();
 // After Initialize: Streamline is loaded (device creation then adds what it relies on but does
 // not add itself, VK_KHR_present_id for its VK_NV_low_latency2).
 [[nodiscard]] bool Requested();
+// Streamline is loaded (DLSS frame generation or DLSS super resolution): it is the Vulkan loader then.
+[[nodiscard]] bool StreamlineLoaded();
 // Frames to generate per rendered frame (KYTY_FRAMEGEN; 0 when off).
 [[nodiscard]] int  GeneratedFrames();
 // The present thread's stages around a DLSS-G present, timed into the [dlssg] line: the swapchain image acquire, the

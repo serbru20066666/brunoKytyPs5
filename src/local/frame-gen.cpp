@@ -397,6 +397,10 @@ bool Requested() {
 	return g_generate > 0;
 }
 
+bool StreamlineLoaded() {
+	return g_generate > 0 || g_dlss_sr;
+}
+
 int GeneratedFrames() {
 	return g_generate;
 }

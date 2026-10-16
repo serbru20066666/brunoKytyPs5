@@ -1459,7 +1459,9 @@ void WindowContext::CreateVulkan() {
 		}
 		// KYTY_FRAMEGEN: Streamline enables VK_NV_low_latency2 (Reflex) without the present-id
 		// extension it requires; current drivers then refuse the device.
-		if (FrameGen::Requested() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+		// (DLSS super resolution alone too: Streamline enables Reflex's extension whichever plugins it loads; the
+		// device without present-id closed the emulator as it was made.)
+		if (FrameGen::StreamlineLoaded() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
 		// KYTY_FSR3_FG: the FidelityFX backend calls vkGetBufferMemoryRequirements2KHR (the extension's name,
@@ -1489,7 +1491,7 @@ void WindowContext::CreateVulkan() {
 	                                        device_extensions, graphic_ctx);
 	if (graphic_ctx.device == nullptr) {
 		// (Issue #32: an RTX 5080 whose driver refused the device Streamline asked for; the game runs without it.)
-		if (FrameGen::Requested()) {
+		if (FrameGen::StreamlineLoaded()) {
 			EXIT("Could not create the Vulkan device with DLSS frame generation (NVIDIA Streamline): start without "
 			     "frame generation (launcher: Frame generation -> Off). KYTY_FRAMEGEN_VERBOSE=1 logs why the driver "
 			     "refused it.\n");
