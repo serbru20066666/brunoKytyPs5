@@ -789,6 +789,9 @@ struct DrawCallInfo {
 	uint64_t             indirect_args  = 0;
 	uint32_t             indirect_count = 1;
 	uint32_t             indirect_stride = 0;
+	// Guest address of the GPU-written count of a multi-draw: the GPU reads it instead of a
+	// waiting CPU read (see CommandProcessor::DrawIndirectMulti).
+	uint64_t             indirect_count_addr = 0;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -2173,6 +2176,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	uint64_t                     gpu_output    = 0;
 	const uint8_t*               gpu_output_mapped = nullptr;
 	std::pair<Buffer*, uint64_t> gpu_arguments = {nullptr, 0};
+	std::pair<Buffer*, uint64_t> gpu_count     = {nullptr, 0};
 	if (gpu_args) {
 		const auto command_size = draw.IsIndexed() ? MeshIndirectArgs::ArgumentsSize
 		                                           : MeshIndirectArgs::DrawArgumentsSize;
@@ -2180,6 +2184,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto count  = std::max(draw.indirect_count, 1u);
 		gpu_arguments     = m_context.GetBufferCache().ObtainBuffer(
 		    draw.indirect_args, uint64_t {stride} * (count - 1u) + command_size, false);
+		// A GPU-read count must come from the device copy, which has to be obtained now:
+		// later this function cannot touch guest memory.
+		if (draw.indirect_count_addr != 0) {
+			gpu_count = m_context.GetBufferCache().ObtainBuffer(draw.indirect_count_addr,
+			                                                  sizeof(uint32_t), false);
+		}
 		// One converted slot is enough for a single draw; a multi-draw reads the guest
 		// commands in place (see the drawIndirect below).
 		if (count == 1) {
@@ -2454,12 +2464,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                                           : MeshIndirectArgs::DrawArgumentsSize;
 			const auto stride = draw.indirect_stride != 0 ? draw.indirect_stride : command_size;
 			const auto buffer_handle = gpu_arguments.first->Handle();
-			for (uint32_t i = 0; i < draw.indirect_count; i++) {
-				const auto offset = gpu_arguments.second + uint64_t {stride} * i;
+			if (gpu_count.first != nullptr) {
+				// The count lives in GPU-written memory: reading it on the CPU would wait for
+				// that work. The GPU reads it and clamps it to indirect_count (the packet's
+				// max) itself.
 				if (draw.IsIndexed()) {
-					vk_buffer.drawIndexedIndirect(buffer_handle, offset, 1, stride);
+					vk_buffer.drawIndexedIndirectCount(buffer_handle, gpu_arguments.second,
+					                                   gpu_count.first->Handle(), gpu_count.second,
+					                                   draw.indirect_count, stride);
 				} else {
-					vk_buffer.drawIndirect(buffer_handle, offset, 1, stride);
+					vk_buffer.drawIndirectCount(buffer_handle, gpu_arguments.second,
+					                            gpu_count.first->Handle(), gpu_count.second,
+					                            draw.indirect_count, stride);
+				}
+			} else {
+				for (uint32_t i = 0; i < draw.indirect_count; i++) {
+					const auto offset = gpu_arguments.second + uint64_t {stride} * i;
+					if (draw.IsIndexed()) {
+						vk_buffer.drawIndexedIndirect(buffer_handle, offset, 1, stride);
+					} else {
+						vk_buffer.drawIndirect(buffer_handle, offset, 1, stride);
+					}
 				}
 			}
 		} else if (gpu_args && !draw.IsIndexed()) {
@@ -2672,7 +2697,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance, args.indirect_args,
-	                        args.indirect_count, args.indirect_stride};
+	                        args.indirect_count, args.indirect_stride, args.indirect_count_addr};
 	DrawRenderState state;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		g_pm4_ops.outcome = Pm4OpTimer::NotPrepared;
@@ -2760,7 +2785,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
 	                         args.instance_count, args.first_instance, args.indirect_args,
-	                         args.indirect_count, args.indirect_stride};
+	                         args.indirect_count, args.indirect_stride,
+	                         args.indirect_count_addr};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {

@@ -1601,7 +1601,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 }
 
 bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawRegisters registers,
-                                               bool indexed, uint32_t draw_count, uint32_t stride) {
+                                               bool indexed, uint32_t draw_count, uint32_t stride,
+                                               uint64_t count_addr) {
 	if (draw_count == 0) {
 		return true;
 	}
@@ -1616,7 +1617,8 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	// from an unregistered buffer reads undefined device memory and hangs the GPU. A draw that
 	// patches shader registers still has to read the arguments on the CPU.
 	auto&      buffers  = m_renderer.GetBufferCache();
-	const bool gpu_args = buffers.IsRegionGpuModified(address, size) ||
+	const bool gpu_args = count_addr != 0 ||
+	                      buffers.IsRegionGpuModified(address, size) ||
 	                      buffers.HasGpuDirtyBytes(address, size) ||
 	                      buffers.IsPageGpuDirtyHint(address) ||
 	                      buffers.IsPageGpuDirtyHint(address + size - 1u);
@@ -1643,14 +1645,15 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled() &&
 	    !(mesh && draw_count > 1)) {
 		m_num_instances_address = address + offsetof(DrawIndexedIndirectArgs, instance_count);
-		DrawIndex({.index_count     = 1,
-		           .index_addr      = reinterpret_cast<const void*>(m_index_base_addr),
-		           .instance_count  = 1,
-		           .offset_source   = DrawOffsetSource::IndirectArgs,
-		           .indirect_args   = address,
-		           .index_limit     = m_index_buffer_size,
-		           .indirect_count  = draw_count,
-		           .indirect_stride = stride});
+		DrawIndex({.index_count          = 1,
+		           .index_addr           = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count       = 1,
+		           .offset_source        = DrawOffsetSource::IndirectArgs,
+		           .indirect_args        = address,
+		           .index_limit          = m_index_buffer_size,
+		           .indirect_count       = draw_count,
+		           .indirect_stride      = stride,
+		           .indirect_count_addr  = count_addr});
 		return true;
 	}
 	// A non-indexed draw draws from them directly too: the guest layout is
@@ -1658,12 +1661,13 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	if (!indexed && gpu_args && !patches && !mesh &&
 	    prim_type != Prospero::PrimitiveType::kQuadListLegacy && Config::GpuMeshIndirectEnabled()) {
 		m_num_instances_address = address + offsetof(DrawIndirectArgs, instance_count);
-		DrawIndexAuto({.vertex_count    = 1,
-		               .instance_count  = 1,
-		               .offset_source   = DrawOffsetSource::IndirectArgs,
-		               .indirect_args   = address,
-		               .indirect_count  = draw_count,
-		               .indirect_stride = stride});
+		DrawIndexAuto({.vertex_count         = 1,
+		               .instance_count       = 1,
+		               .offset_source        = DrawOffsetSource::IndirectArgs,
+		               .indirect_args        = address,
+		               .indirect_count       = draw_count,
+		               .indirect_stride      = stride,
+		               .indirect_count_addr  = count_addr});
 		return true;
 	}
 	return false;
@@ -1677,21 +1681,38 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	SyncTraceDraw(m_renderer.GetGpu().GetFrameNum());
 
+	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		const auto count_vaddr = reinterpret_cast<uint64_t>(count_addr);
+		auto&      buffers     = m_renderer.GetBufferCache();
+		// A count the GPU wrote makes a CPU read wait for that work. When the tracker knows the
+		// write, its device copy holds the value: let the GPU read it (drawIndirectCount clamps
+		// it to max_count on its own). Otherwise read as before; an armed page fault catches a
+		// write the tracker missed.
+		static const bool no_gpu_count = std::getenv("KYTY_DEBUG_NO_GPU_INDIRECT_COUNT") != nullptr;
+		if (!no_gpu_count && max_count_or_count > 1 &&
+		    (stride_in_bytes == 0 || stride_in_bytes >= args_size) &&
+		    (buffers.IsRegionGpuModified(count_vaddr, sizeof(uint32_t)) ||
+		     buffers.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t)) ||
+		     buffers.IsPageGpuDirtyHint(count_vaddr)) &&
+		    DrawIndirectFromGpuArgs(args_addr, registers, indexed, max_count_or_count,
+		                            stride_in_bytes, count_vaddr)) {
+			return;
+		}
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
 	}
 
-	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	if (draw_count == 0) {
 		return;
 	}
 
-	if (DrawIndirectFromGpuArgs(m_draw_indirect_args_base_addr + data_offset, registers, indexed,
-	                            draw_count, stride_in_bytes)) {
+	if (DrawIndirectFromGpuArgs(args_addr, registers, indexed, draw_count, stride_in_bytes)) {
 		return;
 	}
 

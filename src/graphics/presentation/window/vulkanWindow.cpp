@@ -65,6 +65,9 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderBufferInt64Atomics  = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+#if !defined(__APPLE__)
+	features.drawIndirectCount         = VK_TRUE;
+#endif
 	return features;
 }
 
@@ -92,8 +95,34 @@ static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char*
 
 static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
                                    SurfaceCapabilities& r) {
-	RequireVulkanSuccess(physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities),
-	                     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+	// KYTY_DEBUG_FAKE_CAPS=1: the AMD driver can answer ErrorUnknown here when the panel is
+	// off (post-TDR or display sleep), while formats, present modes and swapchain creation
+	// still work. Fill in the shape swapchain creation expects and keep testing headless.
+	static const bool fake_caps = std::getenv("KYTY_DEBUG_FAKE_CAPS") != nullptr;
+	const auto      caps_result =
+	    physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities);
+	if (caps_result != vk::Result::eSuccess && fake_caps) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed ({}); "
+		                "KYTY_DEBUG_FAKE_CAPS fills plausible values\n",
+		                vk::to_string(caps_result)));
+		auto& caps                  = r.capabilities;
+		caps.minImageCount          = 2;
+		caps.maxImageCount          = 0;
+		caps.currentExtent          = vk::Extent2D {std::numeric_limits<uint32_t>::max(),
+		                                            std::numeric_limits<uint32_t>::max()};
+		caps.minImageExtent         = vk::Extent2D {1, 1};
+		caps.maxImageExtent         = vk::Extent2D {16384, 16384};
+		caps.maxImageArrayLayers    = 1;
+		caps.supportedTransforms    = vk::SurfaceTransformFlagBitsKHR::eIdentity;
+		caps.currentTransform       = vk::SurfaceTransformFlagBitsKHR::eIdentity;
+		caps.supportedCompositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque;
+		caps.supportedUsageFlags    = vk::ImageUsageFlagBits::eColorAttachment |
+		                              vk::ImageUsageFlagBits::eTransferDst |
+		                              vk::ImageUsageFlagBits::eTransferSrc;
+	} else {
+		RequireVulkanSuccess(caps_result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+	}
 
 	r.formats = EnumerateVulkan<vk::SurfaceFormatKHR>( // @suppress("Ambiguous problem")
 	    "vkGetPhysicalDeviceSurfaceFormatsKHR", [&](uint32_t* count, vk::SurfaceFormatKHR* values) {
@@ -286,6 +315,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing",
 		              required_features12.shaderSampledImageArrayNonUniformIndexing);
+#if !defined(__APPLE__)
+		check_feature(features12.drawIndirectCount, "drawIndirectCount",
+		              required_features12.drawIndirectCount);
+#endif
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);

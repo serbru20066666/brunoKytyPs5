@@ -191,9 +191,11 @@ private:
 	friend class DrawSpeculator;
 
 	// Draws one indirect draw from GPU-written arguments without reading them on the CPU, when
-	// the draw allows it. False when the arguments must be read.
+	// the draw allows it. False when the arguments must be read. `count_addr`, when set, is the
+	// guest address of a GPU-written count the GPU reads instead of a waiting CPU read.
 	bool DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawRegisters registers, bool indexed,
-	                            uint32_t draw_count = 1, uint32_t stride = 0);
+	                            uint32_t draw_count = 1, uint32_t stride = 0,
+	                            uint64_t count_addr = 0);
 
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,

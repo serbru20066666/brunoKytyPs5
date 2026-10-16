@@ -86,6 +86,9 @@ struct DrawIndexArgs {
 	// `indirect_stride` bytes apart. 0 stride means the native command size.
 	uint32_t         indirect_count             = 1;
 	uint32_t         indirect_stride            = 0;
+	// Guest address of the GPU-written count of a DRAW_INDIRECT_MULTI: the GPU reads it
+	// (drawIndirectCount clamps it to `indirect_count` itself) instead of a waiting CPU read.
+	uint64_t         indirect_count_addr        = 0;
 };
 
 struct DrawAutoArgs {
@@ -99,6 +102,8 @@ struct DrawAutoArgs {
 	uint64_t         indirect_args              = 0;
 	uint32_t         indirect_count             = 1;
 	uint32_t         indirect_stride            = 0;
+	// As DrawIndexArgs::indirect_count_addr.
+	uint64_t         indirect_count_addr        = 0;
 };
 
 struct SubmitInfo {

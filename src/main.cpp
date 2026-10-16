@@ -193,6 +193,8 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --reported-resolution <0|1|2>        Console output resolution reported to the game:\n"
+	         "                                       1 = 1080p, 2 = 2160p, 0 = automatic. Default: 0.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -535,6 +537,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--reported-resolution") {
+			if (!ParseUint32(value, options.config.reported_resolution) ||
+			    options.config.reported_resolution > 2) {
+				::printf("invalid reported resolution: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--console-language") {

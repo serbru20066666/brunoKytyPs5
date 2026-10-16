@@ -49,6 +49,9 @@ namespace {
 	X(vkCmdDraw)                                                                                  \
 	X(vkCmdDrawIndexed)                                                                           \
 	X(vkCmdDrawIndexedIndirect)                                                                   \
+	X(vkCmdDrawIndexedIndirectCount)                                                              \
+	X(vkCmdDrawIndirect)                                                                          \
+	X(vkCmdDrawIndirectCount)                                                                     \
 	X(vkCmdDrawMeshTasksEXT)                                                                      \
 	X(vkCmdDrawMeshTasksIndirectEXT)                                                              \
 	X(vkCmdDispatch)                                                                              \
@@ -114,8 +117,6 @@ namespace {
 	X(vkCmdEndRenderPass)                                                                         \
 	X(vkCmdSetDeviceMask)                                                                         \
 	X(vkCmdDispatchBase)                                                                          \
-	X(vkCmdDrawIndirectCount)                                                                     \
-	X(vkCmdDrawIndexedIndirectCount)                                                              \
 	X(vkCmdBeginRenderPass2)                                                                      \
 	X(vkCmdNextSubpass2)                                                                          \
 	X(vkCmdEndRenderPass2)                                                                        \
@@ -975,6 +976,48 @@ void VKAPI_PTR HookCmdDrawIndexedIndirect(VkCommandBuffer buffer, VkBuffer args,
 	g_real.vkCmdDrawIndexedIndirect(buffer, args, offset, count, stride);
 }
 
+void VKAPI_PTR HookCmdDrawIndexedIndirectCount(VkCommandBuffer buffer, VkBuffer args,
+                                               VkDeviceSize offset, VkBuffer count_buffer,
+                                               VkDeviceSize count_buffer_offset,
+                                               uint32_t max_draw_count, uint32_t stride) {
+	if (Routed(buffer)) {
+		Emit([=] {
+			g_real.vkCmdDrawIndexedIndirectCount(buffer, args, offset, count_buffer,
+			                                     count_buffer_offset, max_draw_count, stride);
+		});
+		return;
+	}
+	BeforeDirect();
+	g_real.vkCmdDrawIndexedIndirectCount(buffer, args, offset, count_buffer, count_buffer_offset,
+	                                     max_draw_count, stride);
+}
+
+void VKAPI_PTR HookCmdDrawIndirect(VkCommandBuffer buffer, VkBuffer args,
+                                   VkDeviceSize offset, uint32_t count, uint32_t stride) {
+	if (Routed(buffer)) {
+		Emit([=] { g_real.vkCmdDrawIndirect(buffer, args, offset, count, stride); });
+		return;
+	}
+	BeforeDirect();
+	g_real.vkCmdDrawIndirect(buffer, args, offset, count, stride);
+}
+
+void VKAPI_PTR HookCmdDrawIndirectCount(VkCommandBuffer buffer, VkBuffer args,
+                                        VkDeviceSize offset, VkBuffer count_buffer,
+                                        VkDeviceSize count_buffer_offset,
+                                        uint32_t max_draw_count, uint32_t stride) {
+	if (Routed(buffer)) {
+		Emit([=] {
+			g_real.vkCmdDrawIndirectCount(buffer, args, offset, count_buffer,
+			                              count_buffer_offset, max_draw_count, stride);
+		});
+		return;
+	}
+	BeforeDirect();
+	g_real.vkCmdDrawIndirectCount(buffer, args, offset, count_buffer, count_buffer_offset,
+	                              max_draw_count, stride);
+}
+
 void VKAPI_PTR HookCmdDrawMeshTasksEXT(VkCommandBuffer buffer, uint32_t x, uint32_t y, uint32_t z) {
 	if (Routed(buffer)) {
 		Emit([=] { g_real.vkCmdDrawMeshTasksEXT(buffer, x, y, z); });
@@ -1437,6 +1480,9 @@ struct FallbackHook<Tag, R(VKAPI_PTR*)(VkCommandBuffer, A...)> {
 #define KYTY_HOOK_FUNCTION_vkCmdDraw HookCmdDraw
 #define KYTY_HOOK_FUNCTION_vkCmdDrawIndexed HookCmdDrawIndexed
 #define KYTY_HOOK_FUNCTION_vkCmdDrawIndexedIndirect HookCmdDrawIndexedIndirect
+#define KYTY_HOOK_FUNCTION_vkCmdDrawIndexedIndirectCount HookCmdDrawIndexedIndirectCount
+#define KYTY_HOOK_FUNCTION_vkCmdDrawIndirect HookCmdDrawIndirect
+#define KYTY_HOOK_FUNCTION_vkCmdDrawIndirectCount HookCmdDrawIndirectCount
 #define KYTY_HOOK_FUNCTION_vkCmdDrawMeshTasksEXT HookCmdDrawMeshTasksEXT
 #define KYTY_HOOK_FUNCTION_vkCmdDrawMeshTasksIndirectEXT HookCmdDrawMeshTasksIndirectEXT
 #define KYTY_HOOK_FUNCTION_vkCmdDispatch HookCmdDispatch

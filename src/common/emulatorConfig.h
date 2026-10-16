@@ -61,6 +61,9 @@ struct ConfigOptions {
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
 	uint32_t               vblank_frequency            = 60;
+	// Resolution reported to the game as the console output: 0 follows the current rule
+	// (4K unless the game's param.json asks for detection), 1 reports 1080p, 2 reports 2160p.
+	uint32_t               reported_resolution         = 0;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -124,6 +127,7 @@ bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
 uint32_t GetVblankFrequency();
+uint32_t GetReportedResolution();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
