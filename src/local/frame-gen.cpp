@@ -72,6 +72,11 @@ bool g_taa_bypass = false;
 // which later passes read, lost: darker zones). Default: the TAA runs, then its color is replaced by the raw frame's
 // (AfterTaa), its alpha kept. KYTY_TAA_BYPASS_GAIN=<f>: the raw frame times f there.
 bool g_taa_bypass_copy = false;
+// KYTY_TAA_BYPASS_MODE=match: the TAA's output replaced by the raw frame scaled to its mean brightness (10-17: the
+// gain came out ~0.38 and the picture still darker: the raw frame's bright specks inflate the game's auto exposure).
+// Default: the TAA's output is left to the game (its exposure, bloom and the rest see what they always saw) and only
+// the upscaler takes the raw frame, a copy made right after the TAA (UpscaleComposite).
+bool g_taa_bypass_match = false;
 double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
@@ -538,6 +543,8 @@ void Initialize() {
 		g_taa_bypass        = taa != nullptr && std::string(taa) == "upscaler";
 		if (const char* mode = std::getenv("KYTY_TAA_BYPASS_MODE"); mode != nullptr && std::string(mode) == "copy")
 			g_taa_bypass_copy = true;
+		if (const char* mode = std::getenv("KYTY_TAA_BYPASS_MODE"); mode != nullptr && std::string(mode) == "match")
+			g_taa_bypass_match = true;
 	}
 	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
 		return;
@@ -1698,6 +1705,7 @@ struct TaaBypassPipeline {
 	const float*            readback_mapped = nullptr;
 	VulkanImage             dlaa;                        // KYTY_TAA_REPLACE=dlss: DLAA's output, then into the TAA's
 	vk::ImageView           dlaa_view = nullptr;
+	uint64_t                raw_frame = UINT64_MAX;      // the guest frame whose raw color `dlaa` holds (bypass)
 	bool                    failed     = false;
 } g_bypass;
 
@@ -1858,6 +1866,30 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 		vk_command.pipelineBarrier2(dependency);
 	};
 	compute_barrier(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+
+	if (bypass && !g_taa_bypass_match) {
+		// The raw jittered frame kept for the upscaler (UpscaleComposite); the TAA's output stays the game's.
+		if (color.backing.format != vk::Format::eR16G16B16A16Sfloat || !EnsureDlaaImage(*g_graphics_ctx, render)) return false;
+		color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+		vk::ImageCopy copy {};
+		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.extent         = vk::Extent3D {render.width, render.height, 1};
+		vk_command.copyImage(color.backing.image, vk::ImageLayout::eTransferSrcOptimal, g_bypass.dlaa.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
+		color.Transit(color_b.layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+		g_bypass.raw_frame = g_guest_frame;
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: ran for the game; its raw %ux%u frame kept for the upscaler\n", render.width, render.height);
+			std::fflush(stdout);
+		}
+		return true;
+	}
 
 	// The source of the color: the raw jittered frame, or DLAA's output (KYTY_TAA_REPLACE=dlss).
 	vk::ImageView   source_view   = color_b.image_view;
@@ -2118,9 +2150,25 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 	                       ? 16.7f
 	                       : std::chrono::duration<float, std::milli>(now - g_up_last).count();
 	g_up_last = now;
+	// KYTY_TAA_REPLACE=upscaler: the raw frame kept right after the TAA (AfterTaa), not the TAA's output.
+	const VulkanImage* in_color = &color.backing;
+	vk::ImageView      in_view  = scene->image_view;
+	if (g_taa_bypass && !g_taa_bypass_copy && !g_taa_bypass_match && g_bypass.dlaa.image != nullptr &&
+	    g_bypass.raw_frame == g_guest_frame && g_bypass.dlaa.extent.width == render.width &&
+	    g_bypass.dlaa.extent.height == render.height) {
+		in_color = &g_bypass.dlaa;
+		in_view  = g_bypass.dlaa_view;
+	} else if (g_taa_bypass && !g_taa_bypass_copy && !g_taa_bypass_match) {
+		static uint32_t misses = 0;
+		if (misses++ < 4) {
+			std::printf("Upscaling: no raw frame of this frame kept (frame %llu, kept %llu): the TAA's output upscaled\n",
+			            static_cast<unsigned long long>(g_guest_frame), static_cast<unsigned long long>(g_bypass.raw_frame));
+			std::fflush(stdout);
+		}
+	}
 	Fsr3::UpscaleDesc desc;
 	desc.command  = static_cast<VkCommandBuffer>(vk_command);
-	desc.color    = &color.backing;
+	desc.color    = in_color;
 	desc.depth    = &g_up_depth;
 	desc.motion   = &g_up_motion;
 	desc.output   = &g_up_output;
@@ -2142,14 +2190,14 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 	bool done = false;
 	if (dlss) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-		done = DlssUpscale(desc.command, color.backing, scene->image_view, g_up_depth, g_up_depth_view, g_up_motion,
+		done = DlssUpscale(desc.command, *in_color, in_view, g_up_depth, g_up_depth_view, g_up_motion,
 		                   g_up_motion_view, g_up_output, g_up_output_view, render, output, g_camera, g_up_reset);
 #endif
 	} else if (xess) {
 		Xess::UpscaleDesc x;
 		x.command     = desc.command;
-		x.color       = &color.backing;
-		x.color_view  = scene->image_view;
+		x.color       = in_color;
+		x.color_view  = in_view;
 		x.depth       = &g_up_depth;
 		x.depth_view  = g_up_depth_view;
 		x.motion      = &g_up_motion;

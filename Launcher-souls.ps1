@@ -33,7 +33,7 @@ $fgModes = @(
 # "juego": el 3D a menos resolucion y lo sube el propio juego.
 $resModes = @(
 	@('1440p nativo',   1440, '',     0),
-	@('DLSS DLAA sin TAA', 1440, 'taa-dlss', 0),
+	@('DLSS DLAA sin TAA', 1440, 'taa-up-dlss', 0),
 	@('DLSS U.cal. sin TAA',  1108, 'taa-up-dlss', 0),
 	@('DLSS Calidad sin TAA', 960,  'taa-up-dlss', 0),
 	@('DLSS Equil. sin TAA',  836,  'taa-up-dlss', 0),
