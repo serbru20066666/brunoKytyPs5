@@ -22,8 +22,6 @@ $fgModes = @(
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
-	@('   Frame generation DLSS x5',                    'dlss-x5.json'),
-	@('   Frame generation DLSS x6',                    'dlss-x6.json'),
 	@('   224 FPS Nvidia Smooth x6',                    'dlss-x6-224.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
@@ -35,6 +33,11 @@ $fgModes = @(
 $resModes = @(
 	@('1440p nativo',   1440, '',     0),
 	@('DLSS sin TAA',   1440, 'taa-dlss', 0),
+	@('DLSS U.cal. sin TAA',  1108, 'taa-up-dlss', 0),
+	@('DLSS Calidad sin TAA', 960,  'taa-up-dlss', 0),
+	@('DLSS Equil. sin TAA',  836,  'taa-up-dlss', 0),
+	@('DLSS Rendim. sin TAA', 720,  'taa-up-dlss', 0),
+	@('DLSS U.rend. sin TAA', 720,  'taa-up-dlss', 2160),
 	@('DLSS DLAA',      1440, 'dlss', 0),
 	@('DLSS U.calidad', 1108, 'dlss', 0),
 	@('DLSS Calidad',   960,  'dlss', 0),
@@ -47,10 +50,21 @@ $resModes = @(
 	@('XeSS Calidad',   848,  'xess', 0),
 	@('XeSS Equilib.',  720,  'xess', 0),
 	@('XeSS Rendim.',   940,  'xess', 2160),
+	@('XeSS AA sin TAA',      1440, 'taa-up-xess', 0),
+	@('XeSS U.cal.+ sin TAA', 1108, 'taa-up-xess', 0),
+	@('XeSS U.cal. sin TAA',  960,  'taa-up-xess', 0),
+	@('XeSS Calidad sin TAA', 848,  'taa-up-xess', 0),
+	@('XeSS Equil. sin TAA',  720,  'taa-up-xess', 0),
+	@('XeSS Rendim. sin TAA', 940,  'taa-up-xess', 2160),
 	@('FSR U.calidad',  1108, 'fsr',  0),
 	@('FSR Calidad',    960,  'fsr',  0),
 	@('FSR Equilib.',   848,  'fsr',  0),
 	@('FSR Rendim.',    720,  'fsr',  0),
+	@('FSR AA sin TAA',       1440, 'taa-up-fsr', 0),
+	@('FSR U.cal. sin TAA',   1108, 'taa-up-fsr', 0),
+	@('FSR Calidad sin TAA',  960,  'taa-up-fsr', 0),
+	@('FSR Equil. sin TAA',   848,  'taa-up-fsr', 0),
+	@('FSR Rendim. sin TAA',  720,  'taa-up-fsr', 0),
 	@('1080p juego',    1080, '',     0),
 	@('900p juego',     900,  '',     0),
 	@('720p juego',     720,  '',     0)
@@ -135,7 +149,10 @@ function Start-Game {
 		return
 	}
 	if ($res[1] -ne 1440) { $psargs += @('-RenderHeight', "$($res[1])") }
-	if ($res[2] -like 'taa-*') { $psargs += @('-TaaReplace', $res[2].Substring(4)) }
+	# "sin TAA": el TAA del juego no se ejecuta; DLSS (DLAA) en su lugar, o (taa-up-*) el reescalador elegido toma la
+	# imagen sin filtrar y hace el antialiasing el solo (encima del TAA salia como una acuarela, con estelas).
+	if ($res[2] -like 'taa-up-*') { $psargs += @('-Upscale', $res[2].Substring(7), '-TaaReplace', 'upscaler') }
+	elseif ($res[2] -like 'taa-*') { $psargs += @('-TaaReplace', $res[2].Substring(4)) }
 	elseif ($res[2]) { $psargs += @('-Upscale', $res[2]) }
 	if ($res[3] -gt 0) { $psargs += @('-UpscaleHeight', "$($res[3])") }
 	$preset = $dlssPresets[[math]::Max(0, $cmbPreset.SelectedIndex)][1]
@@ -293,7 +310,7 @@ function Fill-Res {
 	$titles = @{ 'dlss' = '--- NVIDIA DLSS ---'; 'xess' = '--- Intel XeSS ---'; 'fsr' = '--- AMD FSR 3.1 ---'; 'juego' = '--- Del juego ---' }
 	$shown  = @()
 	foreach ($family in (Get-ResFamilies)) {
-		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } elseif ($_[2] -like 'taa-*') { $_[2].Substring(4) } else { $_[2] }) -eq $family })
+		$modes = @($resModes | Where-Object { $(if ($_[2] -eq '' -and $_[1] -ne 1440) { 'juego' } elseif ($_[2] -like 'taa-*') { $_[2] -replace '^taa-(up-)?', '' } else { $_[2] }) -eq $family })
 		if ($family -eq '') { $modes = @($resModes | Where-Object { $_[0] -eq '1440p nativo' }) }
 		if ($modes.Count -eq 0) { continue }
 		if ($titles.ContainsKey($family)) { $shown += , @($titles[$family], 0, '', 0) }

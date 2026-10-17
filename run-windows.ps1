@@ -371,7 +371,8 @@ if ($Upscale) { $environment['KYTY_UPSCALE'] = $Upscale }
 # -UpscaleHeight: the upscaled image's height (default 1440; 2160 for DLSS ultra performance); -DlssPreset K|L|M|J.
 if ($UpscaleHeight -gt 0) { $environment['KYTY_UPSCALE_HEIGHT'] = "$UpscaleHeight" }
 if ($DlssPreset) { $environment['KYTY_DLSS_PRESET'] = $DlssPreset }
-# -TaaReplace dlss: DLSS (DLAA) in place of the game's TAA (frame-gen.h ReplaceTaa).
+# -TaaReplace dlss: DLSS (DLAA) in place of the game's TAA (frame-gen.h ReplaceTaa); -TaaReplace upscaler (with -Upscale):
+# the game's TAA skipped, the upscaler gets the raw jittered frame and does the anti-aliasing itself.
 if ($TaaReplace) { $environment['KYTY_TAA_REPLACE'] = $TaaReplace }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
 # projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.

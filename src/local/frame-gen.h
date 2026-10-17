@@ -160,6 +160,7 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 [[nodiscard]] bool TaaDiagFrame();
 // KYTY_TAA_REPLACE=dlss: the game's TAA dispatch replaced by DLSS (DLAA at the render size) on the dispatch's own images:
 // color 0 (jittered), depth 1, motion 3, output 6 (renderCompute.cpp, in place of the dispatch, its descriptors bound).
+// KYTY_TAA_REPLACE=upscaler: the dispatch replaced by a copy of its jittered color to its output, for the upscaler.
 // False: the dispatch runs as usual.
 [[nodiscard]] bool TaaReplaceWanted();
 bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images);

@@ -63,6 +63,10 @@ struct Sources {
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 bool g_dlss_sr = false; // KYTY_UPSCALE=dlss: DLSS super resolution (Streamline's DLSS plugin)
 bool g_taa_dlss = false; // KYTY_TAA_REPLACE=dlss: DLSS (DLAA) in place of the game's TAA
+// KYTY_TAA_REPLACE=upscaler (with KYTY_UPSCALE dlss|fsr|xess): the game's TAA skipped, its jittered image copied to
+// the TAA's output, so the composite's upscaler gets the raw frame and does the anti-aliasing itself (on the TAA's
+// output it ran a second temporal filter: smeared, "watercolor" images and ghosting).
+bool g_taa_bypass = false;
 double g_real_interval = 0.0; // DLSS-G under the G-SYNC cap: the real frames' least interval (seconds)
 bool g_sr_ready = false;
 bool     g_ready       = false; // Streamline loaded and the feature available
@@ -526,6 +530,7 @@ void Initialize() {
 		g_dlss_sr           = upscale != nullptr && std::string(upscale) == "dlss";
 		const char* taa     = std::getenv("KYTY_TAA_REPLACE");
 		g_taa_dlss          = taa != nullptr && std::string(taa) == "dlss";
+		g_taa_bypass        = taa != nullptr && std::string(taa) == "upscaler";
 	}
 	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
 		return;
@@ -965,7 +970,7 @@ bool DlssUpscaleWanted() {
 }
 
 bool TaaReplaceWanted() {
-	return g_taa_dlss;
+	return g_taa_dlss || g_taa_bypass;
 }
 
 
@@ -1611,7 +1616,67 @@ void ConfigureOutput(GraphicContext& graphics, vk::Format format, vk::Extent2D e
 }
 } // namespace
 
+namespace {
+// KYTY_TAA_REPLACE=upscaler: the TAA dispatch's jittered color (image 0) copied to its output (image 6), each image
+// back in the layout the dispatch bound it in.
+bool BypassTaa(vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	if (g_cache == nullptr || images.size() < 7) return false;
+	if (!Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the game's TAA)
+	const auto& color_b = images[0];
+	const auto& out_b   = images[6];
+	if (!color_b.image_id || !out_b.image_id) return false;
+	auto& color  = g_cache->GetImage(color_b.image_id);
+	auto& output = g_cache->GetImage(out_b.image_id);
+	static uint32_t logs = 0;
+	if (color.backing.extent.width != output.backing.extent.width ||
+	    color.backing.extent.height != output.backing.extent.height || color.backing.image == output.backing.image) {
+		if (logs < 2) {
+			++logs;
+			std::printf("TAA: not skipped (color %ux%u, output %ux%u)\n", color.backing.extent.width,
+			            color.backing.extent.height, output.backing.extent.width, output.backing.extent.height);
+			std::fflush(stdout);
+		}
+		return false;
+	}
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+	LocalVulkanRecording::Drain();
+#endif
+	const vk::ImageSubresourceLayers layers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+	output.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+	if (color.backing.format == output.backing.format) {
+		vk::ImageCopy copy {};
+		copy.srcSubresource = layers;
+		copy.dstSubresource = layers;
+		copy.extent         = vk::Extent3D {color.backing.extent.width, color.backing.extent.height, 1};
+		vk_command.copyImage(color.backing.image, vk::ImageLayout::eTransferSrcOptimal, output.backing.image,
+		                     vk::ImageLayout::eTransferDstOptimal, copy);
+	} else {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = layers;
+		blit.dstSubresource = layers;
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(color.backing.extent.width),
+		                                    static_cast<int32_t>(color.backing.extent.height), 1};
+		blit.dstOffsets[1]  = blit.srcOffsets[1];
+		vk_command.blitImage(color.backing.image, vk::ImageLayout::eTransferSrcOptimal, output.backing.image,
+		                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+	}
+	const auto shader = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	color.Transit(color_b.layout, shader, {}, vk_command);
+	output.Transit(out_b.layout, shader, {}, vk_command);
+	if (logs < 2) {
+		++logs;
+		std::printf("TAA: skipped, the upscaler takes the raw %ux%u frame (format %d -> %d)\n", color.backing.extent.width,
+		            color.backing.extent.height, static_cast<int>(color.backing.format),
+		            static_cast<int>(output.backing.format));
+		std::fflush(stdout);
+	}
+	return true;
+}
+} // namespace
+
 bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
+	if (g_taa_bypass) return BypassTaa(vk_command, images);
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_taa_dlss || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
 	const auto& color_b = images[0];
