@@ -2,7 +2,7 @@ param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [switch]$NoAo
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
       [string]$Patch = '', [switch]$Fullscreen, [switch]$Hdr, [switch]$ShotOnly, [switch]$NoWalk,
       [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
-      [string]$Game = '')
+      [string]$Game = '', [switch]$LoadGame)
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
 # is really up, measure. Screen states are told apart by pixel statistics.
 $S = $PSScriptRoot
@@ -65,7 +65,7 @@ function Press([string]$key, [int]$ms = 150) {
 	$w = Window; if (!$w -or ![BenchWin]::Focus($w.MainWindowHandle)) { $script:unfocused++; return }
 	$ime = [BenchWin]::ImmGetDefaultIMEWnd($w.MainWindowHandle)
 	if ($ime -ne [IntPtr]::Zero) { [BenchWin]::SendMessage($ime, 0x283, [IntPtr]6, [IntPtr]::Zero) | Out-Null }
-	$code = if ($key -eq 'enter') { 0x0D } else { [int][char]$key.ToUpper() }
+	$code = if ($key -eq 'enter') { 0x0D } elseif ($key -eq 'down') { 0x28 } else { [int][char]$key.ToUpper() }
 	[BenchWin]::Key([uint16]$code, $false); Start-Sleep -Milliseconds $ms; [BenchWin]::Key([uint16]$code, $true)
 }
 function State($source) {
@@ -197,12 +197,16 @@ while (((Get-Date) - $start).TotalSeconds -lt $StartupSeconds) {
 	if ($state -ne $last) { $log.Add(("{0,6:N1} s {1}" -f ((Get-Date) - $start).TotalSeconds, $state)); $last = $state }
 	if ($state -eq 'hud') { break }
 	if ($state -eq 'prompt') { Press j; $answered = $true; Start-Sleep -Milliseconds 1500; continue }
+	# -LoadGame: the main menu's Load Game (its second item) instead of Continue, once.
+	if ($state -eq 'menu' -and $LoadGame -and !$script:loadChosen) { Start-Sleep -Milliseconds 1500; Press s 300; Start-Sleep -Milliseconds 1500; $script:loadChosen = $true; continue }
 	if ($state -eq 'menu') { Press j; Start-Sleep -Milliseconds 1500; continue }
 	# A cinematic, or before the prompt the title: Options opens the skip prompt (or leaves the
 	# title), Cross held confirms (250 ms let go just before its bar filled). After the prompt only
 	# a cinematic is skipped (Options elsewhere would open the in-game menu): a letterboxed picture,
 	# or the dim colourless one that follows the loading fog (skipped at most 3 times, 4 s apart,
 	# so a fade into the game is never taken for it).
+	# -LoadGame: in the save list that follows, the second save (one move down) before it is chosen.
+	if ($LoadGame -and $answered -and !$script:listMoved -and $state -eq 'cinematic') { Press s 200; Start-Sleep -Milliseconds 700; $script:listMoved = $true }
 	if ($state -eq 'fog') { $fogSeen = $true }
 	$early = $answered -and $fogSeen -and $state -eq 'mono' -and $earlySkips -lt 3 -and
 	         ((Get-Date) - $lastSkip).TotalSeconds -ge 4

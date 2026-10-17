@@ -1,20 +1,13 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/assert.h"
-#include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_prt_3d_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_prt_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_render_target_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_standard256_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_standard4_3d_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_standard4_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_demote_d24_to_d16_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_demote_d32_to_d16_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_promote_d16_to_d24_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_promote_d16_to_d32_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_swap_bgra16_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_variants.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
@@ -33,20 +26,19 @@ namespace Libs::Graphics {
 // Freed scratch buffers kept for reuse: at most this much.
 static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
 
-TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
-                         StreamBuffer& stream_buffer)
-    : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
+TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler)
+    : m_graphics(graphics), m_scheduler(scheduler) {
 	// Kept scratch is video memory too: a smaller GPU keeps less (8 GB: ~200 MiB).
 	m_scratch_pool_budget = std::min(ScratchPoolBudget, m_graphics.GetTotalMemoryBudget() / 32);
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 52);
-	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
+	static_assert(std::size(GPU_TILER_VARIANTS) == PipelineCount);
+	// The source and the target (the parameters are push constants).
+	std::array<vk::DescriptorSetLayoutBinding, 2> bindings {};
 	for (uint32_t index = 0; index < 2; index++) {
 		bindings[index] = {index, vk::DescriptorType::eStorageBuffer, 1,
 		                   vk::ShaderStageFlagBits::eCompute, nullptr};
 	}
-	bindings[2] = {2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute,
-	               nullptr};
 
 	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
 	descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
@@ -279,19 +271,6 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		dispatch.push.tail             = info.tail;
 		dispatches.push_back(dispatch);
 	}
-
-	const uint64_t uniform_alignment =
-	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, 1);
-	const uint64_t stride = (sizeof(Push) + uniform_alignment - 1) & ~(uniform_alignment - 1);
-	EXIT_NOT_IMPLEMENTED(dispatches.size() > UINT64_MAX / stride);
-	const uint64_t bytes  = dispatches.size() * stride;
-	auto [mapped, offset] = m_stream_buffer.Map(bytes, uniform_alignment);
-	EXIT_IF(mapped == nullptr);
-	for (size_t index = 0; index < dispatches.size(); index++) {
-		std::memcpy(mapped + index * stride, &dispatches[index].push, sizeof(Push));
-		dispatches[index].params_offset = offset + index * stride;
-	}
-	m_stream_buffer.Commit();
 }
 
 vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
@@ -299,46 +278,47 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	if (m_pipelines[slot] != nullptr) {
 		return m_pipelines[slot];
 	}
-	struct Shader {
-		const uint32_t* code;
-		size_t          words;
-	};
-	static constexpr std::array<Shader, FamilyCount> shaders {{
-	    {GPU_TILER_STANDARD256_SPV, std::size(GPU_TILER_STANDARD256_SPV)},
-	    {GPU_TILER_STANDARD4_SPV, std::size(GPU_TILER_STANDARD4_SPV)},
-	    {GPU_TILER_STANDARD4_3D_SPV, std::size(GPU_TILER_STANDARD4_3D_SPV)},
-	    {GPU_TILER_STANDARD64_SPV, std::size(GPU_TILER_STANDARD64_SPV)},
-	    {GPU_TILER_STANDARD64_3D_SPV, std::size(GPU_TILER_STANDARD64_3D_SPV)},
-	    {GPU_TILER_PRT_SPV, std::size(GPU_TILER_PRT_SPV)},
-	    {GPU_TILER_PRT_3D_SPV, std::size(GPU_TILER_PRT_3D_SPV)},
-	    {GPU_TILER_RENDER_TARGET_SPV, std::size(GPU_TILER_RENDER_TARGET_SPV)},
-	    {GPU_TILER_DEPTH_SPV, std::size(GPU_TILER_DEPTH_SPV)},
-	}};
-	const uint32_t                                   element_index = slot % BytesPerElementCount;
-	const uint32_t                   direction_index = slot / (FamilyCount * BytesPerElementCount);
-	const uint32_t                   family_index    = (slot / BytesPerElementCount) % FamilyCount;
-	const uint32_t                   values[] {1u << element_index, direction_index};
-	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
-	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
-	vk::ShaderModuleCreateInfo       module_info {};
-	module_info.codeSize    = shaders[family_index].words * sizeof(uint32_t);
-	module_info.pCode       = shaders[family_index].code;
+	const uint32_t element_index   = slot % BytesPerElementCount;
+	const uint32_t direction_index = slot / (FamilyCount * BytesPerElementCount);
+	const uint32_t family_index    = (slot / BytesPerElementCount) % FamilyCount;
+	// One line per pipeline (at most PipelineCount a session), before the driver compiles it: a driver that crashes
+	// compiling one leaves its name last (issue #43: RDNA2 crashed in its compiler making a tiler pipeline).
+	static constexpr std::array<const char*, FamilyCount> family_names {
+	    "standard 256 B", "standard 4 KiB", "standard 4 KiB 3D", "standard 64 KiB", "standard 64 KiB 3D",
+	    "PRT 64 KiB",     "PRT 64 KiB 3D",  "render target 64 KiB", "depth 64 KiB"};
+	std::printf("Tiler pipeline: %s, %u-byte elements, %s (slot %u)\n", family_names[family_index],
+	            1u << element_index, direction_index != 0 ? "tile" : "detile", slot);
+	std::fflush(stdout);
+	m_pipelines[slot] =
+	    CreatePipeline(GPU_TILER_VARIANTS[slot].code, GPU_TILER_VARIANTS[slot].words, "create TileManager pipeline");
+	return m_pipelines[slot];
+}
+
+// A pipeline of one of the tiler's modules (no specialization), requiring the subgroup size the game's compute
+// pipelines require on this GPU (GraphicContext::InternalComputeSubgroupSize).
+vk::Pipeline TileManager::CreatePipeline(const uint32_t* code, size_t words, const char* what) {
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize    = words * sizeof(uint32_t);
+	module_info.pCode       = code;
 	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-	                     "create TileManager shader module");
-	vk::PipelineShaderStageCreateInfo stage {};
-	stage.stage               = vk::ShaderStageFlagBits::eCompute;
-	stage.module              = module;
-	stage.pName               = "main";
-	stage.pSpecializationInfo = &specialization;
+	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module), what);
+	vk::PipelineShaderStageCreateInfo                     stage {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+	stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	stage.module = module;
+	stage.pName  = "main";
+	if (const auto size = m_graphics.InternalComputeSubgroupSize(); size != 0) {
+		subgroup.requiredSubgroupSize = size;
+		stage.pNext                   = &subgroup;
+	}
 	vk::ComputePipelineCreateInfo create {};
 	create.stage  = stage;
 	create.layout = m_pipeline_layout;
-	const auto result =
-	    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_pipelines[slot]);
+	vk::Pipeline pipeline = nullptr;
+	const auto   result   = m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
 	m_graphics.device.destroyShaderModule(module, nullptr);
-	RequireVulkanSuccess(result, "create TileManager pipeline");
-	return m_pipelines[slot];
+	RequireVulkanSuccess(result, what);
+	return pipeline;
 }
 
 void TileManager::Record(vk::Buffer source, uint64_t source_offset,
@@ -360,7 +340,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
-	vk::BufferMemoryBarrier barriers[3] {};
+	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -375,17 +355,10 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[1].buffer        = target;
 	barriers[1].offset        = target_offset;
 	barriers[1].size          = target_capacity;
-	barriers[2]               = barriers[0];
-	barriers[2].srcAccessMask = vk::AccessFlagBits::eHostWrite;
-	barriers[2].dstAccessMask = vk::AccessFlagBits::eUniformRead;
-	barriers[2].buffer        = m_stream_buffer.Handle();
-	barriers[2].offset        = dispatches.front().params_offset;
-	barriers[2].size =
-	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
-	    nullptr, 3, barriers, 0, nullptr);
+	    nullptr, 2, barriers, 0, nullptr);
 	if (clear_target) {
 		command.fillBuffer(target, target_offset, target_capacity, 0);
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -396,23 +369,21 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		                        &barriers[1], 0, nullptr);
 	}
 
-	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
-	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
-	for (auto& dispatch: dispatches) {
-		const vk::DescriptorBufferInfo        params_info {m_stream_buffer.Handle(),
-		                                                   dispatch.params_offset, sizeof(Push)};
-		const vk::DescriptorBufferInfo        infos[] {source_info, target_info, params_info};
-		std::array<vk::WriteDescriptorSet, 3> writes {};
-		for (uint32_t index = 0; index < writes.size(); index++) {
-			writes[index].dstBinding      = index;
-			writes[index].descriptorCount = 1;
-			writes[index].descriptorType  = index == 2 ? vk::DescriptorType::eUniformBuffer
-			                                           : vk::DescriptorType::eStorageBuffer;
-			writes[index].pBufferInfo     = &infos[index];
-		}
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
-		                             static_cast<uint32_t>(writes.size()), writes.data());
+	const vk::DescriptorBufferInfo infos[] {{source, source_descriptor_offset, source_range},
+	                                        {target, target_descriptor_offset, target_range}};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t index = 0; index < writes.size(); index++) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo     = &infos[index];
+	}
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
+	                             static_cast<uint32_t>(writes.size()), writes.data());
+	for (const auto& dispatch: dispatches) {
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
+		command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push),
+		                      &dispatch.push);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
@@ -492,8 +463,8 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
 	const uint64_t size = (linear_capacity + 3u) & ~uint64_t {3};
 	vk::Buffer     output {};
-	// (After Prepare, whose parameter ring may submit the tick: a buffer is reused only in the tick it is kept through.
-	// Record's first barrier waits for every earlier command, the reused buffer's readers.)
+	// (A buffer is reused only in the tick it is kept through. Record's first barrier waits for every earlier command,
+	// the reused buffer's readers.)
 	if (reuse_scratch && m_reused_scratch.buffer != vk::Buffer {} && m_reused_tick == m_scheduler.CurrentTick() &&
 	    m_reused_scratch.size >= size) {
 		output = m_reused_scratch.buffer;
@@ -537,8 +508,6 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
-	// Reserve all stream parameters before creating a scheduler-lived scratch dependency:
-	// StreamBuffer::Map is allowed to submit the current tick when it wraps.
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches);
 	auto linear = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
 	DeferDestroy(linear);
@@ -593,36 +562,14 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	}
 	auto& pipeline = *pipeline_pointer;
 	if (pipeline == nullptr) {
-		const uint32_t                   value = d32 ? 1u : 0u;
-		const vk::SpecializationMapEntry entry {0, 0, sizeof(value)};
-		const vk::SpecializationInfo     specialization {1, &entry, sizeof(value), &value};
-		const uint32_t*                  code  = nullptr;
-		size_t                           words = 0;
+		constexpr const char* what = "create D16 conversion pipeline";
 		if (direction == D16Direction::Promote) {
-			code  = GPU_TILER_PROMOTE_D16_SPV;
-			words = std::size(GPU_TILER_PROMOTE_D16_SPV);
+			pipeline = d32 ? CreatePipeline(GPU_TILER_PROMOTE_D16_TO_D32_SPV, std::size(GPU_TILER_PROMOTE_D16_TO_D32_SPV), what)
+			               : CreatePipeline(GPU_TILER_PROMOTE_D16_TO_D24_SPV, std::size(GPU_TILER_PROMOTE_D16_TO_D24_SPV), what);
 		} else {
-			code  = GPU_TILER_DEMOTE_D16_SPV;
-			words = std::size(GPU_TILER_DEMOTE_D16_SPV);
+			pipeline = d32 ? CreatePipeline(GPU_TILER_DEMOTE_D32_TO_D16_SPV, std::size(GPU_TILER_DEMOTE_D32_TO_D16_SPV), what)
+			               : CreatePipeline(GPU_TILER_DEMOTE_D24_TO_D16_SPV, std::size(GPU_TILER_DEMOTE_D24_TO_D16_SPV), what);
 		}
-		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = words * sizeof(uint32_t);
-		module_info.pCode       = code;
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-		                     "create D16 conversion shader module");
-		vk::PipelineShaderStageCreateInfo stage {};
-		stage.stage               = vk::ShaderStageFlagBits::eCompute;
-		stage.module              = module;
-		stage.pName               = "main";
-		stage.pSpecializationInfo = &specialization;
-		vk::ComputePipelineCreateInfo create {};
-		create.stage  = stage;
-		create.layout = m_pipeline_layout;
-		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
-		m_graphics.device.destroyShaderModule(module, nullptr);
-		RequireVulkanSuccess(result, "create D16 conversion pipeline");
 	}
 
 	const uint64_t source_element =
@@ -744,23 +691,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 
 void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	if (m_swap_bgra16 == nullptr) {
-		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = std::size(GPU_TILER_SWAP_BGRA16_SPV) * sizeof(uint32_t);
-		module_info.pCode       = GPU_TILER_SWAP_BGRA16_SPV;
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-		                     "create BGRA16 swap shader module");
-		vk::PipelineShaderStageCreateInfo stage {};
-		stage.stage  = vk::ShaderStageFlagBits::eCompute;
-		stage.module = module;
-		stage.pName  = "main";
-		vk::ComputePipelineCreateInfo create {};
-		create.stage  = stage;
-		create.layout = m_pipeline_layout;
-		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_swap_bgra16);
-		m_graphics.device.destroyShaderModule(module, nullptr);
-		RequireVulkanSuccess(result, "create BGRA16 swap pipeline");
+		m_swap_bgra16 = CreatePipeline(GPU_TILER_SWAP_BGRA16_SPV, std::size(GPU_TILER_SWAP_BGRA16_SPV),
+		                               "create BGRA16 swap pipeline");
 	}
 	const uint64_t bytes = static_cast<uint64_t>(pixels) * 8u;
 	EXIT_IF(pixels == 0);

@@ -68,6 +68,24 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+# The AMD driver keys its pipelines (VK_KHR_pipeline_binary keys, its pipeline cache) by the executable's name: what
+# kyty_shader_precompile.exe compiled, kyty_emulator.exe never found (10-16, RX 9070 XT: 0 of every pipeline the game
+# made). The program runs named like the emulator (its DLLs next to it), on any GPU: a hard link in the emulator's
+# _PipelineCache (a copy where the drive has no hard links). Not a copy in %TEMP% (v20261017): a program put into
+# %TEMP% under another name and started there is what droppers do, and Windows Defender's heuristics took the precompile
+# for a trojan (issue #47).
+$runAs = Join-Path $PSScriptRoot '_PipelineCache\precompile-as-emulator'
+New-Item -ItemType Directory -Force $runAs | Out-Null
+foreach ($file in @(Get-Item $Exe) + @(Get-ChildItem (Split-Path $Exe) -Filter *.dll)) {
+	$name = if ($file.FullName -eq (Get-Item $Exe).FullName) { 'kyty_emulator.exe' } else { $file.Name }
+	$target = Join-Path $runAs $name
+	Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+	try { New-Item -ItemType HardLink -Path $target -Target $file.FullName -ErrorAction Stop | Out-Null }
+	catch { Copy-Item -LiteralPath $file.FullName $target -Force }
+}
+$Exe = "$runAs\kyty_emulator.exe"
+# (v20261017's copy in %TEMP%, no longer used.)
+Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) 'kyty-precompile-as-emulator') -Recurse -Force -ErrorAction SilentlyContinue
 # The game's sce_sys\param.json (its title and version). The game is its folder (eboot.bin and sce_sys) or the
 # folder packed into a ZArchive (a .zar file, read without extracting it): a .zar's is copied out by the program.
 function Read-GameParam([string]$game) {
@@ -153,6 +171,7 @@ if ($ExportHints) {
 	Start-Process explorer.exe "/select,`"$out`""
 	exit 0
 }
+$recordedLost = $false
 if ($Recorded -eq '*') {
 	$Recorded = ''
 	$hints = "$PSScriptRoot\tools\local\static-precompile\hints-$gameId.hints"
@@ -194,6 +213,7 @@ if ($Recorded -eq '*') {
 		if ($LASTEXITCODE) {
 			Write-Host 'the specializations of recorded play could not be gathered (kyty_shader_precompile --make-hints/--apply-hints): the seeds alone'
 			$Recorded = ''
+			$recordedLost = $true
 		}
 	}
 }
@@ -359,9 +379,10 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
-# (-Quick: what the store held of the other shaders stays.)
+# (-Quick: what the store held of the other shaders stays. Recorded play that could not be gathered: the pipelines an
+# earlier run made for it stay too - pruned to the seeds alone, the game compiled them all again while playing.)
 $mergeArguments = @('--merge')
-if (!$Quick) { $mergeArguments += '--prune' }
+if (!$Quick -and !$recordedLost) { $mergeArguments += '--prune' }
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",

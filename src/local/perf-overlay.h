@@ -10,8 +10,11 @@
 
 namespace PerfOverlay {
 
-// KYTY_FPS_HUD: 0 off, 1 the frame rate with the frame-time graph, 2 detailed (GPU, processor, memory).
+// 0 off, 1 the frame rate with the frame-time graph, 2 detailed (GPU, processor, memory): KYTY_FPS_HUD at start-up
+// (the launcher's Overlay), then F8 in the game (CycleLevel).
 [[nodiscard]] int Level();
+// The next level (off, frame rate, detailed, off...); returns it.
+int CycleLevel();
 
 // GPU thread, at each guest flip: the steady-clock time and the render thread's total wait for guest work (ns).
 void NoteFlip(int64_t now_ns, int64_t idle_ns);

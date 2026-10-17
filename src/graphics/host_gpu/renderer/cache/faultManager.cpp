@@ -65,6 +65,10 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	stage.stage  = vk::ShaderStageFlagBits::eCompute;
 	stage.module = module;
 	stage.pName  = "main";
+	// (The subgroup size the game's compute pipelines require here: GraphicContext::InternalComputeSubgroupSize.)
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+	subgroup.requiredSubgroupSize = m_graphics.InternalComputeSubgroupSize();
+	if (subgroup.requiredSubgroupSize != 0) stage.pNext = &subgroup;
 	vk::ComputePipelineCreateInfo pipeline_info {};
 	pipeline_info.stage  = stage;
 	pipeline_info.layout = m_fault_process_pipeline_layout;

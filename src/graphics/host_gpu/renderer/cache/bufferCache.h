@@ -244,9 +244,16 @@ public:
 	void               RunGarbageCollector(bool collect = true);
 	void               UpdateGcThresholds();
 	[[nodiscard]] uint64_t CacheBytes() const noexcept { return m_cache_bytes; }
+	// The video memory the game buffers in use that got system memory need back, with headroom (0: none): the texture
+	// collector makes this room too (TextureCache::RunGarbageCollector). Updated every 60 flips.
+	[[nodiscard]] uint64_t SpilledRoom() const noexcept { return m_spilled_room; }
 
 private:
 	friend struct BufferCacheTestAccess;
+
+	// A game buffer in use made in system memory (Buffer::IsInSystemMemory: video memory over budget then) goes back to
+	// video memory once there is room for it, one a call (RunGarbageCollector, every 60 flips). True when one moved.
+	bool MoveSpilledBufferBack();
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {
@@ -404,6 +411,12 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// When each recent collector tick began (steady clock, by tick % size): RetireStaleBuffers counts idleness in time.
+	std::array<int64_t, 8192> m_tick_times {};
+	bool                      m_retire_pressure = false; // the video memory in use at the critical level
+	// The registered game buffers in system memory and the room those in use need (MoveSpilledBufferBack).
+	std::vector<BufferId> m_spilled;
+	uint64_t              m_spilled_room = 0;
 
 	// KYTY_READBACK_QUEUE: GPU writes that may still be in flight, oldest first. An entry's
 	// tick is set at the next point between commands (every write noted by then is recorded

@@ -699,6 +699,11 @@ struct Program: ResourcePlan {
 	// Its proof took buffer loads at one address for values the same in every lane: two lanes per invocation after
 	// all where the specialization has a buffer that adds the lane to its index (ADD_TID; CompileProgram).
 	bool                          lane_local_uniform_loads = false;
+	// Its proof had a 64-thread group's two halves cooperate (Frontend::ProveWaveLaneLocal): these lane reads (pc)
+	// run wave-wide and these lane-mask branches (pc of the branch) are the wave's decision (IR::WaveFlags).
+	bool                          lane_cooperative = false;
+	std::vector<uint32_t>         cooperative_reads;
+	std::vector<uint32_t>         cooperative_branches;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

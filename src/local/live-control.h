@@ -497,6 +497,12 @@ inline void Run(uint64_t id, const std::string& line) {
 		std::printf("LIVE_FLIPS id=%" PRIu64 " count=%llu path=%s\n", id, static_cast<unsigned long long>(count), arg2);
 	} else if ((cmd == "prof" || cmd == "profp" || cmd == "profw") && n == 3) {
 		Profile(id, std::strtod(arg1, nullptr), arg2, cmd == "profp", cmd == "profw");
+	} else if (cmd == "profbg" && n == 3) {
+		// profbg <seconds> <path>: prof on a thread of its own, while the next commands run (a trace of the same
+		// seconds: the samples' TSC stamps place them in its frames).
+		std::thread([id, seconds = std::strtod(arg1, nullptr), path = std::string(arg2)] {
+			Profile(id, seconds, path.c_str(), false, false);
+		}).detach();
 #if defined(_WIN32)
 	} else if (cmd == "pinthread" && n == 3) {
 		// pinthread <tid> <cpus>: any thread's affinity (placement A/B of the worker threads).

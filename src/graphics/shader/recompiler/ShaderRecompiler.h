@@ -51,6 +51,8 @@ void SetDeviceStorageBufferBounds(bool enabled);
                                            const CompileOptions& options,
                                            const IR::ResourceSpecialization& specialization,
 	                                       uint32_t push_data_start_dword = 0);
+// A CompileResult's SPIR-V the caller is done with: the thread's next CompileProgram writes its module there.
+void RecycleSpirv(std::vector<uint32_t>&& spirv);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

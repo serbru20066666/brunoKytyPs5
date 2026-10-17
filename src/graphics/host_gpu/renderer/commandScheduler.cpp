@@ -32,6 +32,9 @@ volatile std::atomic_uint32_t kyty_local_draw_batch {256};
 // 1: prove the pending-operation queue empty before the timeline query and the
 //    operation lock. Draws and dispatches call this with nothing to retire.
 volatile std::atomic<uint32_t> kyty_local_pending_drain_mode {0};
+// Flush points nothing waits on (a label without an interrupt, the end of a queue's slice) leave the open buffer open
+// while the GPU still runs work it was handed (CommandScheduler::DeferrableFlush; KYTY_FLUSH_DEFER=0: flush at once).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_flush_defer {2};
 }
 
 namespace Libs::Graphics {
@@ -200,6 +203,7 @@ void CommandScheduler::CompleteDispatch() {
 	// against how early the queue receives work. Dispatches inside a batch keep
 	// the same chain barriers at any size. (A recorder's buffers are submitted later, whole.)
 	if (t_recorder != nullptr) return;
+	if (FlushedDeferred(4)) return;
 	const auto batch = std::clamp(kyty_local_dispatch_batch.load(std::memory_order_relaxed), 1u, 65536u);
 	if (++m_recorded_dispatches < batch) {
 		return;
@@ -225,6 +229,7 @@ void CommandScheduler::CompleteDispatch() {
 // translated. Whole, the GPU idled through its translation (3-4.5 ms for the big passes) and ran it after, late into the
 // next frame, where the next frame's culling readbacks waited for it.
 void CommandScheduler::CompleteDraws(uint32_t draws) {
+	if (t_recorder == nullptr && FlushedDeferred(draws)) return;
 	const auto batch = kyty_local_draw_batch.load(std::memory_order_relaxed);
 	if (t_recorder != nullptr || batch == 0 || (m_recorded_draws += draws) < batch) {
 		return;
@@ -258,6 +263,49 @@ bool CommandScheduler::GpuBusy() {
 	if (m_master.IsFree(handed)) return false;
 	m_master.Refresh();
 	return !m_master.IsFree(handed);
+}
+
+// A flush point nothing waits on (a label without an interrupt, the end of a queue's slice: CommandProcessor::
+// BufferFlushDeferrable) while the GPU has kyty_local_flush_defer (or more) submissions still to run: the buffer stays
+// open, and goes with the next flush, or once the GPU is down to its last submission (FlushedDeferred: asked every 16
+// draws or 4 dispatches, so it never runs dry waiting for this one), or before the GPU thread waits for work
+// (FlushDeferred). Each submission costs the GPU a drain between back-to-back command buffers (~8 us) and the recording
+// worker a submission; ~118 a frame at 1-1, mostly labels and the async queues' slices. A flush while the GPU merely
+// still ran something (GpuBusy, as CompleteDraws asks) halved the submissions but starved the GPU after short ones.
+// (Ended as a submission ends it: the render pass and a compute chain's pending barrier, so the commands after it are
+// recorded as they would be into the next buffer.)
+void CommandScheduler::DeferrableFlush() {
+	if (const auto backlog = kyty_local_flush_defer.load(std::memory_order_relaxed);
+	    backlog != 0 && t_recorder == nullptr && !m_command.IsInvalid() && Backlog() >= backlog) {
+		m_command.EndRendering();
+		(void)m_command.Handle();
+		m_flush_deferred = true;
+		return;
+	}
+	Flush();
+}
+
+void CommandScheduler::FlushDeferred() {
+	if (m_flush_deferred) Flush();
+}
+
+// While a flush is deferred, every 16 draws (or 4 dispatches: `weight`) whether the GPU is down to its last submission:
+// then the open buffer is submitted (true).
+bool CommandScheduler::FlushedDeferred(uint32_t weight) {
+	if (!m_flush_deferred) return false;
+	if ((m_deferred_checks += weight) < 16) return false;
+	m_deferred_checks = 0;
+	if (Backlog() > 1) return false;
+	Flush();
+	return true;
+}
+
+// The submissions the GPU has still to finish (the recording worker's not handed yet included).
+uint64_t CommandScheduler::Backlog() {
+	m_master.Refresh();
+	const auto submitted = m_master.CurrentTick() - 1;
+	const auto done      = m_master.KnownGpuTick();
+	return submitted > done ? submitted - done : 0;
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -674,6 +722,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_command.m_buffer    = nullptr;
 	m_recorded_dispatches = 0;
 	m_recorded_draws      = 0;
+	m_flush_deferred      = false;
 	return tick;
 }
 
@@ -907,6 +956,7 @@ uint64_t CommandScheduler::SubmitRecorded(Recorder& recorder, size_t count) {
 		m_command.m_buffer    = nullptr;
 		m_recorded_dispatches = 0;
 		m_recorded_draws      = 0;
+		m_flush_deferred      = false;
 	}
 	uint64_t tick = 0;
 	for (size_t i = 0, first = 0; i < count; ++i) {

@@ -148,6 +148,13 @@ inline void NotePipeline(VkPipeline pipeline, std::string what) {
 	g_breadcrumbs.pipelines[PipelineKey(pipeline)] = std::move(what);
 }
 
+// A pipeline destroyed (its handle's value may come back as another's).
+inline void ForgetPipeline(VkPipeline pipeline) {
+	if (!BreadcrumbsOn() || pipeline == VK_NULL_HANDLE) return;
+	std::lock_guard lock(g_breadcrumbs.mutex);
+	g_breadcrumbs.pipelines.erase(PipelineKey(pipeline));
+}
+
 // The buffers' binds, filed under the submission (`timeline` signalled to `tick`).
 inline void NoteSubmit(uint64_t timeline, uint64_t tick, const VkCommandBuffer* commands, uint32_t count,
                        const VkSemaphore* wait_semaphores = nullptr, const uint64_t* wait_values = nullptr,

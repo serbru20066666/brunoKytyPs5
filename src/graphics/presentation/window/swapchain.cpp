@@ -516,7 +516,20 @@ struct Presenter::Impl {
 		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		if (level < 2) {
+			// (Switched down from detailed with F8: its rows go.)
+			hud.perf.rows.clear();
+			hud.perf.core_load.clear();
+			hud.perf.core_fast.clear();
+			hud.perf.core_note.clear();
+		}
 		if (level == 0) {
+			hud.title.clear();
+			hud.detail.clear();
+			hud.perf.frame_ms.clear();
+			hud.perf.busy_ms.clear();
+			hud_window = {}; // (the count starts again when it is switched on)
+			hud_frames = 0;
 			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
 		}
 		if (level >= 2 && !machine_started) {
@@ -1168,12 +1181,34 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 	return m_impl->frames.AcquireLast();
 }
 
+// KYTY_PRESENT_DIRECT=1 (a test for issue #37, a variable refresh rate that stopped engaging in v20261016b): each frame
+// is presented on the vblank thread as it is handed over, as before the presenter had a thread of its own (eadf554f).
+static bool PresentDirect() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PRESENT_DIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 void Presenter::Submit(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	if (PresentDirect()) {
+		Present(frame, reuse);
+		return;
+	}
 	m_impl->Replace({.frame = &frame, .reuse = reuse});
 }
 
 void Presenter::SubmitBlank(uint32_t width, uint32_t height, bool opaque) {
+	if (PresentDirect()) {
+		// (A free frame, else none, as the presenter's thread does.)
+		if (auto* frame = m_impl->frames.Acquire(false); frame != nullptr) {
+			m_impl->ClearFrame(*frame, width, height, opaque, nullptr);
+			Present(*frame, false);
+		}
+		return;
+	}
 	m_impl->Replace({.blank = true, .width = width, .height = height, .opaque = opaque});
 }
 
@@ -1336,6 +1371,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    (overlay_visual.active || hud != nullptr) && swapchain.PrepareSystemOverlay(hud);
+			if (FrameGen::Enabled() && (hud == nullptr || !draw_system_overlay)) {
+				FrameGen::SetStaticRect(0.0f, 0.0f, 0.0f, 0.0f); // (no panel: the whole picture moves)
+			}
 			if (hud != nullptr && draw_system_overlay && FrameGen::Enabled()) {
 				// The panel's motion vectors are zeroed (a margin around it).
 				const auto& region = hud->region;

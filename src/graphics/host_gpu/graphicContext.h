@@ -136,6 +136,13 @@ struct GraphicContext {
 		return compute_subgroup_size_control_enabled ? compute_wave64_native : subgroup_size == 64u;
 	}
 
+	// The subgroup size the emulator's own compute pipelines require: 32 where compute pipelines choose one (AMD), as the
+	// game's compute pipelines there do; 0 elsewhere (the driver's). An RDNA2 driver crashed compiling the first tiler
+	// pipeline, which required none (issue #43).
+	[[nodiscard]] uint32_t InternalComputeSubgroupSize() const noexcept {
+		return compute_subgroup_size_control_enabled && min_subgroup_size <= 32u && max_subgroup_size >= 32u ? 32u : 0u;
+	}
+
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
 		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
 		return alignment != 0 ? alignment : 1;
@@ -147,6 +154,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetHostMemoryUsage() const;
+	// The video memory heap's budget less its usage (VMA's figures, the largest device-local heap): what a new
+	// device-local allocation can take without going over the budget; 0 without the driver's figures.
+	[[nodiscard]] uint64_t GetVideoMemoryRoom() const;
 	// The driver's usage figures read again (VMA otherwise refreshes them every 30 of its own allocations: memory
 	// the driver takes itself, such as pipelines, shows late).
 	void                   RefreshMemoryBudget();

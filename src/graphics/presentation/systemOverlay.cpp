@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -34,6 +35,7 @@ namespace {
 namespace CoreIme   = Libs::Ime;
 namespace DialogIme = Libs::Dialog::ImeDialog;
 namespace ErrorDialog = Libs::Dialog::ErrorDialog;
+namespace SaveDialog  = Libs::Dialog::SaveDataDialog;
 
 namespace Ime {
 
@@ -106,7 +108,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error };
+enum class OverlayKind : uint8_t { None, Ime, Error, SaveList };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -119,11 +121,16 @@ struct OverlaySnapshot {
 	OverlaySession            session;
 	Ime::HostSnapshot         ime;
 	ErrorDialog::HostSnapshot error;
+	SaveDialog::HostSnapshot  save;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
 	if (ErrorDialog::GetHostSnapshot(&snapshot->error)) {
 		snapshot->session = {OverlayKind::Error, snapshot->error.generation};
+		return true;
+	}
+	if (SaveDialog::GetHostSnapshot(&snapshot->save)) {
+		snapshot->session = {OverlayKind::SaveList, snapshot->save.generation};
 		return true;
 	}
 	if (Ime::GetHostSnapshot(&snapshot->ime)) {
@@ -235,7 +242,7 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Error) {
+	if (snapshot.session.kind == OverlayKind::Error || snapshot.session.kind == OverlayKind::SaveList) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -429,6 +436,7 @@ void InitializeSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
+	SaveDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
 }
 
@@ -436,6 +444,7 @@ void ShutdownSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
 	ErrorDialog::SetVisibilityCallback(nullptr);
+	SaveDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -465,8 +474,9 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	const auto save   = SaveDialog::GetVisualState();
+	return {core.active || dialog.active || error.active || save.active,
+	        core.revision + dialog.revision + error.revision + save.revision};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -518,6 +528,27 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	                            event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
+	}
+	if (keyboard_event && session.kind == OverlayKind::SaveList) {
+		// The keys the game's pad has (arrows, J cross, L circle) and Enter / Escape, as the pad's buttons.
+		if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+			int button = -1;
+			switch (event.key.keysym.sym) {
+				case SDLK_UP:
+				case SDLK_w: button = SDL_CONTROLLER_BUTTON_DPAD_UP; break;
+				case SDLK_DOWN:
+				case SDLK_s: button = SDL_CONTROLLER_BUTTON_DPAD_DOWN; break;
+				case SDLK_RETURN:
+				case SDLK_KP_ENTER:
+				case SDLK_j: button = SDL_CONTROLLER_BUTTON_A; break;
+				case SDLK_ESCAPE:
+				case SDLK_l: button = SDL_CONTROLLER_BUTTON_B; break;
+				default: break;
+			}
+			if (button >= 0 && event.key.repeat == 0)
+				QueueInput({InputKind::Button, session, button, event.type == SDL_KEYDOWN ? 1.0f : 0.0f, 0.0f});
+		}
+		return true;
 	}
 	if (keyboard_event && session.kind == OverlayKind::Error) {
 		if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
@@ -703,6 +734,9 @@ struct SystemOverlay::Impl {
 			switch (event.kind) {
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
+					if (session.kind == OverlayKind::SaveList && down && event.id == SDL_CONTROLLER_BUTTON_B) {
+						SaveDialog::HostCancel(session.generation);
+					}
 					if (session.kind == OverlayKind::Ime && down) {
 						if (event.id == SDL_CONTROLLER_BUTTON_B) {
 							Ime::HostCancel(session.generation);
@@ -965,6 +999,56 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	// The system's save data list (a game's Load Game): one button per save, the game's texts for it and its date.
+	void DrawSaveList(const SaveDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
+		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display, IM_COL32(0, 0, 0, 160));
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+		ImGui::SetNextWindowSize({std::max(std::min(720.0f * scale, display.x - 32.0f), 1.0f), 0.0f}, ImGuiCond_Always);
+		if (focus_pending) {
+			ImGui::SetNextWindowFocus();
+		}
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 20.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 10.0f * scale});
+		ImGui::PushFont(nullptr, 20.0f * scale);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+		ImGui::Begin("##SaveDataList", nullptr, flags);
+		ImGui::TextUnformatted(snapshot.disp_type == 3 ? "Delete" : (snapshot.disp_type == 1 ? "Save" : "Load"));
+		ImGui::Separator();
+		ImGui::BeginChild("##Saves", {0.0f, std::min(display.y * 0.6f, 96.0f * scale * static_cast<float>(snapshot.entries.size()))});
+		std::optional<size_t> chosen;
+		ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.0f, 0.5f});
+		for (size_t i = 0; i < snapshot.entries.size(); i++) {
+			const auto& entry = snapshot.entries[i];
+			std::string label = entry.title;
+			if (!entry.detail.empty()) label += "\n" + entry.detail;
+			if (!entry.date.empty()) label += "\n" + entry.date;
+			label += "##" + entry.dir_name;
+			if (ImGui::Button(label.c_str(), {ImGui::GetContentRegionAvail().x, 0.0f})) chosen = i;
+			if (focus_pending && i == snapshot.focus) {
+				ImGui::SetItemDefaultFocus();
+				ImGui::SetKeyboardFocusHere(-1);
+			}
+		}
+		ImGui::PopStyleVar();
+		ImGui::EndChild();
+		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
+		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
+		const bool canceled = ImGui::Button("Cancel", {button_width, 40.0f * scale});
+		ImGui::TextDisabled("Cross / Enter: choose    Circle / Escape: back    Up / Down (W / S): move");
+		focus_pending = false;
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleVar(2);
+		if (chosen) {
+			SaveDialog::HostSelect(snapshot.generation, *chosen);
+		} else if (canceled) {
+			SaveDialog::HostCancel(snapshot.generation);
+		}
+	}
+
 	// KYTY_FPS_HUD: the frame-time graph (the frames green, hitches red; the render thread's busy part of each
 	// orange; lines at 60 and 30 fps) and the detailed panel's rows with the processor's cores as bars.
 	void DrawPerf(const SystemOverlayPerf& perf, float unit) {
@@ -1155,6 +1239,8 @@ struct SystemOverlay::Impl {
 		if (dialog) {
 			if (snapshot.session.kind == OverlayKind::Error) {
 				DrawError(snapshot.error, frame_extent);
+			} else if (snapshot.session.kind == OverlayKind::SaveList) {
+				DrawSaveList(snapshot.save, frame_extent);
 			} else {
 				DrawIme(snapshot.ime, frame_extent);
 			}

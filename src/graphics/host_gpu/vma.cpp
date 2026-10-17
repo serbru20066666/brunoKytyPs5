@@ -265,6 +265,27 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage - std::min(usage, simulation_ballast_bytes);
 }
 
+uint64_t GraphicContext::GetVideoMemoryRoom() const {
+	// (Without VK_EXT_memory_budget VMA counts only its own blocks against a guessed budget: no figure to go by.)
+	if (allocator == nullptr || !CanReportMemoryUsage()) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto& heaps = physical_device_memory_properties.memoryHeaps;
+	uint32_t    video = UINT32_MAX;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool larger = video == UINT32_MAX || heaps[heap].size > heaps[video].size;
+		if ((heaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) && larger) video = heap;
+	}
+	if (video == UINT32_MAX) {
+		return 0;
+	}
+	// (The driver's usage holds KYTY_SIMULATE_VRAM_MB's ballast: the room left is the same.)
+	const auto& budget = budgets[video];
+	return budget.budget > budget.usage ? budget.budget - budget.usage : 0;
+}
+
 // Allocations in the heaps that are not device-local (system RAM the driver maps for the GPU): staging and
 // readback buffers, and anything the budget pushed out of video memory.
 uint64_t GraphicContext::GetHostMemoryUsage() const {

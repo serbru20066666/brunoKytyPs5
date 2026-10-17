@@ -2517,11 +2517,16 @@ private:
 		// driver. DLSS (frame generation or super resolution: NvidiaNgxWanted) needs it: NVIDIA's optical flow and NGX
 		// interop reserve about 44 GiB of host address space below 1 TiB when the device is
 		// created, and fail it (VK_ERROR_INITIALIZATION_FAILED) when the guest took all of it.
+		// With frame generation the guest stops at 512 GiB (its mappings take the lowest free
+		// addresses, tens of GiB above HOST_USER_MIN): a ceiling of 0xE0_0000_0000 left an RTX 5090
+		// enough, an RTX 5080's device creation failed until 0x80_0000_0000 (issue #32).
 		uint64_t ceiling = 0;
 		if (const char* value = std::getenv("KYTY_RESERVE_CEILING"); value != nullptr && *value != '\0') {
 			ceiling = std::strtoull(value, nullptr, 16);
 		} else if (NvidiaNgxWanted()) {
-			ceiling = 0xE000000000ull;
+			// (DLSS frame generation's optical flow and NGX reserve ~44 GiB below 1 TiB at device creation: an RTX 5080's
+			// device was refused with the ceiling at 0xE0_0000_0000; upstream issue #32.)
+			ceiling = 0x8000000000ull;
 		}
 		if (ceiling != 0) {
 			guest_end = std::clamp<uint64_t>(ceiling, HOST_USER_MIN, guest_end);

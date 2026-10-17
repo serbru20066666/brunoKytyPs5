@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -38,12 +39,24 @@ namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler;
 
-// "yes" or the reason.
-std::string Classify(std::span<const uint32_t> code) {
+// "yes" or the reason (`cooperative`: a 64-thread group's halves may cooperate: "yes (cooperative: ...)").
+std::string Classify(std::span<const uint32_t> code, bool cooperative = false) {
 	Decoder::Program decoded;
 	Decoder::DecodeProgram(code, decoded);
-	std::string reason;
-	return Frontend::IsWaveLaneLocal(decoded, &reason) ? "yes" : reason;
+	std::string               reason;
+	Frontend::LaneLocalProof  proof;
+	if (!Frontend::ProveWaveLaneLocal(decoded, cooperative, proof, &reason)) return reason;
+	if (!proof.Cooperative()) return "yes";
+	// (The program's VGPRs: what running two lanes per invocation doubles.)
+	uint32_t vgprs = 0;
+	for (const auto& inst: decoded.instructions)
+		for (const auto* operand: {&inst.dst, &inst.dst2, &inst.src0, &inst.src1, &inst.src2, &inst.src3})
+			if (operand->kind == Decoder::OperandKind::Vgpr) vgprs = std::max(vgprs, operand->reg + 1u);
+	std::string text = "yes (cooperative: vgprs " + std::to_string(vgprs) + ", " + std::to_string(decoded.instructions.size()) +
+	                   " instructions,";
+	for (const auto pc: proof.exchange_reads) text += " read@" + std::to_string(pc);
+	for (const auto pc: proof.wave_branches) text += " branch@" + std::to_string(pc);
+	return text + ")";
 }
 
 struct Case {
@@ -127,9 +140,10 @@ int main(int argc, char** argv) {
 		            static_cast<int>(std::size(Cases)));
 		return failed == 0 ? 0 : 1;
 	}
-	// (-d first: the decoded programs too.)
-	const bool dump  = std::string_view(argv[1]) == "-d";
-	const int  first = dump ? 2 : 1;
+	// (-d first: the decoded programs too; -c first: cooperative halves allowed.)
+	const bool cooperative = std::string_view(argv[1]) == "-c";
+	const bool dump        = std::string_view(argv[1]) == "-d";
+	const int  first       = dump || cooperative ? 2 : 1;
 	int        yes   = 0;
 	for (int a = first; a < argc; ++a) {
 		std::ifstream         file(argv[a], std::ios::binary);
@@ -137,8 +151,8 @@ int main(int argc, char** argv) {
 		std::vector<uint32_t> code(bytes.size() / 4);
 		std::memcpy(code.data(), bytes.data(), code.size() * 4);
 		try {
-			const auto verdict = Classify(code);
-			yes += verdict == "yes" ? 1 : 0;
+			const auto verdict = Classify(code, cooperative);
+			yes += verdict.starts_with("yes") ? 1 : 0;
 			std::printf("%s: %s\n", argv[a], verdict.c_str());
 			if (dump) {
 				Decoder::Program decoded;

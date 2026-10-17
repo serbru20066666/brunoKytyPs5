@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -197,6 +198,13 @@ struct AudioOut2PortStateEntry {
 	// single-float read dropped both.
 	std::array<float, 16>  gains {};
 	bool                   gains_set = false;
+	// A PCM attribute holds for one grain: set since the context's last push (pcm_fresh), and the pushes in a row
+	// without one (pcm_stale). An object port the game stopped feeding is no longer mixed (issue #40).
+	bool                   pcm_fresh = false;
+	uint32_t               pcm_stale = 0;
+	// (Diagnostic, issue #40.) The pushes in a row that were fed the same bytes.
+	uint64_t               pcm_hash   = 0;
+	uint32_t               pcm_repeat = 0;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -385,7 +393,7 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 	bool       mixed    = false;
 	for (const auto& object: g_audioout2_ports) {
 		if (!object.used || object.context != ctx || !audioout2_port_type_is_object(object.port_type) ||
-		    object.pcm_data == nullptr || object.audio_format != AudioInternal::Format::FloatMono ||
+		    object.pcm_data == nullptr || !object.pcm_fresh || object.audio_format != AudioInternal::Format::FloatMono ||
 		    object.samples_num != frames) {
 			continue;
 		}
@@ -419,6 +427,60 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 	return mixed ? mix.data() : target.pcm_data;
 }
 
+// Before a push queues the context's grain: the ports the game gave no PCM since the last push count as unfed. Issue #40:
+// with Mono Mix Mode on, Demon's Souls stops setting PCM on its 36 ambisonics object ports (it mixes into its main port
+// itself) and keeps them; each push mixed their last grain again, a high tone that never ended. An object port without
+// PCM for this grain is left out of the mix (on the console a grain's PCM holds for that grain only).
+// (Diagnostic.) A port fed the same non-silent bytes for 100 pushes in a row (its first 256 hashed) is reported once:
+// the game's own mix stopped moving.
+static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
+	static std::atomic<uint32_t> reported {0};
+	// (KYTY_AUDIO_LOG: every 2000 pushes, the object grains fed and left out.)
+	static const bool log    = std::getenv("KYTY_AUDIO_LOG") != nullptr;
+	static uint64_t   pushes = 0, fed = 0, unfed = 0;
+	if (log && ++pushes % 2000 == 0) {
+		std::printf("AudioOut2: %llu pushes, object grains fed %llu, left out %llu\n", static_cast<unsigned long long>(pushes),
+		            static_cast<unsigned long long>(fed), static_cast<unsigned long long>(unfed));
+	}
+	for (auto& state: g_audioout2_ports) {
+		if (!state.used || state.context != ctx || state.pcm_data == nullptr) continue;
+		state.pcm_stale = state.pcm_fresh ? 0 : state.pcm_stale + 1;
+		if (audioout2_port_type_is_object(state.port_type)) (state.pcm_fresh ? fed : unfed)++;
+		if (state.pcm_stale == 100 && audioout2_port_type_is_object(state.port_type) &&
+		    reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("AudioOut2: object port 0x%llx (ambisonics 0x%x) not fed for 100 grains: left out of the mix\n",
+			            static_cast<unsigned long long>(state.handle), state.ambisonics);
+		}
+		if (!state.pcm_fresh) continue;
+		const auto bytes = std::min<uint64_t>(256, static_cast<uint64_t>(state.samples_num) *
+		                                                audioout2_data_format_channels(state.data_format) * 2);
+		const auto* data = static_cast<const uint8_t*>(state.pcm_data);
+		uint64_t    hash = 0xcbf29ce484222325ull;
+		uint64_t    any  = 0;
+		for (uint64_t i = 0; i + 8 <= bytes; i += 8) {
+			uint64_t word = 0;
+			std::memcpy(&word, data + i, 8);
+			any |= word;
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+		const bool repeat = any != 0 && hash == state.pcm_hash;
+		state.pcm_hash    = hash;
+		state.pcm_repeat  = repeat ? state.pcm_repeat + 1 : 0;
+		if (state.pcm_repeat == 100 && reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("AudioOut2: port 0x%llx (type %u, ambisonics 0x%x) was fed the same grain 100 times in a row\n",
+			            static_cast<unsigned long long>(state.handle), static_cast<uint32_t>(state.port_type),
+			            state.ambisonics);
+		}
+	}
+}
+
+// After the push queued it: the next grain needs PCM of its own.
+static void audioout2_end_grain_locked(AudioOut2ContextHandle ctx) {
+	for (auto& state: g_audioout2_ports) {
+		if (state.used && state.context == ctx) state.pcm_fresh = false;
+	}
+}
+
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
@@ -427,6 +489,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	std::array<std::array<float, 16>, AudioInternal::OUT_PORTS_MAX> gain_storage {};
 
 	g_audioout2_port_mutex.Lock();
+	audioout2_note_grain_locked(ctx);
 	bool objects_mixed = false;
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
@@ -447,6 +510,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 			params.push_back(AudioInternal::OutputParam {state.audio_handle, data, gains});
 		}
 	}
+	audioout2_end_grain_locked(ctx);
 	g_audioout2_port_mutex.Unlock();
 
 	if (params.empty()) {
@@ -795,7 +859,10 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	if (has_pcm || has_gain || has_gains || has_ambisonics) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
-			if (has_pcm) state->pcm_data = pcm_data;
+			if (has_pcm) {
+				state->pcm_data  = pcm_data;
+				state->pcm_fresh = true;
+			}
 			if (has_gain) state->gain = gain;
 			if (has_gains) {
 				state->gains     = gains;

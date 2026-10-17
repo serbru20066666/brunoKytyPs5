@@ -90,6 +90,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// A flush nothing waits on (a label without an interrupt, a slice's end): deferred while the GPU is busy.
+	void            BufferFlushDeferrable();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }

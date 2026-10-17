@@ -221,8 +221,11 @@ int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>
 	for (const auto& recording: recordings) {
 		Lists records, recipes;
 		if (!Cache::ReadInputs(recording, records, recipes)) {
-			std::fprintf(stderr, "%s: not a warmup recording or a seed file\n", Utf8(recording).c_str());
-			return 1;
+			// (A recording of an older emulator, in a format this one no longer reads: the others still count. Failing
+			// here made the precompile drop every recording, compile the seeds alone and prune the store to them.)
+			std::fprintf(stderr, "%s: not a warmup recording or a seed file (an older format?): left out\n",
+			             Utf8(recording).c_str());
+			continue;
 		}
 		std::vector<uint32_t> numbers(records.size(), NoShader);
 		for (size_t i = 0; i < records.size(); i++) {

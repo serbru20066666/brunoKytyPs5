@@ -142,7 +142,7 @@ public:
 			}
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_SPACE ||
-			                      binding.key == SDLK_F1 || binding.key == SDLK_F7 ||
+			                      binding.key == SDLK_F7 || binding.key == SDLK_F8 ||
 			                      binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {

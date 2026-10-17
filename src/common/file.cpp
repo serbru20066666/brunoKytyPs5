@@ -661,4 +661,12 @@ void File::RemoveReadonly(const std::filesystem::path& name) {
 	SysFileRemoveReadonly(name);
 }
 
+uint32_t File::TakeLastError() {
+	return SysFileTakeLastError();
+}
+
+std::string File::ErrorText(uint32_t error) {
+	return SysFileErrorText(error);
+}
+
 } // namespace Common

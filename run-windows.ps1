@@ -29,7 +29,7 @@
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
 #                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
 #                                            its sides unstretched, in-game menus stretched), movies at 16:9
-#   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: simpler shadows and
+#   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: shorter shadows and
 #                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -TextureReduce 1       large textures without their largest level: half the size per side
 #                                            (2: a quarter; 0: whole), less video memory and upload; default 1
@@ -378,14 +378,14 @@ if ($TaaReplace) { $environment['KYTY_TAA_REPLACE'] = $TaaReplace }
 # projection widened to match; the presenter shows those frames at the aspect and the others at 16:9.
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }
 # -Quality low|lowest: Demon's Souls engine settings that cut what a frame draws, for PCs whose CPU limits the frame
-# rate (each draw costs the emulator CPU time). low: shadows drawn from simpler meshes, levels of detail chosen as for
-# a 720-line picture (1080), sun shadows to 125 m (250); lowest: detail as for 480 lines, sun shadows to 60 m, no
-# ambient shadowing, no shadows from torches and other spot lights. A laptop Ryzen 9 5900HX + RTX 3080 standing, same
-# process (standard -> low / lowest): Boletaria 1-1 20.0 -> 22.6 / 24.0 fps, Latria 22.6 -> 25.5 / 25.8, Shrine of
-# Storms 25.0 -> 26.6 / 29.0; with -RenderHeight 1080 Latria 25.4 -> 27.8 / 28.8, the Shrine 30.7 -> 34.9 / 35.8.
+# rate (each draw costs the emulator CPU time). low: levels of detail chosen as for a 720-line picture (1080), sun
+# shadows to 125 m (250); lowest: detail as for 480 lines, sun shadows to 60 m, no ambient shadowing, no shadows from
+# torches and other spot lights. A laptop Ryzen 9 5900HX + RTX 3080 standing at the Gates of Boletaria, at 1440:
+# standard 21.9 fps, lowest 25.6. Not r_forceShadowLOD (until 10-17 in both): it draws objects with their shadow
+# meshes, and objects without one vanish (carts and barricades at the Gates of Boletaria; issue #40), for 6% more.
 $qualityConvars = @{
-	low    = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
-	lowest = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
+	low    = 'r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
+	lowest = 'r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
 }
 if ($Quality -and $Quality -ne 'standard') {
 	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
@@ -443,6 +443,12 @@ if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 # not stop the frame; a worker compiles it and the object appears a few frames later. -NoAsyncShaders: off.
 if (!$NoAsyncShaders -and !$Baseline -and !$environment.Contains('KYTY_ASYNC_DRAW_PIPELINES')) { $environment['KYTY_ASYNC_DRAW_PIPELINES'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# Without -StreamlineDir, the Streamline folder chosen in the launcher (launcher-settings.json), as the launcher passes
+# it: run.cmd -FrameGen 1 had started with frame generation off, its runtime not found (issue #38).
+if (!$StreamlineDir -and $FrameGen -gt 0 -and (Test-Path "$PSScriptRoot\launcher-settings.json")) {
+	$chosen = try { [string](Get-Content "$PSScriptRoot\launcher-settings.json" -Raw | ConvertFrom-Json).streamline } catch { '' }
+	if ($chosen -and (Test-Path $chosen)) { $StreamlineDir = $chosen }
+}
 if ($StreamlineDir) { $environment['KYTY_STREAMLINE_DIR'] = $StreamlineDir }
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).

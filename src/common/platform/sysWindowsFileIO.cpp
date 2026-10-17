@@ -33,6 +33,9 @@ static std::wstring WidePath(const std::filesystem::path& path) {
 	return L"\\\\?\\" + normal;
 }
 
+// (SysFileTakeLastError.)
+static thread_local uint32_t g_last_error = 0;
+
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
 	SYS_FILE_ERROR,       // NOLINT(readability-identifier-naming)
@@ -127,7 +130,7 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		WriteFile(f.handle, data, size, &w, nullptr);
+		if (WriteFile(f.handle, data, size, &w, nullptr) == 0) g_last_error = GetLastError();
 		if (bytes_written != nullptr) {
 			*bytes_written = w;
 		}
@@ -172,6 +175,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
 	                         static_cast<DWORD>(DELETE),
 	                     FILE_SHARE_POSIX, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h_file == INVALID_HANDLE_VALUE) g_last_error = GetLastError();
 
 	ret->handle = h_file;
 	ret->type   = SYS_FILE_FILE;
@@ -232,7 +236,8 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_
 	    FILE_SHARE_POSIX, nullptr, OPEN_EXISTING, GetCacheAccessType(cache_type), nullptr);
 
 	if (h_file == INVALID_HANDLE_VALUE) {
-		ret->type = SYS_FILE_ERROR;
+		g_last_error = GetLastError();
+		ret->type    = SYS_FILE_ERROR;
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
@@ -255,7 +260,8 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 	                     nullptr);
 
 	if (h_file == INVALID_HANDLE_VALUE) {
-		ret->type = SYS_FILE_ERROR;
+		g_last_error = GetLastError();
+		ret->type    = SYS_FILE_ERROR;
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
@@ -599,6 +605,27 @@ bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::
 	auto src_wide = WidePath(src);
 	auto dst_wide = WidePath(dst);
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
+}
+
+uint32_t SysFileTakeLastError() {
+	const auto error = g_last_error;
+	g_last_error     = 0;
+	return error;
+}
+
+std::string SysFileErrorText(uint32_t error) {
+	// In English where Windows has it (logs are read in UTF-8 and reported in English), else in the system's language.
+	wchar_t    text[256] {};
+	const auto flags  = static_cast<DWORD>(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS);
+	auto       length = FormatMessageW(flags, nullptr, error, MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), text, 256, nullptr);
+	if (length == 0) length = FormatMessageW(flags, nullptr, error, 0, text, 256, nullptr);
+	while (length != 0 && (text[length - 1] == L'\n' || text[length - 1] == L'\r' || text[length - 1] == L'.')) length--;
+	if (length == 0) return {};
+	std::string result(static_cast<size_t>(length) * 4, '\0');
+	const auto  bytes = WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), result.data(),
+	                                        static_cast<int>(result.size()), nullptr, nullptr);
+	result.resize(bytes > 0 ? static_cast<size_t>(bytes) : 0);
+	return result;
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {

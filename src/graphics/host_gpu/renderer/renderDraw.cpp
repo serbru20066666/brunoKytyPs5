@@ -487,10 +487,12 @@ static ResolvedDynamicState ResolveGraphicsDynamicParams(const Buffer& buffer, b
 	}
 
 	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
+	// mask. Attachment availability therefore follows the target write mask, and CB_SHADER_MASK: a target the pixel
+	// shader exports nothing to is not written (render_target_write_mask_slot). Kept out of the pipelines' static
+	// color mask, so their keys and the precompiled caches do not depend on it.
 	out.color_count = color_count;
 	for (uint32_t i = 0; i < color_count; i++) {
-		out.color_write[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		out.color_write[i] = render_target_write_mask_slot(ctx, colors[i].target_slot) != 0
 		                         ? VK_TRUE
 		                         : VK_FALSE;
 	}
@@ -671,7 +673,8 @@ static DynamicState Capture(const CommandBuffer& buffer, const ShaderVertexInput
     const auto& ctx = buffer.GetRegisters();
     state.buffer.registers = {ctx.GetScreenViewport(), ctx.GetClipControl(),
         ctx.GetScanModeControl(), ctx.GetModeControl(), ctx.GetPolyOffset(),
-        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask()};
+        ctx.GetBlendColor(), ctx.GetLineWidth(), ctx.GetRenderTargetMask(),
+        ctx.GetShaderRegisters().m_cbShaderMask};
     const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
     state.buffer.graphics.properties.limits = {limits.maxFramebufferWidth, limits.maxFramebufferHeight,
         {limits.maxViewportDimensions[0], limits.maxViewportDimensions[1]}};
@@ -1722,7 +1725,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LiveCounters::Add(LiveCounters::DirectDraws);
 		if (mesh_active) LiveCounters::Add(LiveCounters::MeshDraws);
 		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
-		                    state.depth_info, pipeline.pipeline, feedback_aspects);
+		                    state.depth_info, BindPipelineHandle(pipeline), feedback_aspects);
 	} else {
 		buffer.InvalidateGraphicsState();
 	}
@@ -1767,7 +1770,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
 		    m_context.GetGraphics().attachment_feedback_loop_enabled, feedback_aspects);
 		packet.command = vk_buffer;
-		packet.pipeline = pipeline.pipeline;
+		packet.pipeline = BindPipelineHandle(pipeline);
 		packet.index_buffer = index_binding.buffer;
 		packet.index_offset = index_binding.offset;
 		packet.index_type = index_binding.type;

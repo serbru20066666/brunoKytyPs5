@@ -78,12 +78,12 @@ play the HUD keeps its shape: health, magic, stamina and the equipment at the le
 the right edge, the boss's health in the middle. The in-game menus are stretched to the width; the lock-on
 and enemy health bars stay on their targets; pre-rendered movies and loading screens are shown at 16:9
 with black bars. Pick the matching resolution (2560x1080, 3440x1440, 5120x2160, ...) or full screen.
-"Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low draws shadows from
-simpler meshes, picks the level of detail as for a 720-line picture and ends sun shadows at 125 m
-(250 m); Lowest picks detail as for 480 lines, ends sun shadows at 60 m and turns off ambient shadowing
+"Graphics" (Standard by default, as on the PS5) sets how much the game draws. Low picks the level of
+detail as for a 720-line picture and ends sun shadows at 125 m (250 m); Lowest picks detail as for 480
+lines, ends sun shadows at 60 m and turns off ambient shadowing
 and the shadows of torches and other lamps. Each thing drawn costs the emulator processor time, so these
-help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing in Latria: 22.6 fps at
-Standard, 25.5 at Low, 25.8 at Lowest; 28.8 at Lowest with render height 1080).
+help where the processor limits the frame rate (a laptop Ryzen 9 5900HX standing at the Gates of
+Boletaria: 21.9 fps at Standard, 25.6 at Lowest).
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
@@ -94,7 +94,9 @@ the frames per second and a graph of the last frames' times (60 and 30 fps lines
 and the longest frame of the last 10 seconds); "Detailed" adds the render thread's time in each frame (orange),
 the graphics card (load, clock, temperature, power and video memory on NVIDIA cards), the processor's load
 with a bar for each core, and the memory in use. (The overlays seen in videos with temperatures and voltages
-of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.)
+of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.) In the
+game, F8 switches the panel between Off, "Frame rate" and "Detailed", whatever the launcher started it with
+(also when started with `run.cmd`).
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -129,7 +131,7 @@ shortcut):
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
 | `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides, in-game menus are stretched, movies stay 16:9 |
-| `-Quality low` | How much the game draws: `low` or `lowest` (simpler shadows and distant detail), faster where the processor limits the frame rate |
+| `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
 
 ## Shader precompile (without it the game stutters)
 
@@ -191,18 +193,10 @@ Default keyboard layout:
 | Backspace / Tab | Left / right half of the touch pad |
 | F7 | Camera with the mouse (press again to release the mouse) |
 | Space | **Pause / resume the emulation** (careful not to hit it by accident) |
+| F8 | The emulator's overlay: Off, Frame rate, Detailed (the launcher's "Overlay" is where it starts) |
 | F11, Alt+Enter | Toggle full screen |
-| F9 / F10, F8 | Debug warp: pick a map's spawn point, arm (or cancel) the warp |
 
 The keyboard has no L2 / R2 by default: use a gamepad when you need them.
-
-**Debug warp** (for testing other areas): F9 / F10 show the list of spawn points of every map (read
-from the game's map files) and move in it, F8 arms the shown one. Then leave to the title (OPTIONS >
-Settings, the gear tab > Exit Game > Save and Exit Game) and Continue: the game loads on that map.
-The save on disk is only changed by the game itself when it saves on the new map (the panel then says
-"Warp done"), so a character can be warped back the same way; it keeps everything else (level,
-items, world progress). Some spawn points are at a boss's fog gate. A character still in the tutorial
-can be warped too; one in the character creation cannot (it has no save yet).
 
 ## Files and folders
 
@@ -223,6 +217,9 @@ can be warped too; one in the character creation cannot (it has no save yet).
 - It crashes now and then.
 - Sound: 3D sound has no direction, and there is no reverb.
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
+- On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
+  card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
+  `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
 - Windows may say "Windows protected your PC" (the programs are not signed): click
   "More info → Run anyway". For a zip downloaded from the internet, you can tick "Unblock" in the
   zip file's properties before extracting it.

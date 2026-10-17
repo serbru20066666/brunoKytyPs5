@@ -179,6 +179,32 @@ static int PosixToKernel(int posix_errno) {
 	return KERNEL_ERROR_UNKNOWN + posix_errno;
 }
 
+// A guest write the host refused (a create, an open for writing, a write that wrote less): printed, as the game goes on
+// without its data and says nothing (issue #31: progress never saved). The first 32.
+static void ReportWriteFailure(const char* what, const std::filesystem::path& path, uint64_t written = 0,
+                               uint64_t wanted = 0) {
+	const auto                   error = Common::File::TakeLastError();
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+	char sizes[64] = "";
+	if (wanted != 0) {
+		std::snprintf(sizes, sizeof(sizes), " (%llu of %llu bytes)", static_cast<unsigned long long>(written),
+		              static_cast<unsigned long long>(wanted));
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// ERROR_ACCESS_DENIED: Windows Security's Controlled folder access blocks programs it does not know from writing in
+	// Documents, Desktop and other protected folders, a read-only folder or file the same.
+	const char* hint = error == 5 ? ": if the folder is under Documents or Desktop, allow kyty_emulator.exe in Windows "
+	                                "Security > Ransomware protection > Controlled folder access, or move the emulator"
+	                              : "";
+#else
+	const char* hint = "";
+#endif
+	std::printf("FileSystem: %s failed%s: %s: error %u (%s)%s\n", what, sizes, Common::PathToString(path).c_str(), error,
+	            error != 0 ? Common::File::ErrorText(error).c_str() : "unknown", hint);
+	std::fflush(stdout);
+}
+
 int FileDescriptors::CreateDescriptor() {
 	Common::LockGuard lock(m_mutex);
 
@@ -568,6 +594,9 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		}
 
 		if (!result || file->f.IsInvalid()) {
+			if (rw_mode != Common::File::Mode::Read || creat || trunc) {
+				ReportWriteFailure(creat ? "create" : "open for writing", file->real_name);
+			}
 			g_files->DeleteDescriptor(descriptor);
 			return KERNEL_ERROR_EACCES;
 		}
@@ -747,6 +776,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		file->f.Seek(file->f.Size());
 	}
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}
@@ -856,6 +886,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
 	}

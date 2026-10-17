@@ -25,6 +25,7 @@ extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
+extern volatile std::atomic_uint32_t kyty_local_flush_defer;
 extern volatile std::atomic_uint32_t kyty_local_dispatch_batch;
 extern volatile std::atomic_uint32_t kyty_local_draw_batch;
 extern volatile std::atomic<uint32_t> kyty_local_upload_prologue;
@@ -50,6 +51,7 @@ extern volatile std::atomic_uint32_t kyty_local_table_indirect_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
 extern volatile std::atomic_uint32_t kyty_local_table_written_memo;
 extern volatile std::atomic_uint32_t kyty_local_table_set_proofs;
+extern volatile std::atomic_uint32_t kyty_local_table_mru;
 #endif
 // Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
 extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
@@ -108,6 +110,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_IMAGE_BARRIER_DEDUPE", &kyty_local_image_barrier_dedupe},
 	    Switch {"KYTY_IMAGE_POOL", &kyty_local_image_pool_mode},
 	    Switch {"KYTY_PENDING_DRAIN", &kyty_local_pending_drain_mode},
+	    // Submissions the GPU has still to run for a flush nothing waits on to be deferred (0: never).
+	    Switch {"KYTY_FLUSH_DEFER", &kyty_local_flush_defer, 0, 64},
 	    // Dispatches recorded per submission.
 	    Switch {"KYTY_DISPATCH_BATCH", &kyty_local_dispatch_batch, 1, 65536},
 	    // Draws recorded per submission (0: no limit).
@@ -144,6 +148,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_WRITTEN_MEMO", &kyty_local_table_written_memo},
 	    // Table set image uses checked again only when they changed (default on; 0 checks all, 2 verifies).
 	    Switch {"KYTY_TABLE_SET_PROOFS", &kyty_local_table_set_proofs, 0, 2},
+	    // Table lookups that ask the last answer first (bits: pair cache size, variant, image set).
+	    Switch {"KYTY_TABLE_MRU", &kyty_local_table_mru, 0, 7},
 #endif
 	    Switch {"KYTY_SPECULATE", &kyty_local_speculate_mode, 0, 4},
 	    Switch {"KYTY_SPECULATE_THREADS", &kyty_local_speculate_threads, 1, 8},

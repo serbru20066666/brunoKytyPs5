@@ -250,6 +250,40 @@ static vk::Result CapturePipelineBinaries(GraphicContext& graphics, PipelineCach
 	return result;
 }
 
+namespace {
+struct ZstdThread {
+	ZSTD_CCtx*        compress   = nullptr;
+	ZSTD_DCtx*        decompress = nullptr;
+	std::vector<char> packed;
+	~ZstdThread() {
+		ZSTD_freeCCtx(compress);
+		ZSTD_freeDCtx(decompress);
+	}
+};
+thread_local ZstdThread t_zstd;
+} // namespace
+
+std::span<const char> ZstdPack(const void* data, size_t bytes, int level) {
+	auto& zstd = t_zstd;
+	if (zstd.compress == nullptr) zstd.compress = ZSTD_createCCtx();
+	const auto bound = ZSTD_compressBound(bytes);
+	if (zstd.packed.size() < bound) zstd.packed.resize(bound);
+	const auto size = zstd.compress != nullptr
+	                      ? ZSTD_compressCCtx(zstd.compress, zstd.packed.data(), bound, data, bytes, level)
+	                      : ZSTD_compress(zstd.packed.data(), bound, data, bytes, level);
+	if (ZSTD_isError(size)) return {};
+	return {zstd.packed.data(), size};
+}
+
+bool ZstdUnpack(std::span<const char> packed, void* out, size_t bytes) {
+	auto& zstd = t_zstd;
+	if (zstd.decompress == nullptr) zstd.decompress = ZSTD_createDCtx();
+	const auto size = zstd.decompress != nullptr
+	                      ? ZSTD_decompressDCtx(zstd.decompress, out, bytes, packed.data(), packed.size())
+	                      : ZSTD_decompress(out, bytes, packed.data(), packed.size());
+	return size == bytes;
+}
+
 namespace ModuleStore {
 namespace {
 // A stored module's handle: the address of its index's byte here (untouched: no memory).
@@ -310,12 +344,11 @@ vk::ShaderModule Add(const std::vector<uint32_t>& spirv) {
 	if (!Enabled() || spirv.empty()) return nullptr;
 	std::call_once(g_file_once, [] { g_file = LocalPlatform::OpenScratchFile(); });
 	if (g_file == 0) return nullptr;
-	const auto        bytes = spirv.size() * sizeof(uint32_t);
-	std::vector<char> packed(ZSTD_compressBound(bytes));
-	const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), spirv.data(), bytes, 1);
-	const bool        compressed  = !ZSTD_isError(packed_size) && packed_size < bytes;
-	const void*       data        = compressed ? static_cast<const void*>(packed.data()) : spirv.data();
-	const auto        stored      = compressed ? packed_size : bytes;
+	const auto  bytes      = spirv.size() * sizeof(uint32_t);
+	const auto  packed     = ZstdPack(spirv.data(), bytes);
+	const bool  compressed = !packed.empty() && packed.size() < bytes;
+	const void* data       = compressed ? static_cast<const void*>(packed.data()) : spirv.data();
+	const auto  stored     = compressed ? packed.size() : bytes;
 	const auto        offset      = g_end.fetch_add(stored, std::memory_order_relaxed);
 	if (stored > UINT32_MAX || !LocalPlatform::WriteScratchFile(g_file, offset, data, stored)) return nullptr;
 	const auto module = Push({g_file, offset, static_cast<uint32_t>(stored), static_cast<uint32_t>(spirv.size()), compressed});
@@ -354,7 +387,7 @@ std::shared_ptr<const std::vector<uint32_t>> Load(vk::ShaderModule module) {
 	if (entry.compressed) {
 		std::vector<char> packed(entry.stored);
 		if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, packed.data(), packed.size()) ||
-		    ZSTD_decompress(spirv->data(), bytes, packed.data(), packed.size()) != bytes)
+		    !ZstdUnpack(packed, spirv->data(), bytes))
 			return nullptr;
 	} else if (!LocalPlatform::ReadScratchFile(entry.file, entry.offset, spirv->data(), bytes)) {
 		return nullptr;
@@ -455,6 +488,35 @@ void LogPipelineKey(const char* what, const PipelineBinaries::Key& key, const In
 		const auto [shader, spirv] =
 		    found != g_key_log_modules.end() ? found->second : std::pair<uint64_t, uint64_t> {0, 0};
 		line += fmt::format(" {:016x}/{:016x}", shader, spirv);
+	}
+	// What else the key is made of: the create flags, the pNext chain, each stage's flags, pNext and specialization.
+	const auto chain = [](const void* next) {
+		std::string text;
+		for (const auto* s = static_cast<const VkBaseInStructure*>(next); s != nullptr; s = s->pNext)
+			text += fmt::format("{}{}", text.empty() ? "" : ",", static_cast<int>(s->sType));
+		return text;
+	};
+	line += fmt::format(" | flags={:x} next=[{}]", static_cast<uint32_t>(info.flags), chain(info.pNext));
+	const auto stage_text = [&](const vk::PipelineShaderStageCreateInfo& stage) {
+		std::string text = fmt::format(" stage={:x}/{:x}/{} next=[{}]", static_cast<uint32_t>(stage.stage),
+		                               static_cast<uint32_t>(stage.flags), stage.pName != nullptr ? stage.pName : "",
+		                               chain(stage.pNext));
+		if (const auto* spec = stage.pSpecializationInfo; spec != nullptr) {
+			text += fmt::format(" spec={}:{}:{:016x}", spec->mapEntryCount, spec->dataSize,
+			                    spec->pData != nullptr ? XXH3_64bits(spec->pData, spec->dataSize) : 0);
+		}
+		if (const auto* sub = static_cast<const VkBaseInStructure*>(stage.pNext); sub != nullptr &&
+		    sub->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO) {
+			text += fmt::format(" subgroup={}",
+			                    reinterpret_cast<const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo*>(sub)
+			                        ->requiredSubgroupSize);
+		}
+		return text;
+	};
+	if constexpr (std::is_same_v<Info, vk::ComputePipelineCreateInfo>) {
+		line += stage_text(info.stage);
+	} else {
+		for (uint32_t i = 0; i < info.stageCount; i++) line += stage_text(info.pStages[i]);
 	}
 	std::printf("%s\n", line.c_str());
 }
@@ -656,9 +718,44 @@ uint64_t ComputePipelineIdentity(uint64_t spirv, const ShaderComputeInputInfo& i
 	return XXH3_64bits(parts, sizeof(parts));
 }
 
+// What the game's pipelines got from a static store (ReportStaticStore): made of what it holds, not among them, held
+// but their binaries or cache not made again from the data, refused by the driver when made of them (the last result),
+// and pipelines it could not be asked for (no driver key; no identity).
+struct StoreOutcomes {
+	std::atomic<uint64_t> hits {0}, absent {0}, damaged {0}, refused {0}, unasked {0};
+	std::atomic<int32_t>  refusal {0};
+
+	void Count(std::atomic<uint64_t>& counter) { counter.fetch_add(1, std::memory_order_relaxed); }
+	void Refused(vk::Result result) {
+		Count(refused);
+		refusal.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+	}
+	void Report(const char* store, const char* data, const char* unasked_what) const {
+		const auto counts = std::array {hits.load(), absent.load(), damaged.load(), refused.load(), unasked.load()};
+		if (counts[0] + counts[1] + counts[2] + counts[3] + counts[4] == 0) return;
+		const auto last = counts[3] != 0 ? vk::to_string(static_cast<vk::Result>(refusal.load())) : std::string("none");
+		std::printf("Static pipeline %s: %llu pipelines made of them, %llu not among them, %llu whose %s the driver did "
+		            "not make again, %llu it refused to make of them (last: %s), %llu %s\n",
+		            store, static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+		            static_cast<unsigned long long>(counts[2]), data, static_cast<unsigned long long>(counts[3]),
+		            last.c_str(), static_cast<unsigned long long>(counts[4]), unasked_what);
+	}
+};
+static StoreOutcomes g_binary_outcomes, g_blob_outcomes;
+
+void ReportStaticStore() {
+	g_binary_outcomes.Report("binaries", "binaries", "without a driver key");
+	g_blob_outcomes.Report("blobs", "pipeline cache", "without an identity");
+	std::fflush(stdout);
+}
+
 // (KYTY_PIPELINE_SOURCE_LOG) Whether the static cache or store gave this thread's last pipeline, and for a pipeline
 // cache blob: its size and the microseconds of its read, of the cache made of it and of the pipeline's creation.
 static thread_local bool t_static_hit = false;
+
+bool LastPipelineFromStore() {
+	return t_static_hit;
+}
 struct BlobTimes {
 	size_t bytes     = 0;
 	double read_us   = 0.0;
@@ -725,15 +822,22 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				auto with              = info;
 				from.pNext             = with.pNext;
 				with.pNext             = &from;
-				if (create(nullptr, with) == vk::Result::eSuccess) {
+				const auto result      = create(nullptr, with);
+				if (result == vk::Result::eSuccess) {
 					if (writer != nullptr) writer->Copy(key, *store);
+					if (writer == nullptr) g_binary_outcomes.Count(g_binary_outcomes.hits);
 					t_static_hit = true;
 					return vk::Result::eSuccess;
 				}
 				pipeline.pipeline = nullptr;
+				if (writer == nullptr) g_binary_outcomes.Refused(result);
+			} else if (writer == nullptr) {
+				g_binary_outcomes.Count(store->Holds(key) ? g_binary_outcomes.damaged : g_binary_outcomes.absent);
 			}
 			if (writer == nullptr && PipelineKeyLog()) LogPipelineKey("miss", key, original);
 			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
+		} else if (writer == nullptr) {
+			g_binary_outcomes.Count(g_binary_outcomes.unasked);
 		}
 	}
 	// Without pipeline binaries, its own cache data by its identity: a cache made of it gives the pipeline without
@@ -741,6 +845,10 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	// one it lacks into a cache of its own, whose data it keeps.
 	const auto* blobs       = graphics.pipeline_blobs;
 	auto*       blob_writer = graphics.pipeline_blob_writer;
+	if (build != PipelineBuild::Optimize && identity == 0 && blobs != nullptr && blob_writer == nullptr &&
+	    graphics.pipeline_cache_control_enabled) {
+		g_blob_outcomes.Count(g_blob_outcomes.unasked);
+	}
 	if (build != PipelineBuild::Optimize && identity != 0 && (blobs != nullptr || blob_writer != nullptr) &&
 	    graphics.pipeline_cache_control_enabled) {
 		std::vector<uint8_t> data;
@@ -764,11 +872,17 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				graphics.device.destroyPipelineCache(cache, nullptr);
 				if (result == vk::Result::eSuccess) {
 					if (blob_writer != nullptr) blob_writer->Copy(identity, *blobs);
+					if (blob_writer == nullptr) g_blob_outcomes.Count(g_blob_outcomes.hits);
 					t_static_hit = true;
 					return result;
 				}
 				pipeline.pipeline = nullptr;
+				if (blob_writer == nullptr) g_blob_outcomes.Refused(result);
+			} else if (blob_writer == nullptr) {
+				g_blob_outcomes.Count(g_blob_outcomes.damaged);
 			}
+		} else if (blobs != nullptr && blob_writer == nullptr) {
+			g_blob_outcomes.Count(blobs->Holds(identity) ? g_blob_outcomes.damaged : g_blob_outcomes.absent);
 		}
 		if (blob_writer != nullptr) {
 			// A static pipeline cache from before the blobs (a conversion, KYTY_STATIC_BLOBS_FROM_CACHE): its hit gives the

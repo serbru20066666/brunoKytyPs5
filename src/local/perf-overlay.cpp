@@ -396,13 +396,24 @@ void Run(std::array<uint8_t, 16> /*uuid*/, std::string gpu_name) {
 
 } // namespace
 
-int Level() {
-	static const int level = [] {
+std::atomic<int>& LevelState() {
+	static std::atomic<int> level = [] {
 		const char* value = std::getenv("KYTY_FPS_HUD");
 		if (value == nullptr || *value == '\0' || std::string_view(value) == "0") return 0;
 		return std::atoi(value) >= 2 ? 2 : 1;
 	}();
 	return level;
+}
+
+int Level() {
+	return LevelState().load(std::memory_order_relaxed);
+}
+
+int CycleLevel() {
+	auto& level = LevelState();
+	int   next  = (level.load(std::memory_order_relaxed) + 1) % 3;
+	level.store(next, std::memory_order_relaxed);
+	return next;
 }
 
 void NoteFlip(int64_t now_ns, int64_t idle_ns) {

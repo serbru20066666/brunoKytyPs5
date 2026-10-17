@@ -1009,6 +1009,10 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
+	// (As before below 12 GiB of budget, where GPU buffers ignore it: one in system memory had no video memory at all;
+	// and without the driver's figures, which give no room to move one into.)
+	if (!m_graphics.small_video_memory && m_graphics.CanReportMemoryUsage() && m_slot_buffers[id].IsInSystemMemory())
+		m_spilled.push_back(id);
 }
 
 void BufferCache::Unregister(BufferId id) {
@@ -1100,6 +1104,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (buffer == nullptr || buffer->is_deleted) {
 		return;
 	}
+	std::erase(m_spilled, id);
 	Unregister(id);
 	// KYTY_READBACK_QUEUE: a copy on the transfer queue may still read it after the graphics timeline
 	// passes (it waits on that timeline only for the bytes' last writer). Freed then, its memory was
@@ -1304,6 +1309,10 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
         vk::ComputePipelineCreateInfo pipeline {};
         pipeline.stage.stage = vk::ShaderStageFlagBits::eCompute;
         pipeline.stage.module = module; pipeline.stage.pName = "main";
+        // (The subgroup size the game's compute pipelines require here: GraphicContext::InternalComputeSubgroupSize.)
+        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+        subgroup.requiredSubgroupSize = m_graphics.InternalComputeSubgroupSize();
+        if (subgroup.requiredSubgroupSize != 0) pipeline.stage.pNext = &subgroup;
         pipeline.layout = m_lod_pack_layout;
         RequireVulkanSuccess(m_graphics.device.createComputePipelines(nullptr, 1, &pipeline, nullptr, &m_lod_pack_pipeline),
                              "create LOD report pipeline");
@@ -1483,15 +1492,22 @@ void BufferCache::WriteBufferReport(const char* path) {
 	m_scheduler.Context().GetGpu().SendCommandSync([this, path] {
 		FILE* file = std::fopen(path, "wb");
 		if (file == nullptr) return;
-		std::fputs("id\taddress\tsize\tlru_tick\tgc_tick\tmapped\tgpu_modified\tcpu_modified\tbda_read\n", file);
+		std::fputs("id\taddress\tsize\tlru_tick\tgc_tick\tmapped\tgpu_modified\tcpu_modified\tbda_read\tmapped_bytes\tmapped_parts\n",
+		           file);
+		std::vector<std::pair<uint64_t, uint64_t>> parts;
 		m_slot_buffers.ForEach([&](BufferId id, const Buffer& buffer) {
 			if (buffer.is_deleted || buffer.CpuAddress() == 0) return;
 			const auto address = buffer.CpuAddress(), size = buffer.Size();
-			std::fprintf(file, "%u\t0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%d\t%d\t%d\t%d\n", id.index, address,
-			             size, m_lru_cache.TickOf(buffer.lru_id), m_gc_tick,
+			// (How much of it guest mappings cover, in how many pieces: video memory over unmapped guest memory.)
+			LibKernel::Memory::MappedParts(address, size, &parts);
+			uint64_t mapped_bytes = 0;
+			for (const auto& part: parts) mapped_bytes += part.second;
+			std::fprintf(file, "%u\t0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%d\t%d\t%d\t%d\t%" PRIu64 "\t%zu\n",
+			             id.index, address, size, m_lru_cache.TickOf(buffer.lru_id), m_gc_tick,
 			             LibKernel::Memory::IsFullyMapped(address, size) ? 1 : 0,
 			             m_memory_tracker.IsRegionGpuModified(address, size) ? 1 : 0,
-			             m_memory_tracker.IsRegionCpuModified(address, size) ? 1 : 0, buffer.bda_read ? 1 : 0);
+			             m_memory_tracker.IsRegionCpuModified(address, size) ? 1 : 0, buffer.bda_read ? 1 : 0, mapped_bytes,
+			             parts.size());
 		});
 		std::fclose(file);
 	});
@@ -2802,8 +2818,15 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size) && (spec == nullptr || !spec->current_set.Contains(vaddr, size));
 }
 
-// Per flip, whatever the memory use: the buffers no binding used for StaleTicks flips go (at most MaxRetirements a flip;
-// 600 flips also retired what a turned camera left behind for ten seconds: re-registered when seen again at Latria).
+// Per flip, whatever the memory use: the CPU-written buffers no binding used for StaleTime go (at most MaxRetirements a
+// flip); with the video memory in use at the critical level or over it, after PressureTime and up to PressureRetirements
+// (only then: ten seconds also retire what a turned camera left behind, re-registered when seen again at Latria).
+// Idleness is counted in time, not flips: the 1800 flips it was are 2 minutes at an 8 GB laptop's 14 fps, where
+// a 5-minute 1-1 tour left 0.5 GB of such buffers idle while the video memory in use went past the budget (8.0 GB of
+// 7.25). Same exe, the 1800-flip rule against this, twice each: 14.8/17.3 -> 23.5/23.9 fps, render 45 -> 38.6 ms, frames
+// over 100 ms 137/137 -> 25/21, region syncs 3650 -> 1900 a frame, buffers 2.9 -> 2.1 GB, bda_fault_pages 3.3/4.6 ->
+// 3.0/2.0. At high frame rates the StaleTicks flips can come first. Never one used in the last MinTicks flips (a long
+// frame is no idle time). The video memory in use is read every 30 flips.
 // The collector below waits for a frame without BDA shaders, which this game never has, so every buffer it ever
 // registered stayed; those inside the BDA shaders' unbounded read windows had their CPU-written pages uploaded and
 // write-protected again at every BDA preparation (the game reuses that memory every frame). At 1-1, three rounds of the
@@ -2812,20 +2835,47 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 // collector's) and buffers BDA shaders read with no buffer registered (Buffer::bda_read: those reads touch no LRU
 // entry, and one after the buffer went would read zeros once) - none faulted back over that route (bda_fault_pages ~0).
 void BufferCache::RetireStaleBuffers(uint64_t tick) {
-	constexpr uint64_t StaleTicks     = 1800;
-	constexpr size_t   MaxRetirements = 64;
-	if (tick <= StaleTicks) return;
+	constexpr auto     StaleTime           = std::chrono::seconds(30);
+	constexpr auto     PressureTime        = std::chrono::seconds(10);
+	constexpr size_t   MaxRetirements      = 64;
+	constexpr size_t   PressureRetirements = 256;
+	constexpr uint64_t MinTicks            = 120;
+	constexpr uint64_t StaleTicks          = 1800;
+	const auto         now                 = std::chrono::steady_clock::now();
+	m_tick_times[tick % m_tick_times.size()] = now.time_since_epoch().count();
+	if (tick % 30 == 0) {
+		uint64_t video = 0, budget = 0;
+		m_retire_pressure = m_graphics.QueryLocalVideoMemory(&video, &budget) && video >= m_critical_gc_memory;
+	}
+	if (tick <= MinTicks) return;
+	const bool pressure = m_retire_pressure;
+	const auto horizon  = (now - (pressure ? PressureTime : StaleTime)).time_since_epoch().count();
+	// The newest tick that began by the horizon among the ticks the ring holds (their times only grow); when even the
+	// oldest held began after it, the ticks older than the ring.
+	uint64_t first = tick - std::min<uint64_t>(tick, m_tick_times.size() - 1), last = tick;
+	if (m_tick_times[first % m_tick_times.size()] > horizon) {
+		last = first;
+	} else {
+		while (first < last) {
+			const uint64_t middle = first + (last - first + 1) / 2;
+			if (m_tick_times[middle % m_tick_times.size()] <= horizon) first = middle;
+			else last = middle - 1;
+		}
+	}
+	// (Never later than the StaleTicks rule it replaced: at 120 fps, 1800 flips are 15 s.)
+	const uint64_t below = std::min(std::max(last, tick > StaleTicks ? tick - StaleTicks : 0), tick - MinTicks);
+	const size_t   limit = pressure ? PressureRetirements : MaxRetirements;
 	thread_local std::vector<BufferId> stale, kept;
 	stale.clear();
 	kept.clear();
-	m_lru_cache.ForEachItemBelow(tick - StaleTicks, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(below, [&](BufferId id) {
 		const auto& buffer = m_slot_buffers[id];
 		if (buffer.is_deleted) return false;
 		if (buffer.bda_read || m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()))
 			kept.push_back(id);
 		else
 			stale.push_back(id);
-		return stale.size() == MaxRetirements;
+		return stale.size() == limit;
 	});
 	// (The ones passed over go to the back of the list: the next flips' walks do not cross them again.)
 	for (const auto id: kept) TouchBuffer(m_slot_buffers[id]);
@@ -2846,10 +2896,70 @@ void BufferCache::EraseRetired() {
 	});
 }
 
+bool BufferCache::MoveSpilledBufferBack() {
+	// What a buffer moved back leaves of the budget: VMA's largest new block and the next frames' allocations. (A game
+	// buffer in system memory is read over the bus every frame: 28 fps where there were 60 on a 16 GB GPU, until a
+	// restart.)
+	constexpr uint64_t Headroom = uint64_t {256} << 20u;
+	// In use: read through the page table (bda_read: those reads leave no trace in the LRU), or bound in the last 600
+	// flips (the texture collector's staleness).
+	constexpr uint64_t InUseTicks = 600;
+	if (m_spilled.empty()) {
+		m_spilled_room = 0;
+		return false;
+	}
+	const uint64_t room   = m_graphics.GetVideoMemoryRoom();
+	uint64_t       needed = 0;
+	BufferId       id {};
+	bool           fits   = false;
+	for (const auto spilled: m_spilled) {
+		const auto& buffer = m_slot_buffers[spilled];
+		if (!buffer.bda_read && m_lru_cache.TickOf(buffer.lru_id) + InUseTicks < m_gc_tick) continue;
+		needed += buffer.Size();
+		if (!fits && buffer.Size() + Headroom <= room) {
+			id   = spilled;
+			fits = true;
+		}
+	}
+	// The room the ones in use need, which the texture collector makes (SpilledRoom).
+	m_spilled_room = needed != 0 ? needed + Headroom : 0;
+	// (On the command buffer being recorded, outside a speculation.)
+	if (!fits || !m_scheduler.Active() || m_scheduler.Current().IsInvalid() || Spec::Current() != nullptr) {
+		return false;
+	}
+	const auto begin    = m_slot_buffers[id].CpuAddress();
+	const auto size     = m_slot_buffers[id].Size();
+	const auto moved_id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
+	                                            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+	if (m_slot_buffers[moved_id].IsInSystemMemory()) {
+		m_slot_buffers.erase(moved_id);
+		return false;
+	}
+	// SplitUnmappedBuffers' steps with one piece (the stream score kept: the same range): the copy, the old buffer out,
+	// the new one in.
+	auto&       moved  = m_slot_buffers[moved_id];
+	const auto& source = m_slot_buffers[id];
+	moved.bda_read     = source.bda_read;
+	moved.IncreaseStreamScore(source.StreamScore());
+	SetVulkanObjectNameF(m_graphics.device, moved.Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin,
+	                     size);
+	moved.CopyFrom(m_scheduler.Current(), source, 0, 0, size);
+	NoteGpuWrite(begin, size);
+	DeleteBuffer(id);
+	Register(moved_id);
+	m_spilled_room = needed > size ? needed - size + Headroom : 0;
+	std::printf("Vulkan: a GPU buffer is back in video memory (%llu bytes)\n", static_cast<unsigned long long>(size));
+	return true;
+}
+
 void BufferCache::RunGarbageCollector(bool collect) {
 	EraseRetired();
 	const auto tick = m_gc_tick++;
 	RetireStaleBuffers(tick);
+	// The game buffers in system memory are looked at every 60 flips, collection or not (this game's frames all read
+	// guest memory through device addresses). At the end of a submission its command buffer still records
+	// (EndSubmission, before the flush).
+	if (tick % 60 == 0) (void)MoveSpilledBufferBack();
 	if (!collect) {
 		return;
 	}

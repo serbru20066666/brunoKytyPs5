@@ -114,6 +114,10 @@ public:
 	static bool CopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static void RemoveReadonly(const std::filesystem::path& name);
+	// This thread's latest failed create, open or write: the system's error code (GetLastError, errno), 0 when none
+	// failed since the last call, which clears it; and an error code's text.
+	static uint32_t    TakeLastError();
+	static std::string ErrorText(uint32_t error);
 
 	KYTY_CLASS_NO_COPY(File);
 

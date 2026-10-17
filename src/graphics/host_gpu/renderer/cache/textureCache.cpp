@@ -262,7 +262,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
-      m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
+      m_tiler(graphics, scheduler),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
@@ -4210,6 +4210,19 @@ void TextureCache::RunGarbageCollector() {
 			}
 			m_trigger_gc_memory = trigger;
 		}
+	} else if (m_graphics.CanReportMemoryUsage() && !m_graphics.small_video_memory) {
+		// The budget Windows gives now, not the one at start-up: another program's video memory lowers it (a Discord
+		// stream: 15.2 -> 13.9 GB on a 16 GB GPU), and past it Windows moves the game's memory out of video memory
+		// (60 -> 20-30 fps). Its lowest of the last 30 s (KytyGcLiveBudgetValue), less GetTotalMemoryBudget's headroom
+		// as at start-up. (As before below 12 GiB of budget.)
+		static uint64_t logged  = 0;
+		const uint64_t  trigger = KytyGcLiveBudgetValue(m_graphics);
+		if ((trigger > logged ? trigger - logged : logged - trigger) >= (uint64_t {256} << 20u)) {
+			logged = trigger;
+			std::printf("Texture collector: collects above %llu MiB (the video memory budget now, less its headroom)\n",
+			            static_cast<unsigned long long>(trigger >> 20u));
+		}
+		m_trigger_gc_memory = trigger;
 	}
 	// A log line on where the GPU's memory goes when its use moved (checked every 60 flips): on a GPU short of video
 	// memory by 256 MiB of video memory, on others by 1 GiB of video or GPU system memory (issue #14: an RX 9070 XT held
@@ -4233,11 +4246,13 @@ void TextureCache::RunGarbageCollector() {
 	// come back after a few seconds (160 flips: 5-7 MB of uploads a frame instead of 0.2-1.7, 1% low 47 -> 27 fps).
 	// Further past the budget, younger images go and more a flip: a 16 GB card with a 10 GB budget climbed to 13.5 GB
 	// in Boletaria (10 minutes, 1-1 to the first tower), as the images unused for 600 flips came at 40 a flip.
-	constexpr uint64_t GiB          = uint64_t {1} << 30u;
-	const uint64_t     over         = m_total_used_memory > m_trigger_gc_memory ? m_total_used_memory - m_trigger_gc_memory : 0;
-	const uint64_t     StaleTicks   = over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
-	const size_t       MaxDeletions = over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
-	if (m_total_used_memory < m_trigger_gc_memory || tick < StaleTicks) {
+	// Less the room game buffers in use that got system memory need back (BufferCache::MoveSpilledBufferBack).
+	constexpr uint64_t GiB           = uint64_t {1} << 30u;
+	const uint64_t     collect_above = m_trigger_gc_memory - std::min(m_trigger_gc_memory, m_buffer_cache.SpilledRoom());
+	const uint64_t     over          = m_total_used_memory > collect_above ? m_total_used_memory - collect_above : 0;
+	const uint64_t     StaleTicks    = over >= 2 * GiB ? 120 : over >= GiB ? 300 : 600;
+	const size_t       MaxDeletions  = over >= 2 * GiB ? 160 : over >= GiB ? 80 : 40;
+	if (m_total_used_memory < collect_above || tick < StaleTicks) {
 		return;
 	}
 	// An image the collector keeps (a depth image with its stencil association; one the GPU wrote, tiled: no download
@@ -4257,7 +4272,7 @@ void TextureCache::RunGarbageCollector() {
 	});
 	for (const auto id: candidates) {
 		auto owner = m_slot_images.try_get(id);
-		if (m_total_used_memory < m_trigger_gc_memory) {
+		if (m_total_used_memory < collect_above) {
 			break;
 		}
 		if (owner == nullptr || !owner->registered) {

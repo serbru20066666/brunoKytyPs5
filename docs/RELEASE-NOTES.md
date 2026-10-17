@@ -1,78 +1,71 @@
 ## New in this build
 
-- **VSync and TVs (issue #30)**:
-  - **No more slow motion:** the game no longer slows down when the display makes it wait. Frames are now shown on a
-    thread of their own, and the game's clock (the PS5's vblank) never waits for them. V-Sync forced in the NVIDIA
-    Control Panel, a TV below 60 Hz or a full VSync queue used to make the game run in slow motion.
-  - **The launcher's VSync follows the display:** when the display refreshes at a whole multiple of 60 Hz, the
-    emulator's vblank follows the display's own. That includes 59.94 Hz TVs, so the dropped or doubled frame every ~17 s
-    is gone. Displays with a variable refresh rate keep the emulator's own timer.
-  - **Steadier 60 fps:** frame pacing at 60 fps is steadier too. Standing in Boletaria 1-1 on the test PC, the 1% low
-    went from 53 to 58-59 fps.
-- **DLSS frame generation with "Up to 120 FPS" (issue #29):** with frame generation on, the game's own frames stay at
-  60, so DLSS-G spaces its frames evenly. Before, they alternated between 8 and 17 ms.
-- **The first visit to a place on a new install:**
-  - Once the shader precompile has run, the background shader preparation starts with the shaders that the shipped
-    recordings met in play, in the order they met them.
-  - The first entry into Boletaria 1-1:
-
-    | | Before | Now |
-    |---|---|---|
-    | First frame | 1.1 s | 0.4 s |
-    | Slow frames | — | half as many |
-    | Shaders translated while you wait | — | none |
-- **Precompile on a new install (issue #28):** a PC without recorded play now compiles the shipped shader hints too.
-  v20261016 compiled only the guessed shaders there, and AMD cards froze 0.2-8 s per pipeline on first visits. After
-  updating, the launcher asks once to update the shader cache; only what is missing is compiled.
-- **Walking back into a place:** the emulator sets shader data it has not used for a while aside to save memory. That
-  data used to come back all at once when you returned, a 30-40 ms hitch each time.
-  - PCs with 64 GB of RAM or more now keep it.
-  - PCs with 16 and 32 GB keep the most recent and bring the rest back on other threads.
-  - On the test PC, the longest frame walking back into Boletaria 1-1 went from 42 ms to 20 ms (24 ms with 16 GB). In
-    Stonefang the 1% low went from 55 to 80 fps.
-- **Graphics cards with less than 12 GB of video memory:**
-  - Large textures are kept without their most detailed level. Textures are slightly softer up close, and play is
-    smoother: with 8 GB simulated, the 1% low went from 37-49 to 53-58 fps.
-  - The launcher's "Graphics" Low and Lowest now also make textures half or quarter size on any card.
-  - `run.cmd -TextureReduce 0` keeps them whole.
-- **Add-on content (DLC):** put it in `Content\PPSA01341\<folder>` (with its `sce_sys\param.json`), and the game sees
-  it as owned (PR #25).
-- **Shader hints:** the shipped shader hints add an RX 9070 XT player's recorded play.
+- **Load Game lets you choose the character (issue #46):**
+  - Load Game shows the list of your saves. Each entry has the character's name, level, place, play time and date.
+  - Choose with Cross / Enter, go back with Circle / Escape. Before, it always loaded the character played last.
+  - Saves from an older version show their folder name and date until the game saves them once.
+- **AMD graphics cards:**
+  - **The precompiled shader cache now works on AMD (PR #41, issue #28).** The driver files its pipelines under the
+    program's name, so the game never found what the precompile had made. **After updating, run the precompile once
+    more**: the launcher asks, and the old cache is no longer used.
+  - **Phantoms and see-through bodies** no longer turn into blocks or mosaics (PR #41, issue #24, driver 26.9.2). The
+    emulator now tells the driver which color targets a shader writes nothing to.
+  - **RX 6700 XT / 6750 XT (RDNA2):** fixes the crash at start-up inside AMD's shader compiler (issue #43). The crash
+    came from the emulator's own texture-conversion shaders, which are now built like the game's shaders. Not yet
+    confirmed on an RDNA2 card: if it still crashes, please send the log. Its last "Tiler pipeline" line names the
+    shader.
+- **Graphics cards with 8 GB of video memory:**
+  - Buffers the game stopped using are let go after 30 s (10 s when video memory runs short) instead of 1800 frames.
+    On an RTX 3080 Laptop (8 GB) touring Boletaria 1-1, the frame rate went from 15-17 to 23-24 fps, and frames over
+    100 ms from 137 to 21-25.
+  - Pipelines unused for 3 minutes leave video memory when it runs short. They come back from the shader cache when
+    needed, about 1 ms each.
+- **Graphics cards with 12 GB or more (PR #44):** game buffers that ended up in system memory move back into video
+  memory once there is room. The texture collector follows the video memory Windows gives now; another program, a
+  Discord stream for example, can take some of it.
+- **Less memory:**
+  - The game's start-up memory is no longer cleared by hand. A 16 GB PC has 0.7 GB more free RAM, and start-up is
+    0.26 s shorter.
+  - The background shader preparation reuses its big buffers. On a 16 GB PC, frames over 50 ms while it runs fell
+    from 30-56 to 11-16 in 30 s.
+- **Frame generation:** GPUs such as the RTX 5080 start with DLSS frame generation again instead of stopping at "Could
+  not create the Vulkan device…" (issue #32). The emulator now leaves the driver the address space frame generation
+  needs, so the `KYTY_RESERVE_CEILING` workaround is no longer needed. `run.cmd -FrameGen` also uses the Streamline
+  folder chosen in the launcher (issue #38).
 - **Fixes:**
-  - A crash at Latria: one of the game's threads dispatched an event on an empty object.
-  - Frame generation: when the graphics driver refuses the device DLSS frame generation needs, the error now says so,
-    and to start without frame generation (issue #32).
-  - AMD driver 26.9.2 mosaics (issue #24): a test switch, `run.cmd -Set KYTY_PS_WAVE64=1`, runs pixel shaders 64 lanes
-    wide where the driver allows it. The log says whether it took effect.
+  - With the game's Mono Mix Mode on (Settings → Audio), a high-pitched tone looped over the sound (issue #40).
+  - A rare crash in Boletaria 1-1 ("buffer ADD_TID is only valid for compute shaders").
+  - When Windows refuses to write a save (antivirus, Controlled folder access, a read-only folder, a full disk), the
+    log now names the file and Windows' reason (issue #31).
+- **Diagnostics:**
+  - `run.cmd -Set KYTY_WRITEBACK_VERIFY=1` reports GPU write-backs that would overwrite memory the game changed
+    (issue #31). It is off by default and costs about 10% fps.
+  - The end of the log says how many pipelines came from the precompiled cache.
+- **Building from source:** Visual Studio 2026's C++ library needs Clang 20 or newer (PR #39).
 
 ## 本版本的变化
 
-- **垂直同步与电视（issue #30）**：
-  - **不再慢动作：** 显示器让模拟器等待时，游戏不再变慢。现在画面在单独的线程上显示，游戏的时钟（PS5 的 vblank）不再等待显示。之前在 NVIDIA 控制面板里强制垂直同步、电视刷新率低于 60 Hz，或垂直同步队列已满时，游戏会变成慢动作。
-  - **启动器的 VSync 跟随显示器：** 显示器刷新率是 60 Hz 的整数倍时，模拟器的 vblank 会跟随显示器自己的 vblank。59.94 Hz 的电视也算在内，所以不再每隔约 17 秒丢一帧或重复一帧。可变刷新率显示器仍使用模拟器自己的计时器。
-  - **60 fps 更稳：** 60 fps 下帧间隔也更均匀了。在测试电脑上站在波雷塔利亚 1-1，1% low 从 53 提高到 58-59 fps。
-- **DLSS 帧生成与"最高 120 FPS"（issue #29）：** 开启帧生成时，游戏自己的帧保持在 60 fps，DLSS-G 生成的帧因此间隔均匀。之前帧间隔在 8 ms 和 17 ms 之间交替。
-- **新装后第一次进入某个区域：**
-  - 运行过着色器预编译后，后台的着色器准备会先处理随包附带的游玩记录里用到的着色器，并按记录里遇到的顺序进行。
-  - 第一次进入波雷塔利亚 1-1：
-
-    | | 之前 | 现在 |
-    |---|---|---|
-    | 第一帧 | 1.1 秒 | 0.4 秒 |
-    | 卡顿帧 | — | 减少一半 |
-    | 等待时现场翻译的着色器 | — | 没有 |
-- **新装环境的预编译（issue #28）：** 没有游玩录制的电脑现在也会编译随包附带的着色器提示。v20261016 在这种情况下只编译了推测出来的着色器，AMD 显卡第一次进入各区域时每条管线会卡 0.2-8 秒。更新后，启动器会询问一次是否更新着色器缓存，只编译缺少的部分。
-- **走回之前去过的地方：** 模拟器会把一段时间没用到的着色器数据暂时移出内存来节省内存。之前回到那个地方时，这些数据会一次性全部载回，每次都会卡 30-40 ms。
-  - 64 GB 及以上内存的电脑现在会一直保留这些数据。
-  - 16 GB 和 32 GB 的电脑保留最近用过的部分，其余的在其他线程上载回。
-  - 在测试电脑上走回波雷塔利亚 1-1 时，最长的帧从 42 ms 降到 20 ms（16 GB 时为 24 ms）。石牙隧道的 1% low 从 55 提高到 80 fps。
-- **显存小于 12 GB 的显卡：**
-  - 大纹理不再保留最精细的一级。近看时纹理稍微模糊一点，但运行更流畅：模拟 8 GB 显存时，1% low 从 37-49 提高到 53-58 fps。
-  - 启动器"Graphics"的 Low 和 Lowest 现在在任何显卡上都会把纹理缩小到一半或四分之一。
-  - 用 `run.cmd -TextureReduce 0` 可以保留完整纹理。
-- **追加内容（DLC）：** 放在 `Content\PPSA01341\<文件夹>` 里（带上它的 `sce_sys\param.json`），游戏就会把它当作已拥有（PR #25）。
-- **着色器提示：** 随包附带的着色器提示加入了一位 RX 9070 XT 玩家的游玩记录。
+- **"读取游戏"可以选择角色（issue #46）：**
+  - "读取游戏"会列出所有存档，每一项显示角色名、等级、所在地点、游戏时间和日期。
+  - 用 ×（或 Enter）选择，○（或 Esc）返回。之前它总是读取最后玩的那个角色。
+  - 旧版本留下的存档，在游戏再保存一次之前，只显示文件夹名和日期。
+- **AMD 显卡：**
+  - **预编译的着色器缓存现在在 AMD 上也能用了（PR #41，issue #28）。** AMD 驱动按程序名存放管线，所以游戏一直找不到预编译生成的结果。**更新后请再预编译一次**：启动器会提示，旧缓存不再使用。
+  - **幽灵和半透明身体**不再变成方块或马赛克（PR #41，issue #24，26.9.2 驱动）。模拟器现在会告诉驱动，着色器不写哪些颜色目标。
+  - **RX 6700 XT / 6750 XT（RDNA2）：** 修复启动时在 AMD 着色器编译器里崩溃的问题（issue #43）。崩溃来自模拟器自己的贴图转换着色器，现在它和游戏着色器用同样的方式构建。尚未在 RDNA2 显卡上确认：如果仍然崩溃，请发日志，日志最后一行 "Tiler pipeline" 会写明是哪个着色器。
+- **8 GB 显存的显卡：**
+  - 游戏不再使用的缓冲区，过 30 秒就释放（显存紧张时 10 秒），之前要等 1800 帧。在 RTX 3080 Laptop（8 GB）上巡游波雷塔利亚 1-1，帧率从 15-17 提高到 23-24 fps，超过 100 ms 的帧从 137 个减到 21-25 个。
+  - 显存紧张时，3 分钟没用过的管线会移出显存，需要时再从着色器缓存里取回，每条约 1 ms。
+- **12 GB 及以上显存的显卡（PR #44）：** 被放进系统内存的游戏缓冲区，等显存有空间时会移回显存。纹理回收会跟随 Windows 当前给的显存额度；其他程序（比如 Discord 推流）会占掉一部分。
+- **更少的内存：**
+  - 游戏启动时的内存不再由模拟器逐页清零。16 GB 内存的电脑多出 0.7 GB 空闲内存，启动快 0.26 秒。
+  - 后台准备着色器时会重复使用大块缓冲区。在 16 GB 内存的电脑上，后台准备期间 30 秒内超过 50 ms 的帧从 30-56 个减到 11-16 个。
+- **帧生成：** RTX 5080 等显卡开启 DLSS 帧生成后可以正常启动，不再停在 "Could not create the Vulkan device…"（issue #32）。模拟器现在会给驱动留出帧生成所需的地址空间，不再需要 `KYTY_RESERVE_CEILING`。`run.cmd -FrameGen` 也会使用启动器里选的 Streamline 文件夹（issue #38）。
 - **修正：**
-  - 拉特利亚之塔的一个崩溃：游戏的一个线程对空对象分发了事件。
-  - 帧生成：显卡驱动拒绝创建 DLSS 帧生成所需的设备时，错误信息现在会说明原因，并提示关闭帧生成后再启动（issue #32）。
-  - AMD 26.9.2 驱动下的马赛克（issue #24）：新增测试开关 `run.cmd -Set KYTY_PS_WAVE64=1`，在驱动允许时让像素着色器按 64 宽运行，日志会说明是否生效。
+  - 开启游戏的单声道混音（Mono Mix Mode，设置 → 音频）时，声音里会循环一个高音（issue #40）。
+  - 波雷塔利亚 1-1 的一个罕见崩溃（"buffer ADD_TID is only valid for compute shaders"）。
+  - Windows 拒绝写入存档时（杀毒软件、受控文件夹访问、只读文件夹、磁盘已满），日志会写明文件名和 Windows 给出的原因（issue #31）。
+- **诊断：**
+  - `run.cmd -Set KYTY_WRITEBACK_VERIFY=1` 会报告 GPU 回写将覆盖游戏已修改内存的情况（issue #31）。默认关闭，开着时 fps 约低 10%。
+  - 日志结尾会写明有多少条管线来自预编译缓存。
+- **从源码构建：** Visual Studio 2026 的 C++ 库需要 Clang 20 或更新版本（PR #39）。

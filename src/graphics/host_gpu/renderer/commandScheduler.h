@@ -35,6 +35,11 @@ public:
 	void           CompleteDispatch();
 	// Finish `draws` complete draws; may submit (KYTY_DRAW_BATCH), but never waits for the GPU.
 	void           CompleteDraws(uint32_t draws);
+	// A flush nothing waits on: deferred while the GPU has KYTY_FLUSH_DEFER submissions to run.
+	void           DeferrableFlush();
+	// The deferred flush, if one is pending (before the GPU thread waits for work).
+	void           FlushDeferred();
+	[[nodiscard]] bool FlushPending() const noexcept { return m_flush_deferred; }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// KYTY_ASYNC_COMPUTE (lane-sync.h): the queue the open command buffer is submitted on (0 graphics, 1 compute); a
@@ -173,6 +178,10 @@ private:
 	[[nodiscard]] SubmitEntry ClosePrologue();
 	// The GPU still runs work of this scheduler's the driver has (CompleteDispatch, CompleteDraws).
 	[[nodiscard]] bool GpuBusy();
+	// A deferred flush done once the GPU is down to its last submission, asked every 16 units of `weight`
+	// (DeferrableFlush).
+	[[nodiscard]] bool     FlushedDeferred(uint32_t weight);
+	[[nodiscard]] uint64_t Backlog();
 	std::function<void(vk::CommandBuffer)> m_prologue_hook;
 
 	MasterSemaphore              m_master;
@@ -188,6 +197,8 @@ private:
 	uint64_t                     m_next_wait_value     = 0;
 	uint32_t                     m_recorded_dispatches = 0;
 	uint32_t                     m_recorded_draws      = 0;
+	bool                         m_flush_deferred      = false; // DeferrableFlush left the open buffer open
+	uint32_t                     m_deferred_checks     = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};
 	int                          m_lane  = 0;

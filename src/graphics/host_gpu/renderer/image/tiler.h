@@ -15,7 +15,6 @@ namespace Libs::Graphics {
 
 class CommandScheduler;
 class Image;
-class StreamBuffer;
 struct GraphicContext;
 struct TileManagerTestAccess;
 
@@ -59,7 +58,7 @@ public:
 		uint64_t target_slice_stride = 0;
 	};
 
-	TileManager(GraphicContext& graphics, CommandScheduler& scheduler, StreamBuffer& stream_buffer);
+	TileManager(GraphicContext& graphics, CommandScheduler& scheduler);
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
@@ -108,7 +107,6 @@ private:
 	struct Dispatch {
 		Push     push {};
 		uint32_t pipeline_slot = 0;
-		uint64_t params_offset = 0;
 	};
 	struct Scratch {
 		vk::Buffer    buffer     = nullptr;
@@ -134,6 +132,7 @@ private:
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	[[nodiscard]] vk::Pipeline CreatePipeline(const uint32_t* code, size_t words, const char* what);
 	// KYTY_TILER_TIMING=1: the GPU time of each detile (timestamps after all earlier work and after it), summed.
 	[[nodiscard]] uint32_t TimingBegin(vk::CommandBuffer command);
 	void                   TimingEnd(vk::CommandBuffer command, uint32_t slot, uint64_t bytes, bool host_source);
@@ -141,7 +140,6 @@ private:
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
-	StreamBuffer&                           m_stream_buffer;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};

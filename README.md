@@ -206,7 +206,9 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
      **C++ CMake tools for Windows** component brings CMake and Ninja)
    - LLVM 19 for `clang-cl`: `winget install LLVM.LLVM --version 19.1.7` (19.1.7 is tested; the
      **C++ Clang tools for Windows** component of Visual Studio is used when LLVM is not installed;
-     LLVM 23.1.2 crashes compiling `agc.cpp`)
+     LLVM 23.1.2 crashes compiling `agc.cpp`). Visual Studio 2026's C++ library needs Clang 20 or
+     newer (`STL1000: Unexpected compiler version`): with it, use its bundled `clang-cl` (no LLVM in
+     `Program Files`) or a newer LLVM.
    - Vulkan SDK, for `glslangValidator`: `winget install KhronosGroup.VulkanSDK`
    - Python 3: `winget install Python.Python.3.12`
 2. Clone and build from a new terminal (so that the tools are on `PATH`):

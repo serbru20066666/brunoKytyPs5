@@ -3,6 +3,7 @@
 #include "live-counters.h"
 #include "live-trace.h"
 #include "time-census.h"
+#include "writeback-verify.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -1031,7 +1032,7 @@ public:
 		char                name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
 
-	FlexibleMemory() {
+	FlexibleMemory(): m_backing_high_water(PhysicalMemory::Size()) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		m_free.emplace(PhysicalMemory::Size(), Size());
 	}
@@ -1065,6 +1066,8 @@ private:
 	std::vector<AllocatedBlock>  m_allocated;
 	std::map<uint64_t, uint64_t> m_free;
 	uint64_t                     m_allocated_total = 0;
+	// The end of the highest backing any mapping was given (Map: what is above it is still the section's zero pages).
+	uint64_t                     m_backing_high_water = 0;
 	Common::Mutex                m_mutex;
 };
 
@@ -1272,6 +1275,10 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
+	// No page of it read-watched: no GPU-written bytes of a buffer over it (their pages are, from the write on: a CPU
+	// read faults), as NativeXprReader's direct reads take it. (The command processor asks for every indirect register
+	// table, ~11K a frame at 1-1, in memory the CPU writes: each a search of the GPU-written ranges.)
+	if (!GetGpuResources().HasReadWatchers(vaddr, size)) return true;
 	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
 		// KYTY_SYNC_LOG: which shader's resource evaluation drains the GPU for its words.
 		static const bool log = std::getenv("KYTY_SYNC_LOG") != nullptr;
@@ -1370,6 +1377,15 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 	const auto index = g_write_back_count.fetch_add(1, std::memory_order_relaxed);
 	g_write_backs[index % WriteBackRecords] = {std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                          vaddr, size, source};
+	// (Diagnostic, KYTY_WRITEBACK_VERIFY: the GPU-owned pages checked before, hashed again after.)
+	struct Verify {
+		uint64_t vaddr, size;
+		bool     on;
+		~Verify() {
+			if (on) WritebackVerify::Rehash(vaddr, size);
+		}
+	} verify {vaddr, size, WritebackVerify::Enabled()};
+	if (verify.on) WritebackVerify::Check(vaddr, static_cast<const uint8_t*>(data), size, source);
 	if (TryWriteBacking(vaddr, data, size)) {
 		return;
 	}
@@ -2294,12 +2310,19 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
 
 	std::vector<AllocatedBlock> mapped;
 	for (const auto& block: blocks) {
-		if (!g_guest_address_space->ZeroBacking(block.backing_offset, block.map_size)) {
+		// Only backing an earlier mapping had needs zeroing: past the high-water mark of the blocks handed out, the
+		// section's pages were never written and read zero. Demon's Souls maps 532 MiB at start-up: zeroing it took
+		// 265 ms and made all of it resident at once.
+		const uint64_t used = m_backing_high_water > block.backing_offset
+		                          ? std::min(block.map_size, m_backing_high_water - block.backing_offset)
+		                          : 0;
+		if (used != 0 && !g_guest_address_space->ZeroBacking(block.backing_offset, used)) {
 			for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
 				EXIT_IF(!g_guest_address_space->UnmapBacking(it->map_vaddr, it->map_size));
 			}
 			return false;
 		}
+		m_backing_high_water = std::max(m_backing_high_water, block.backing_offset + block.map_size);
 		if (!g_guest_address_space->MapBacking(block.map_vaddr, block.map_size,
 		                                       block.backing_offset, block.mode)) {
 			for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {

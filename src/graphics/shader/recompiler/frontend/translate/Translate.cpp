@@ -2,16 +2,38 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+static std::atomic<uint32_t> g_translator_features {TranslatorFeatures};
+
+void SetTranslatorFeatures(uint32_t features) {
+	g_translator_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
+}
+
+uint32_t TranslatorFeatureSet() {
+	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, whatever the store was made with.)
+	static const int cooperative = [] {
+		const char* value = std::getenv("KYTY_LANE_LOCAL_COOP");
+		return value == nullptr ? -1 : std::string_view(value) != "0" ? 1 : 0;
+	}();
+	auto features = g_translator_features.load(std::memory_order_relaxed);
+	if (cooperative >= 0)
+		features = cooperative != 0 ? features | TranslatorFeatureCooperativeHalves : features & ~TranslatorFeatureCooperativeHalves;
+	return features;
+}
 
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
@@ -739,7 +761,7 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
-void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info) {
+void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info, uint32_t branch_pc) {
 	if (source.terminator.goto_value >= 0) {
 		if (source.terminator.goto_variable == UINT32_MAX) {
 			EXIT("block %u sets an invalid goto variable", source.id);
@@ -762,15 +784,21 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
+	// (A cooperative program's lane-mask branch the wave decides: IR::WaveFlags.)
+	const bool wave_decided = program.lane_cooperative && std::binary_search(program.cooperative_branches.begin(),
+	                                                                         program.cooperative_branches.end(), branch_pc);
+	const auto any_lane     = [&](IR::U1 mask) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::AnyLane, {mask}, IR::WaveFlags {.cooperative = wave_decided}));
+	};
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetVcc())); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.AnyLane(ir.GetVcc()); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetExec())); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.AnyLane(ir.GetExec()); break;
+		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(any_lane(ir.GetVcc())); break;
+		case CFG::BranchCondition::VccNonZero: condition = any_lane(ir.GetVcc()); break;
+		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(any_lane(ir.GetExec())); break;
+		case CFG::BranchCondition::ExecNonZero: condition = any_lane(ir.GetExec()); break;
 		case CFG::BranchCondition::ScalarInstruction:
 			EXIT_IF(instruction_branch_condition.IsEmpty());
 			condition = instruction_branch_condition;
@@ -953,13 +981,35 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			return value == nullptr || std::string_view(value) != "0";
 		}();
 		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
-		std::string reason;
-		bool        uniform_loads = false;
-		result.lane_local         = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr, &uniform_loads);
-		result.lane_local_uniform_loads = result.lane_local && uniform_loads;
-		if (log)
-			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
-			            result.lane_local ? (uniform_loads ? "yes (uniform loads)" : "yes") : reason.c_str());
+		// Cooperative halves: a group of exactly one wave on 32-wide subgroups, its halves the workgroup's two subgroups,
+		// may exchange lanes through workgroup memory (LaneLocal.cpp). Where the static pipeline store was made with them
+		// (SetTranslatorFeatures; KYTY_LANE_LOCAL_COOP=0/1 decides otherwise).
+		const bool cooperative_enabled = (TranslatorFeatureSet() & TranslatorFeatureCooperativeHalves) != 0;
+		const auto* group = options.compute;
+		const bool  one_wave =
+		    group != nullptr && group->host_subgroup_size == 32u &&
+		    std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) * std::max(group->threads_num[2], 1u) == 64u;
+		std::string    reason;
+		LaneLocalProof proof;
+		result.lane_local =
+		    enabled && ProveWaveLaneLocal(decoded, cooperative_enabled && one_wave, proof, log ? &reason : nullptr);
+		result.lane_local_uniform_loads = result.lane_local && proof.uniform_loads;
+		if (result.lane_local && proof.Cooperative()) {
+			result.lane_cooperative     = true;
+			result.cooperative_reads    = std::move(proof.exchange_reads);
+			result.cooperative_branches = std::move(proof.wave_branches);
+			std::ranges::sort(result.cooperative_reads);
+			std::ranges::sort(result.cooperative_branches);
+		}
+		if (log) {
+			const auto verdict = !result.lane_local        ? reason
+			                     : result.lane_cooperative ? fmt::format("yes (cooperative: {} lane reads, {} branches)",
+			                                                             result.cooperative_reads.size(),
+			                                                             result.cooperative_branches.size())
+			                     : proof.uniform_loads     ? std::string("yes (uniform loads)")
+			                                               : std::string("yes");
+			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash), verdict.c_str());
+		}
 	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
@@ -1235,11 +1285,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		}
 	}
+	// (A cooperative program: every exchange the proof placed must be where the halves meet, else they would wait at a
+	// barrier the other never reaches; and every lane-mask branch must be its block's own S_CBRANCH, the one the proof
+	// judged.)
+	std::vector<uint32_t> cooperative_reached;
+	bool                  cooperative_unsure = false;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
+			if (result.lane_cooperative && (instruction.opcode == Decoder::Opcode::V_READLANE_B32 ||
+			                                instruction.opcode == Decoder::Opcode::V_READFIRSTLANE_B32))
+				cooperative_reached.push_back(instruction.pc);
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
 				continue;
 			}
@@ -1266,7 +1324,38 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			translator.TranslateInstruction(instruction);
 		}
-		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
+		const uint32_t branch_pc =
+		    cfg_block.inst_end > cfg_block.inst_begin ? decoded.instructions[cfg_block.inst_end - 1].pc : UINT32_MAX;
+		translator.AddBranchCondition(cfg_block, result.block_info[typed_index], branch_pc);
+		switch (cfg_block.terminator.condition) {
+			case CFG::BranchCondition::VccZero:
+			case CFG::BranchCondition::VccNonZero:
+			case CFG::BranchCondition::ExecZero:
+			case CFG::BranchCondition::ExecNonZero:
+				if (result.lane_cooperative && cfg_block.terminator.kind == CFG::TerminatorKind::ConditionalBranch) {
+					cooperative_reached.push_back(branch_pc);
+					const auto opcode = branch_pc != UINT32_MAX ? decoded.instructions[cfg_block.inst_end - 1].opcode
+					                                            : Decoder::Opcode::UNKNOWN;
+					cooperative_unsure = cooperative_unsure ||
+					                     (opcode != Decoder::Opcode::S_CBRANCH_VCCZ && opcode != Decoder::Opcode::S_CBRANCH_VCCNZ &&
+					                      opcode != Decoder::Opcode::S_CBRANCH_EXECZ && opcode != Decoder::Opcode::S_CBRANCH_EXECNZ);
+				}
+				break;
+			default: break;
+		}
+	}
+	if (result.lane_cooperative) {
+		std::ranges::sort(cooperative_reached);
+		const auto reached = [&](uint32_t pc) { return std::ranges::binary_search(cooperative_reached, pc); };
+		if (cooperative_unsure || !std::ranges::all_of(result.cooperative_reads, reached) ||
+		    !std::ranges::all_of(result.cooperative_branches, reached)) {
+			// (Two lanes per invocation: the same IR, every wave operation in one invocation.)
+			std::printf("LaneLocal CS %016llx: cooperative exchanges not all in the structured graph: two lanes per "
+			            "invocation\n",
+			            static_cast<unsigned long long>(options.shader_hash));
+			result.lane_local       = false;
+			result.lane_cooperative = false;
+		}
 	}
 	if (IR::ValidationEnabled()) IR::ValidateProgram(result, false);
 	return result;

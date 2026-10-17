@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -600,7 +601,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
+	// The decoded instructions go in the thread's vector of its last program's, its capacity kept (up to 8 MiB): a new one
+	// of ~0.8 MiB for every program was memory the system had to zero-fill (the shader prefetch's threads: 5 GB a minute).
+	static thread_local std::vector<Decoder::Instruction> t_instructions;
 	Decoder::Program decoded;
+	decoded.instructions = std::move(t_instructions);
+	struct KeepInstructions {
+		Decoder::Program& program;
+		~KeepInstructions() {
+			if (program.instructions.capacity() * sizeof(Decoder::Instruction) <= (size_t {8} << 20u))
+				t_instructions = std::move(program.instructions);
+		}
+	} keep_instructions {decoded};
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
@@ -810,6 +822,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		result.ir_dump      = std::move(ir_dump);
 	}
 	return result;
+}
+
+void RecycleSpirv(std::vector<uint32_t>&& spirv) {
+	Spirv::Builder::Recycle(std::move(spirv));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

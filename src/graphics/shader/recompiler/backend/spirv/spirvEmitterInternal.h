@@ -415,6 +415,10 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	// Cooperative halves (IR::Program::lane_cooperative): the lanes' exchange slots (two phases of 128 words,
+	// workgroup memory) and the phase an invocation is at (private).
+	uint32_t                                         wave_exchange_variable  = 0;
+	uint32_t                                         wave_phase_variable     = 0;
 	uint32_t                                         compact_lds_dwords      = 0;
 	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
 	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
@@ -503,7 +507,8 @@ inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition,
 }
 
 struct ValueEmitContext {
-	explicit ValueEmitContext(EmitterState& state_): state(state_) {}
+	explicit ValueEmitContext(EmitterState& state_);
+	~ValueEmitContext();
 
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);

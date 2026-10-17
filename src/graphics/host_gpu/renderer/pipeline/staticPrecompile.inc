@@ -1037,6 +1037,9 @@ bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::file
 		                    ("hints-" + PipelineCacheGameId() + ".hints");
 		const auto hinted = std::filesystem::last_write_time(hints, error);
 		if (!error && written < hinted) return false;
+		// Made without a translation feature of this emulator's: the precompile makes the pipelines it changes.
+		namespace Translate = ShaderRecompiler::Frontend;
+		if ((ReadStaticFeatures() & Translate::TranslatorFeatures) != Translate::TranslatorFeatures) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;
@@ -1164,10 +1167,15 @@ static bool MergeBlobShards(GraphicContext& graphics, bool prune, bool keep_shar
 	return merged;
 }
 
-// The shard files are removed once merged.
+// The shard files are removed once merged. A pruned merge makes the store of this run's pipelines alone: stamped with the
+// translation features they were made with (WriteStaticFeatures).
 bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards) {
-	if (graphics.pipeline_binaries_enabled) return MergeBinaryShards(graphics, prune, keep_shards);
-	if (StaticBlobsMode(graphics)) return MergeBlobShards(graphics, prune, keep_shards);
+	const auto stamped = [&](bool merged) {
+		if (merged && prune) WriteStaticFeatures();
+		return merged;
+	};
+	if (graphics.pipeline_binaries_enabled) return stamped(MergeBinaryShards(graphics, prune, keep_shards));
+	if (StaticBlobsMode(graphics)) return stamped(MergeBlobShards(graphics, prune, keep_shards));
 	PipelineCache cache(graphics);
 	if (cache.m_static_cache == nullptr) cache.InitializeStaticCache(true);
 	if (cache.m_static_cache == nullptr) return false;
@@ -1197,5 +1205,5 @@ bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune, 
 	}
 	for (const auto shard: shards) graphics.device.destroyPipelineCache(shard, nullptr);
 	PipelineCacheLog("Static pipeline cache: merged {} shards", shards.size());
-	return merged;
+	return stamped(merged);
 }

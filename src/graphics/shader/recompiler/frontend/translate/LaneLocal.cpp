@@ -33,6 +33,16 @@
 // (VCC: a mask holding EXEC's lanes, or zero in the whole wave). Up to the merge of the two ways, both ways must keep
 // that half's lanes inactive (EXEC narrowed, or set from masks without them) and pass no barrier, and the scalar
 // registers read after the merge must be the same both ways: not written, or masks without the half's lanes.
+//
+// Cooperative halves (ProveWaveLaneLocal with `cooperative`, for a 64-thread group: one wave, its two halves the two
+// subgroups of a Vulkan workgroup): a lane read the proof refuses - V_READLANE of a lane given by a constant or a
+// scalar, V_READFIRSTLANE where a half may have no active lane or of a value not the same in every lane - runs
+// wave-wide instead: every lane stores its value in workgroup memory, a barrier, then the wave's lane is read. A
+// lane-mask branch the halves must take together - one whose ways up to the merge pass such an exchange, a barrier or
+// another such branch, or that the per-half rules above refuse - is decided by the wave (each half's lanes through
+// the same exchange). Both halves then reach every exchange the same times, in the same order: every other branch on
+// the way is on a scalar condition, the same in both halves, or a per-half branch whose ways pass no exchange. Their
+// lanes see what the wave's lanes saw; the scalar state is the wave's.
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 namespace {
@@ -302,6 +312,10 @@ struct State {
 	}
 };
 
+// What a cooperative program does at an instruction the per-half rules refuse: a lane read the wave runs (an
+// exchange), or a branch the wave decides.
+enum class Cooperate : uint8_t { None, Exchange, WaveBranch };
+
 // What is known of a 64-bit lane mask.
 struct MaskFacts {
 	bool covers  = false;
@@ -316,13 +330,36 @@ using Syms = std::array<Sym, 128>;
 
 class Analysis {
 public:
-	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool uniform_load_rule = false)
-	    : m_program(program), m_cfg(cfg), m_uniform_load_rule(uniform_load_rule) {}
+	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool uniform_load_rule = false,
+	         bool cooperative = false)
+	    : m_program(program), m_cfg(cfg), m_uniform_load_rule(uniform_load_rule), m_cooperative(cooperative) {}
 
 	bool Run(std::string* reason) {
 		const auto& blocks = m_cfg.blocks;
 		if (blocks.empty() || m_cfg.irreducible) return Refuse(reason, "control flow");
 		for (size_t i = 0; i < blocks.size(); ++i) m_index_of[blocks[i].id] = i;
+		m_exact.assign(blocks.size(), false);
+		m_exchange.assign(m_program.instructions.size(), false);
+		// (Cooperative: each exchange or wave-decided branch found may make more; to a fixpoint, the sets only grow.)
+		for (uint32_t round = 0; round < 256; ++round) {
+			bool grew = false;
+			if (!RunOnce(reason, grew)) return false;
+			if (!grew) return true;
+		}
+		return Refuse(reason, "cooperative analysis did not converge");
+	}
+
+	// The lane reads that run wave-wide and the lane-mask branches the wave decides (their branch instructions).
+	void Exchanges(std::vector<uint32_t>& reads, std::vector<uint32_t>& branches) const {
+		for (size_t i = 0; i < m_exchange.size(); ++i)
+			if (m_exchange[i]) reads.push_back(m_program.instructions[i].pc);
+		for (size_t b = 0; b < m_exact.size(); ++b)
+			if (m_exact[b]) branches.push_back(m_program.instructions[m_cfg.blocks[b].inst_end - 1].pc);
+	}
+
+private:
+	bool RunOnce(std::string* reason, bool& grew) {
+		const auto&        blocks = m_cfg.blocks;
 		std::vector<State> in(blocks.size());
 		std::vector<bool>  reached(blocks.size(), false);
 		size_t             entry = 0;
@@ -346,7 +383,7 @@ public:
 				const auto found = m_index_of.find(successor_id);
 				if (found == m_index_of.end()) continue;
 				const auto successor = found->second;
-				State      edge      = OnEdge(blocks[block].terminator, successor_id, state);
+				State      edge      = OnEdge(blocks[block].terminator, successor_id, state, m_exact[block]);
 				if (reached[successor]) {
 					State merged = in[successor];
 					merged.Join(edge);
@@ -367,15 +404,18 @@ public:
 			if (!reached[block]) continue;
 			State state = in[block];
 			for (auto i = blocks[block].inst_begin; i < blocks[block].inst_end; ++i) {
-				if (const char* refused = Check(block, i, state)) {
+				Cooperate cooperate = Cooperate::None;
+				if (const char* refused = Check(block, i, state, cooperate)) {
 					if (reason != nullptr) *reason = fmt::format("{} (0x{:x})", refused, m_program.instructions[i].pc);
 					return false;
 				}
+				if (cooperate == Cooperate::Exchange && !m_exchange[i]) grew = m_exchange[i] = true;
+				if (cooperate == Cooperate::WaveBranch && !m_exact[block]) grew = m_exact[block] = true;
 				Transfer(m_program.instructions[i], state);
 			}
 			out[block] = state;
 		}
-		return WaveBranches(out, reached, reason);
+		return WaveBranches(out, reached, reason, grew);
 	}
 
 private:
@@ -689,9 +729,11 @@ private:
 		}
 	}
 
-	// A half that goes this way after a branch on its EXEC (or on VCC within EXEC) has an active lane.
-	static State OnEdge(const CFG::Terminator& terminator, uint32_t successor, State state) {
-		if (terminator.kind != CFG::TerminatorKind::ConditionalBranch || terminator.true_block == terminator.false_block)
+	// A half that goes this way after a branch on its EXEC (or on VCC within EXEC) has an active lane (not after a branch
+	// the wave decides: the other half's lanes may have taken it).
+	static State OnEdge(const CFG::Terminator& terminator, uint32_t successor, State state, bool wave_decided) {
+		if (terminator.kind != CFG::TerminatorKind::ConditionalBranch || terminator.true_block == terminator.false_block ||
+		    wave_decided)
 			return state;
 		const bool vcc_within = PairFacts(VccLo, state).within;
 		switch (terminator.condition) {
@@ -718,9 +760,20 @@ private:
 		return PairBase(reg) && state.lanes.test(static_cast<size_t>(reg)) && state.lanes.test(static_cast<size_t>(reg) + 1);
 	}
 
-	// The reason the instruction is not lane-local in this state, or null.
-	const char* Check(size_t block, uint32_t index, const State& state) const {
+	// The reason the instruction is not lane-local in this state, or null (`cooperate`: how a cooperative program runs an
+	// instruction the per-half rules refuse).
+	const char* Check(size_t block, uint32_t index, const State& state, Cooperate& cooperate) const {
 		const auto& inst = m_program.instructions[index];
+		if (m_cooperative && inst.opcode == Opcode::V_READLANE_B32) {
+			// (The lane: a constant, or a scalar value - the wave's, the same in both halves where the read runs.)
+			const auto& lane     = inst.src1;
+			const bool  constant = lane.kind == OperandKind::IntegerInlineConstant || lane.kind == OperandKind::LiteralConstant;
+			const int   reg      = ScalarIndex(lane);
+			if (!constant && (reg < 0 || state.mask.test(static_cast<size_t>(reg)))) return "V_READLANE of a lane from a lane mask";
+			if (inst.src0.dpp) return "cross-row DPP";
+			cooperate = Cooperate::Exchange;
+			return nullptr;
+		}
 		if (const char* refused = RefusedOpcode(inst)) return refused;
 		{
 			// EXEC is set by compares and by 64-bit mask operations (their sources checked below).
@@ -766,8 +819,12 @@ private:
 				// A branch on VCC goes another way for a half than for the wave only when the half has no active lane:
 				// VCC must hold EXEC's lanes (or be zero in the whole wave).
 				if ((inst.opcode == Opcode::S_CBRANCH_VCCZ || inst.opcode == Opcode::S_CBRANCH_VCCNZ) &&
-				    (!PairFacts(VccLo, state).covers || !state.lanes.test(VccLo) || !state.lanes.test(VccHi)))
-					return "a branch on VCC without EXEC's lanes";
+				    (!PairFacts(VccLo, state).covers || !state.lanes.test(VccLo) || !state.lanes.test(VccHi))) {
+					// (A per-lane mask still: the wave's decision from each half's bits.)
+					if (!m_cooperative || !state.lanes.test(VccLo) || !state.lanes.test(VccHi))
+						return "a branch on VCC without EXEC's lanes";
+					cooperate = Cooperate::WaveBranch;
+				}
 				break;
 			case Family::SMEM:
 			case Family::MUBUF:
@@ -794,11 +851,17 @@ private:
 				}
 				if (inst.opcode == Opcode::V_READFIRSTLANE_B32) {
 					// (A half without an active lane would read none of the wave's.)
-					if (!state.active) return "V_READFIRSTLANE where a half may have no active lane";
 					const auto& source = inst.src0;
 					const bool  uniform =
 					    source.kind == OperandKind::Vgpr ? source.reg < 256 && state.uniform.test(source.reg) : !is_mask(source);
-					if (!uniform && !Waterfall(block, index)) return "V_READFIRSTLANE of a lane value outside a waterfall loop";
+					size_t latch = SIZE_MAX;
+					// (A waterfall loop the wave runs reads the wave's first lane each time round.)
+					const bool waterfall = !uniform && Waterfall(block, index, &latch) && !(latch < m_exact.size() && m_exact[latch]);
+					const char* refused  = !state.active                ? "V_READFIRSTLANE where a half may have no active lane"
+					                       : !uniform && !waterfall ? "V_READFIRSTLANE of a lane value outside a waterfall loop"
+					                                                : nullptr;
+					if (refused != nullptr && !m_cooperative) return refused;
+					if (refused != nullptr) cooperate = Cooperate::Exchange;
 				}
 				break;
 			}
@@ -968,7 +1031,34 @@ private:
 	// A branch on EXEC or VCC (within the checks above) goes another way for a half than for the wave only when the
 	// half has no active lane. Both ways to the merge must keep the half's lanes inactive, and the scalar registers the
 	// merge reads must be the same both ways.
-	bool WaveBranches(const std::vector<State>& out, const std::vector<bool>& reached, std::string* reason) const {
+	// Whether the ways from `seeds` up to `merge` (all reachable code when there is none) pass a lane read the wave runs,
+	// a branch it decides or a barrier: the halves must then take the branch at their start together.
+	bool PassesExchange(std::initializer_list<size_t> seeds, size_t merge,
+	                    const std::vector<std::vector<size_t>>& successors) const {
+		const auto&        blocks = m_cfg.blocks;
+		std::vector<bool>  seen(blocks.size(), false);
+		std::deque<size_t> work;
+		for (const auto seed: seeds)
+			if (seed != merge && !seen[seed]) {
+				seen[seed] = true;
+				work.push_back(seed);
+			}
+		while (!work.empty()) {
+			const auto block = work.front();
+			work.pop_front();
+			if (m_exact[block]) return true;
+			for (auto i = blocks[block].inst_begin; i < blocks[block].inst_end; ++i)
+				if (m_exchange[i] || m_program.instructions[i].opcode == Opcode::S_BARRIER) return true;
+			for (const auto s: successors[block])
+				if (s != merge && !seen[s]) {
+					seen[s] = true;
+					work.push_back(s);
+				}
+		}
+		return false;
+	}
+
+	bool WaveBranches(const std::vector<State>& out, const std::vector<bool>& reached, std::string* reason, bool& grew) {
 		const auto&  blocks = m_cfg.blocks;
 		const size_t count  = blocks.size();
 		std::vector<std::vector<size_t>> successors(count);
@@ -1021,7 +1111,7 @@ private:
 		for (size_t b = 0; b < count; ++b) {
 			const auto& terminator = blocks[b].terminator;
 			if (!reached[b] || terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
-			    terminator.true_block == terminator.false_block)
+			    terminator.true_block == terminator.false_block || m_exact[b])
 				continue;
 			bool vcc = false, zero_taken = false; // (the way of a half without an active lane)
 			switch (terminator.condition) {
@@ -1048,16 +1138,32 @@ private:
 			if (vcc) entry[VccLo] = entry[VccHi] = Sym::Zero;
 			for (int r = 0; r < M0; r += 2)
 				if (PairFacts(r, out[b]).within) entry[r] = entry[r + 1] = Sym::Zero;
+			// (Cooperative: a branch whose ways pass an exchange, or that the per-half rules refuse, the wave decides.)
+			const auto wave_decided = [&] {
+				m_exact[b] = true;
+				grew       = true;
+			};
+			if (m_cooperative && PassesExchange({half_way->second, wave_way->second}, merge, successors)) {
+				wave_decided();
+				continue;
+			}
 			Syms half, wave;
 			if (!Ways(half_way->second, merge, entry, successors, half, reason) ||
-			    !Ways(wave_way->second, merge, entry, successors, wave, reason))
-				return false;
+			    !Ways(wave_way->second, merge, entry, successors, wave, reason)) {
+				if (!m_cooperative) return false;
+				wave_decided();
+				continue;
+			}
 			if (merge == count) continue;
 			std::string escaping;
 			for (size_t r = 0; r < 128; ++r)
 				if (live_in[merge].test(r) && (half[r] == Sym::Unknown || half[r] != wave[r]))
 					escaping += " " + ScalarName(static_cast<int>(r));
 			if (!escaping.empty()) {
+				if (m_cooperative) {
+					wave_decided();
+					continue;
+				}
 				if (reason != nullptr) {
 					const auto& last = m_program.instructions[blocks[b].inst_end - 1];
 					*reason = fmt::format("scalar state escapes a lane-mask branch (0x{:x}:{})", last.pc, escaping);
@@ -1070,7 +1176,7 @@ private:
 
 	// V_READFIRSTLANE at `index` heads a waterfall loop: the next compare in its block tests its source against it,
 	// an EXEC save takes that compare's lanes, and its block is in a loop that repeats while EXEC is not zero.
-	bool Waterfall(size_t block, uint32_t index) const {
+	bool Waterfall(size_t block, uint32_t index, size_t* latch_index = nullptr) const {
 		const auto& blocks = m_cfg.blocks;
 		const auto& head   = m_program.instructions[index];
 		if (head.src0.kind != OperandKind::Vgpr) return false;
@@ -1109,7 +1215,13 @@ private:
 			if (std::ranges::find(loop.body_blocks, id) == loop.body_blocks.end() && loop.header != id) continue;
 			const auto* latch = m_cfg.FindBlock(loop.latch);
 			if (latch == nullptr || latch->inst_end == latch->inst_begin) continue;
-			if (m_program.instructions[latch->inst_end - 1].opcode == Opcode::S_CBRANCH_EXECNZ) return true;
+			if (m_program.instructions[latch->inst_end - 1].opcode == Opcode::S_CBRANCH_EXECNZ) {
+				if (latch_index != nullptr) {
+					const auto found = m_index_of.find(loop.latch);
+					*latch_index     = found != m_index_of.end() ? found->second : SIZE_MAX;
+				}
+				return true;
+			}
 		}
 		return false;
 	}
@@ -1117,7 +1229,10 @@ private:
 	const Decoder::Program&              m_program;
 	const CFG::Graph&                    m_cfg;
 	bool                                 m_uniform_load_rule = false;
+	bool                                 m_cooperative       = false;
 	std::unordered_map<uint32_t, size_t> m_index_of;
+	std::vector<bool>                    m_exact;    // (by block) a lane-mask branch the wave decides
+	std::vector<bool>                    m_exchange; // (by instruction) a lane read the wave runs
 };
 
 // KYTY_LANE_LOCAL_UNIFORM_LOADS=1: a program the proof refuses is tried again taking buffer loads at one address for
@@ -1135,12 +1250,29 @@ bool UniformLoadsEnabled() {
 } // namespace
 
 bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason, bool* uniform_loads) {
+	LaneLocalProof proof;
+	const bool     lane_local = ProveWaveLaneLocal(program, false, proof, reason);
+	if (uniform_loads != nullptr) *uniform_loads = proof.uniform_loads;
+	return lane_local;
+}
+
+bool ProveWaveLaneLocal(const Decoder::Program& program, bool cooperative, LaneLocalProof& proof, std::string* reason) {
 	// (On the program's own branches: the structured graph routes some through variables, scalar state of its own.)
 	const auto cfg = CFG::BuildGraph(program);
-	if (uniform_loads != nullptr) *uniform_loads = false;
+	proof          = {};
 	if (Analysis(program, cfg).Run(reason)) return true;
-	if (!UniformLoadsEnabled() || !Analysis(program, cfg, true).Run(reason)) return false;
-	if (uniform_loads != nullptr) *uniform_loads = true;
+	if (UniformLoadsEnabled() && Analysis(program, cfg, true).Run(reason)) {
+		proof.uniform_loads = true;
+		return true;
+	}
+	if (!cooperative) return false;
+	std::string why;
+	Analysis    analysis(program, cfg, false, true);
+	if (!analysis.Run(&why)) {
+		if (reason != nullptr) *reason += " (cooperative: " + why + ")";
+		return false;
+	}
+	analysis.Exchanges(proof.exchange_reads, proof.wave_branches);
 	return true;
 }
 

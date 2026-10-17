@@ -185,9 +185,13 @@ struct RenderExecutor::TablePair {
 	const std::byte*                packed_at    = nullptr; // (the block's first 64-byte line)
 	uint32_t                        packed_bytes = 0;
 	std::vector<TableVariant>                                   variants;
+	uint32_t                                                    variant_hint = 0; // the one TableTry found last
 	uint64_t                                                    store_frame = 0, store_state = 0; // the last request
 	std::unordered_map<uint64_t, std::unique_ptr<TableImageSet>, HashedKey> sets; // by T#/S# words
 	std::array<TableImageSet*, Roles>                           last_set {}; // by role
+	// The set before the last, by role (TableSet asks it before the map: a pass's draws of one pair alternate between
+	// two materials' sets). Cleared with last_set.
+	std::array<TableImageSet*, Roles>                           previous_set {};
 	// ShaderMapGeneration under which the shaders at vs and ps were proven those the programs were compiled
 	// from (the game registers shaders often; code replaced at an address resets the pair), by role.
 	std::array<uint64_t, Roles>                                 generation = NoRoles();
@@ -222,7 +226,7 @@ struct RenderExecutor::TableXpr {
 	static constexpr size_t   PairsKept       = 2048;
 	uint64_t                  pairs_swept     = 0;
 	// The pairs found last, direct-mapped by key.
-	static constexpr size_t PairCacheEntries = 256;
+	static constexpr size_t PairCacheEntries = 4096; // (kyty_local_table_mru bit 1: else its first 256 only)
 	std::array<std::pair<uint64_t, Pair*>, PairCacheEntries> pair_cache {};
 	// The pair TableTry found last, by its key (consecutive draws mostly keep their shaders: no hash of the key, ~0.6% of
 	// the render thread at 1-1 standing, nor lookup then).
@@ -503,7 +507,9 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		// (Another executor's catalog: what it learned, none of it made here.)
 		const auto found = catalog == nullptr || Role() == 0 ? decltype(catalog->pairs.end()) {} : catalog->pairs.find(pair_hash);
 		if (Role() != 0 && (catalog == nullptr || found == catalog->pairs.end())) return Spec::Refuse("table store"), TableResult::Native;
-		auto& cached = table.pair_cache[pair_hash & (TableXpr::PairCacheEntries - 1)];
+		// (A frame's draws use ~600 pairs at 1-1: 256 entries missed often, each a cold map bucket and node.)
+		const auto entries = (kyty_local_table_mru.load(std::memory_order_relaxed) & 1u) != 0 ? TableXpr::PairCacheEntries : 256;
+		auto&      cached  = table.pair_cache[pair_hash & (entries - 1)];
 		known        = own != nullptr && cached.first == pair_hash ? cached.second : nullptr;
 		if (known == nullptr) {
 			auto it = own != nullptr ? own->find(pair_hash) : found;
@@ -579,7 +585,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		table.store_state = cache.state_key;
 		return TableResult::Store;
 	};
-	const auto variant = std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
+	// (The variant found last first: a pair's variants are a cold line each, its draws mostly keep their state.)
+	const bool hint    = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
+	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
+	const auto variant = hint ? pair.variants.begin() + pair.variant_hint
+	                          : std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
+	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
 	if (variant != pair.variants.end() && variant->refused) return Spec::Refuse("table: variant refused"), TableResult::Native;
 	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr)
 		return LiveCounters::Add(LiveCounters::TableStoreVariant), request_store();
@@ -650,6 +661,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		if (slot) {
 			NativeXprRetireSet(slot->pool, slot->set);
 			pair.last_set.fill(nullptr);
+			pair.previous_set.fill(nullptr);
 			++m_table_xpr->epoch;
 		}
 		slot = std::move(set);
@@ -1277,10 +1289,20 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	const auto  frame = m_context.FrameNumber();
 	auto*       set   = pair.last_set[Role()];
 	if (set == nullptr || set->words != words) {
-		const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
-		set              = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
-		if (set == nullptr || (set->refused && frame >= set->validated_frame[0] + TableImageSet::RetryFrames))
-			set = TableResolveSet(buffer, pair, variant, draw_state, words);
+		auto* const last     = set;
+		auto* const previous = pair.previous_set[Role()];
+		// (The set before the last next, without the words' hash or the map's cold bucket and node.)
+		if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
+		    !previous->refused && previous->words == words) {
+			set = previous;
+		} else {
+			const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
+			set              = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
+			if (set == nullptr || (set->refused && frame >= set->validated_frame[0] + TableImageSet::RetryFrames))
+				set = TableResolveSet(buffer, pair, variant, draw_state, words);
+		}
+		// (TableResolveSet may have cleared both: a set it replaced.)
+		if (last != nullptr && pair.last_set[Role()] == last) pair.previous_set[Role()] = last;
 		pair.last_set[Role()] = set;
 		if (set == nullptr) return nullptr; // (a program still translating)
 	}
@@ -1292,6 +1314,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 		const auto write = CatalogWrite();
 		if (table.last_set == set) table.last_set = nullptr;
 		pair.last_set.fill(nullptr);
+		pair.previous_set.fill(nullptr);
 		++table.epoch;
 		const auto found = pair.sets.find(XXH3_64bits(set->words.data(), set->words.size() * sizeof(uint32_t)));
 		NativeXprRetireSet(set->pool, set->set);
@@ -1307,6 +1330,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 				std::erase_if(held.sets, [&](auto& item) {
 					if (item.second->used_frame.load(std::memory_order_relaxed) + 60 >= frame) return false;
 					held.last_set.fill(nullptr);
+					held.previous_set.fill(nullptr);
 					if (table.last_set == item.second.get()) table.last_set = nullptr;
 					++table.epoch;
 					NativeXprRetireSet(item.second->pool, item.second->set);
@@ -2209,7 +2233,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
 	const auto& pipeline = *variant.pipeline;
 	if (!same_command || emit.pipeline != &pipeline)
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, BindPipelineHandle(pipeline));
 	if (!same_command || emit.pipeline != &pipeline || table.last_set != set)
 		vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 0, 1, &set->set, 0,
 		                             nullptr);
@@ -2793,7 +2817,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	TableWatchDispatch(indirect_args, continues_chain);
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
