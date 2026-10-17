@@ -543,8 +543,10 @@ void Initialize() {
 		g_taa_bypass        = taa != nullptr && std::string(taa) == "upscaler";
 		if (const char* mode = std::getenv("KYTY_TAA_BYPASS_MODE"); mode != nullptr && std::string(mode) == "copy")
 			g_taa_bypass_copy = true;
-		if (const char* mode = std::getenv("KYTY_TAA_BYPASS_MODE"); mode != nullptr && std::string(mode) == "match")
-			g_taa_bypass_match = true;
+		// (Default: match. KYTY_TAA_BYPASS_MODE=raw: the TAA's output left to the game and the raw frame to the
+		// upscaler alone: 10-17 the Nexus went black and lost the ghosts and glowing runes, drawn after the TAA.)
+		g_taa_bypass_match = !(std::getenv("KYTY_TAA_BYPASS_MODE") != nullptr &&
+		                       std::string(std::getenv("KYTY_TAA_BYPASS_MODE")) == "raw");
 	}
 	if (g_generate == 0 && !g_dlss_sr && !g_taa_dlss) {
 		return;
@@ -1762,7 +1764,7 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	if (device.createSampler(&sampler, nullptr, &g_bypass.sampler) != vk::Result::eSuccess) return false;
 	{
 		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-		create.size  = 16;
+		create.size  = 32;
 		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		VmaAllocationCreateInfo allocate {};
 		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -1935,7 +1937,7 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 	vk::DescriptorImageInfo  infos[2] {};
 	infos[0] = {g_bypass.sampler, source_view, source_layout};
 	infos[1] = {nullptr, out_b.image_view, vk::ImageLayout::eGeneral};
-	vk::DescriptorBufferInfo stats {g_bypass.stats, 0, 16};
+	vk::DescriptorBufferInfo stats {g_bypass.stats, 0, 32};
 	vk::WriteDescriptorSet   writes[3] {};
 	for (uint32_t i = 0; i < 3; ++i) {
 		writes[i].dstBinding      = i;
