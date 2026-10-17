@@ -1,6 +1,7 @@
 #include "graphics/presentation/window.h"
 
 #include <SDL3/SDL.h>
+#include <atomic>
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -959,16 +960,28 @@ void WindowContext::UpdateTitle(bool new_frame) {
 	    (has_app_ver ? " " : ""), device_name, processor_name, frame_statistics.TotalFrames(),
 	    frame_statistics.FrameRate(), frame_statistics.PresentRate());
 
+	// Not waited for: the main thread loads the game before it runs the window loop, and a
+	// present waiting for it froze the startup precompile's progress screen meanwhile. One
+	// update at a time is queued; the next present brings the title up to date.
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+		SDL_Window* window;
+		std::string text;
+	};
+	static std::atomic_bool pending {false};
+	if (pending.exchange(true)) {
+		return;
+	}
+	auto* update = new TitleUpdate {window, std::move(text)};
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        const std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		        SDL_SetWindowTitle(title->window, title->text.c_str());
+		        pending.store(false);
+	        },
+	        update, false)) {
+		delete update;
+		pending.store(false);
+	}
 }
 
 } // namespace Libs::Graphics
