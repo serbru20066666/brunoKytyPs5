@@ -258,6 +258,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--tessellation";
 	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
+	if (info.reported_resolution != 0) {
+		args << "--reported-resolution" << QString::number(info.reported_resolution);
+	}
+	if (info.texture_lod_bias != 0.0) {
+		args << "--texture-lod-bias" << QString::number(info.texture_lod_bias, 'f', 2);
+	}
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
 	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);

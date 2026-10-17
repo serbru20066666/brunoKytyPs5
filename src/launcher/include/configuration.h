@@ -129,6 +129,10 @@ public:
 	bool                   trophy_enabled              = true;
 	bool                   skip_notice_screen          = false;
 	int                    vblank_frequency            = 60;
+	// --reported-resolution: 0 automatic, 1 1080p, 2 2160p.
+	int                    reported_resolution         = 0;
+	// --texture-lod-bias, from -3 to 0.
+	double                 texture_lod_bias            = 0.0;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -168,6 +172,8 @@ public:
 		trophy_enabled              = other.trophy_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		vblank_frequency            = other.vblank_frequency;
+		reported_resolution         = other.reported_resolution;
+		texture_lod_bias            = other.texture_lod_bias;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
@@ -212,6 +218,31 @@ public:
 			// neither is left over from the settings these replace.
 			screen_resolution        = Resolution::R1920X1080;
 			frame_generation_enabled = false;
+#if defined(_WIN32)
+			red_zone_protection_enabled = true;
+#endif
+			return true;
+		}
+		if (id == QLatin1String("PPSA34015")) {
+			// EA SPORTS FC 27. Told that the output is 1080p it renders for 1080p: told 2160p it
+			// renders up to 2656x1496 and outgrows an 8 GB card. The LOD bias keeps player
+			// textures as sharp as a larger frame would show them.
+			reported_resolution       = 1;
+			texture_lod_bias          = -1.0;
+			present_mode              = PresentMode::Immediate;
+			readback_linear_images    = true;
+			relaxed_readback_enabled  = false;
+			shader_validation_enabled = false;
+			shader_optimization_type  = ShaderOptimizationType::Performance;
+			printf_direction          = LogDirection::Silent;
+			amd_cpu_enabled           = true;
+			fullscreen_enabled        = true;
+			screen_resolution         = Resolution::R1920X1080;
+			frame_generation_enabled  = false;
+			// The full game and its offline modes (private builds).
+			if (entitlements.trimmed().isEmpty()) {
+				entitlements = QStringLiteral("FULLGAMEUNLOCK00");
+			}
 #if defined(_WIN32)
 			red_zone_protection_enabled = true;
 #endif

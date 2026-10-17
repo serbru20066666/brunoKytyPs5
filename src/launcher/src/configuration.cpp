@@ -1,5 +1,7 @@
 #include "configuration.h"
 
+#include <algorithm>
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -21,6 +23,8 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(fsr_upscaling_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(vblank_frequency);
+	KYTY_CFG_SET(reported_resolution);
+	KYTY_CFG_SET(texture_lod_bias);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
 	KYTY_CFG_SET(shader_validation_enabled);
@@ -72,6 +76,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	fsr_upscaling_enabled = s.value("fsr_upscaling_enabled", fsr_upscaling_enabled).toBool();
 	KYTY_CFG_GET(skip_notice_screen);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
+	reported_resolution = std::clamp(s.value("reported_resolution", reported_resolution).toInt(), 0, 2);
+	texture_lod_bias = std::clamp(s.value("texture_lod_bias", texture_lod_bias).toDouble(), -3.0, 0.0);
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
 		console_language = DEFAULT_CONSOLE_LANGUAGE;
