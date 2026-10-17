@@ -958,7 +958,16 @@ struct SystemOverlay::Impl {
 		const auto  phase  = g_precompile_phase.load(std::memory_order_relaxed);
 		const auto  done   = g_precompile_done.load(std::memory_order_relaxed);
 		const auto  total  = std::max(g_precompile_total.load(std::memory_order_relaxed), 1u);
-		const float ratio  = std::clamp(static_cast<float>(done) / static_cast<float>(total), 0.0f, 1.0f);
+		const float target = std::clamp(static_cast<float>(done) / static_cast<float>(total), 0.0f, 1.0f);
+		// The bar glides toward the count every frame instead of jumping with it; a new phase
+		// starts it over from its own count.
+		if (phase != precompile_shown_phase || target < precompile_shown) {
+			precompile_shown_phase = phase;
+			precompile_shown       = target;
+		}
+		const float dt   = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+		precompile_shown += (target - precompile_shown) * std::min(1.0f, dt * 6.0f);
+		const float ratio = precompile_shown;
 		const auto  lang   = Config::GetConsoleLanguage();
 		const bool  es     = lang == 3 || lang == 20; // Spanish, Spanish (Latin America)
 		const ImVec2 screen {static_cast<float>(frame_extent.width),
@@ -999,9 +1008,14 @@ struct SystemOverlay::Impl {
 			outlined(text, size, {column - extent.x * 0.5f, y}, color);
 		};
 		const char* title = es ? "Preparando el juego" : "Preparing the game";
-		const char* stage = phase == 0 ? (es ? "Compilando sombreadores..." : "Compiling shaders...")
-		                               : (es ? "Compilando pipelines graficos..."
-		                                     : "Compiling graphics pipelines...");
+		// Dots that keep moving show it is working even while one large pipeline compiles.
+		const int   dots      = static_cast<int>(ImGui::GetTime() * 2.0) % 4;
+		const auto  stage_str = std::string(phase == 0 ? (es ? "Compilando sombreadores" : "Compiling shaders")
+		                                              : (es ? "Compilando pipelines graficos"
+		                                                    : "Compiling graphics pipelines")) +
+		                       std::string(static_cast<size_t>(dots), '.') +
+		                       std::string(static_cast<size_t>(3 - dots), ' ');
+		const char* stage = stage_str.c_str();
 		const char* note  = es ? "Solo tarda la primera vez tras instalar o actualizar."
 		                       : "Only slow the first time after installing or updating.";
 		const char* note2 = es ? "Despues el juego ya no se detiene a compilar."
@@ -1026,7 +1040,7 @@ struct SystemOverlay::Impl {
 			                    round);
 		}
 
-		const auto counter = fmt::format("{}%   ({} / {})", static_cast<int>(ratio * 100.0f), done,
+		const auto counter = fmt::format("{}%   ({} / {})", static_cast<int>(target * 100.0f), done,
 		                                 g_precompile_total.load(std::memory_order_relaxed));
 		centered(counter.c_str(), 26.0f * unit, end.y + 18.0f * unit, white);
 		centered(note, 22.0f * unit, end.y + 66.0f * unit, white);
@@ -1801,6 +1815,8 @@ struct SystemOverlay::Impl {
 	std::unique_ptr<ImTextureData>              precompile_background;
 	bool                                        precompile_background_attempted = false;
 	ImFont*                                     precompile_font                 = nullptr;
+	float                                       precompile_shown                = 0.0f;
+	uint32_t                                    precompile_shown_phase          = 0;
 	std::optional<TrophyNotification>           trophy_notification;
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;

@@ -30,6 +30,10 @@ struct GraphicContext;
 //
 // Parts can also be prefetched: a look-ahead over the rest of a command buffer predicts the parts
 // of upcoming draws and compiles them on worker threads, and Find waits for a part still compiling.
+// Lowers the calling thread below normal priority, for background compiles that must not slow
+// the game or the window's presents.
+void LowerCurrentThreadPriority();
+
 class PipelineLibraryCache {
 public:
 	PipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache);

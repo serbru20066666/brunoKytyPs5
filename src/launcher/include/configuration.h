@@ -225,10 +225,10 @@ public:
 		}
 		if (id == QLatin1String("PPSA34015")) {
 			// EA SPORTS FC 27. Told that the output is 1080p it renders for 1080p: told 2160p it
-			// renders up to 2656x1496 and outgrows an 8 GB card. The LOD bias keeps player
-			// textures as sharp as a larger frame would show them.
+			// renders up to 2656x1496 and outgrows an 8 GB card. No LOD bias: it streams
+			// texture mips in, and finer mips not loaded yet come out black (the pitch).
 			reported_resolution       = 1;
-			texture_lod_bias          = -1.0;
+			texture_lod_bias          = 0.0;
 			present_mode              = PresentMode::Immediate;
 			readback_linear_images    = true;
 			relaxed_readback_enabled  = false;

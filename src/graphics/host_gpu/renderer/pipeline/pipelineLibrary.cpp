@@ -53,6 +53,10 @@ int64_t LinkQuietNs() {
 
 } // namespace
 
+void LowerCurrentThreadPriority() {
+	LowerThreadPriority();
+}
+
 PipelineLibraryCache::PipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache)
     : m_graphics(graphics), m_driver_cache(driver_cache), m_running_keys(CompileThreadCount),
       m_link_thread([this](const std::stop_token& stop) { LinkThread(stop); }) {

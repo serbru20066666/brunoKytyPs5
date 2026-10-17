@@ -1804,6 +1804,8 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		}
 	};
 	const auto            work = [&] {
+		// Below the window's present thread, which draws the progress meanwhile.
+		LowerCurrentThreadPriority();
 		for (size_t index = next.fetch_add(1); index < records.size(); index = next.fetch_add(1)) {
 			const Tick   tick {finished, records.size()};
 			auto&        record = records[index];
@@ -1932,6 +1934,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			return &located[record].first->permutations[located[record].second];
 		};
 		const auto warm = [&] {
+			LowerCurrentThreadPriority();
 			for (size_t index = next_recipe.fetch_add(1); index < recipes.size();
 			     index = next_recipe.fetch_add(1)) {
 				const auto& recipe = recipes[index];
