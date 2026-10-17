@@ -22,8 +22,8 @@ $fgModes = @(
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
-	@('   Frame generation DLSS x5',                    'dlss-x5.json'),
-	@('   Frame generation DLSS x6',                    'dlss-x6.json'),
+	@('   200 FPS Nvidia Smooth x5',                    'dlss-x5.json'),
+	@('   216 FPS Nvidia Smooth x6',                    'dlss-x6.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
 # Reescalado: texto -> altura del 3D (run-windows.ps1 -RenderHeight), reescalador (-Upscale) y altura de salida
