@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -39,15 +40,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -71,6 +76,125 @@ std::string ComputePrefetchKey(uint64_t program_id) {
 	key.append(reinterpret_cast<const char*>(&program_id), sizeof(program_id));
 	return key;
 }
+
+// The guest waits for the startup precompile (see WaitForStartupPrecompile).
+std::mutex              g_startup_mutex;
+std::condition_variable g_startup_cv;
+bool                    g_startup_running = false;
+
+void BeginStartupPrecompile() {
+	std::lock_guard lock(g_startup_mutex);
+	g_startup_running = true;
+}
+
+void EndStartupPrecompile() {
+	{
+		std::lock_guard lock(g_startup_mutex);
+		g_startup_running = false;
+	}
+	g_startup_cv.notify_all();
+	SetStartupPrecompileProgress(false, 0, 0, 0);
+}
+
+// A graphics pipeline the game created, kept so the next session compiles it before the game
+// starts: the state its key holds besides the session's shader ids, and its stages' records in the
+// shader precompile journal, with each record's shader hash to check the reference. Stages: up to
+// three vertex-side ones, then the pixel shader.
+struct GraphicsRecipe {
+	PipelineRenderingState   rendering;
+	PipelineVertexInputState vertex_input;
+	PipelineStaticParameters static_params;
+	uint32_t                 vertex_stage_count;
+	uint32_t                 has_pixel;
+	std::array<uint32_t, 4>  records;
+	std::array<uint64_t, 4>  hashes;
+};
+static_assert(std::is_trivially_copyable_v<GraphicsRecipe>);
+
+// _PipelineCache/<title>.pipelines: a header with the game version and record size, then each
+// recipe's bytes after their checksum. Recipes are appended once each, as the game creates them.
+class RecipeJournal {
+public:
+	static constexpr size_t MaxRecipes = 200000;
+
+	std::vector<GraphicsRecipe> Open(const std::filesystem::path& path, const std::string& key) {
+		Close();
+		std::vector<GraphicsRecipe> recipes;
+		const auto header = fmt::format("KytyGR1:{}:{}\n", key, sizeof(GraphicsRecipe));
+		std::error_code ec;
+		const auto      size     = std::filesystem::file_size(path, ec);
+		size_t          accepted = 0;
+		bool            matches  = false;
+		if (!ec && size >= header.size() && size < 512ull * 1024 * 1024) {
+			std::ifstream        in(path, std::ios::binary);
+			std::vector<uint8_t> blob(static_cast<size_t>(size));
+			in.read(reinterpret_cast<char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+			matches = in && std::equal(header.begin(), header.end(), blob.begin());
+			if (matches) {
+				constexpr size_t entry = sizeof(uint64_t) + sizeof(GraphicsRecipe);
+				accepted               = header.size();
+				while (blob.size() - accepted >= entry && recipes.size() < MaxRecipes) {
+					uint64_t       checksum = 0;
+					GraphicsRecipe recipe;
+					std::memcpy(&checksum, blob.data() + accepted, sizeof(checksum));
+					std::memcpy(&recipe, blob.data() + accepted + sizeof(checksum), sizeof(recipe));
+					if (XXH3_64bits(&recipe, sizeof(recipe)) != checksum) {
+						break;
+					}
+					if (m_known.insert(checksum).second) {
+						recipes.push_back(recipe);
+					}
+					accepted += entry;
+				}
+			}
+		}
+		if (matches) {
+			if (accepted != size) {
+				std::filesystem::resize_file(path, accepted, ec);
+			}
+			m_out.open(path, std::ios::binary | std::ios::app);
+		} else {
+			m_known.clear();
+			std::filesystem::create_directories(path.parent_path(), ec);
+			m_out.open(path, std::ios::binary | std::ios::trunc);
+			m_out.write(header.data(), static_cast<std::streamsize>(header.size()));
+			m_out.flush();
+		}
+		if (!m_out) {
+			Close();
+		}
+		return recipes;
+	}
+
+	void Append(const GraphicsRecipe& recipe) {
+		if (!m_out.is_open() || m_known.size() >= MaxRecipes) {
+			return;
+		}
+		const uint64_t checksum = XXH3_64bits(&recipe, sizeof(recipe));
+		if (!m_known.insert(checksum).second) {
+			return;
+		}
+		m_out.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
+		m_out.write(reinterpret_cast<const char*>(&recipe), sizeof(recipe));
+		// A crash keeps the recipes recorded so far.
+		m_out.flush();
+		if (!m_out) {
+			Close();
+		}
+	}
+
+	void Close() {
+		if (m_out.is_open()) {
+			m_out.close();
+		}
+	}
+
+	[[nodiscard]] bool IsOpen() const { return m_out.is_open(); }
+
+private:
+	std::ofstream                m_out;
+	std::unordered_set<uint64_t> m_known;
+};
 
 void DestroyPipelineObjects(const GraphicContext& graphics, const PipelineCache::Pipeline& pipeline) {
 	if (pipeline.pipeline != nullptr) {
@@ -1069,9 +1193,12 @@ struct PipelineCache::ProgramCache {
 		source.last_push_cursor = push_data_cursor;
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
-		if (recording.IsOpen()) {
-			(void)recording.Append(ShaderPrecompile::Capture(
-			    params, options, permutation.specialization, push_data_cursor, input_info));
+		if (recording.IsOpen() &&
+		    recording.Append(ShaderPrecompile::Capture(params, options, permutation.specialization,
+		                                               push_data_cursor, input_info))) {
+			std::lock_guard record_lock(record_mutex);
+			record_of_shader[permutation.handle.id] = {
+			    static_cast<uint32_t>(recording.RecordedCount() - 1u), options.shader_hash};
 		}
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -1397,6 +1524,17 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 	ShaderPrecompile::Journal                                   recording;
+	// Each permutation's record in recording, by shader id, for the graphics recipes; under
+	// record_mutex.
+	struct RecordRef {
+		uint32_t index = 0;
+		uint64_t hash  = 0;
+	};
+	std::mutex                                                  record_mutex;
+	std::unordered_map<uint64_t, RecordRef>                     record_of_shader;
+	RecipeJournal                                               recipes;
+	// Recipes the startup precompile compiles (see ReplayPrecompiled).
+	std::vector<GraphicsRecipe>                                 pending_recipes;
 	bool                                                        stats_enabled = false;
 	struct {
 		uint64_t refreshes  = 0;
@@ -1409,12 +1547,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	InitializeShaderPrecompile();
-	// Linking libraries without fast linking costs about as much as a full compile.
+	// Linking libraries without fast linking costs about as much as a full compile. Before the
+	// precompile, whose graphics recipes compile their parts into it.
 	if (m_graphics.pipeline_library_enabled && m_graphics.pipeline_library_fast_linking) {
 		m_libraries = std::make_unique<PipelineLibraryCache>(m_graphics, m_driver_cache);
 		m_program_cache->workers = m_libraries.get();
 	}
+	InitializeShaderPrecompile();
 	if (m_driver_cache != nullptr) {
 		m_autosave_thread =
 		    std::jthread([this](const std::stop_token& stop) { AutosaveThread(stop); });
@@ -1584,8 +1723,21 @@ void PipelineCache::InitializeShaderPrecompile() {
 	(void)Loader::SystemContentParamSfoGetString("APP_VER", &app_version);
 	const auto key = "KytyPJ:" + app_version;
 	auto records = m_program_cache->recording.Open(path, key);
+	// The graphics pipelines earlier sessions created, compiled after the shaders.
+	// KYTY_NO_PIPELINE_PRECOMPILE=1 records them but does not compile them at startup.
+	auto recipe_path = m_driver_cache_path;
+	recipe_path.replace_extension(".pipelines");
+	auto recipes = m_program_cache->recipes.Open(recipe_path, key);
 	if (records.empty()) return;
-	PipelineCacheLog("Shader precompile: replaying {} recorded permutations", records.size());
+	if (std::getenv("KYTY_NO_PIPELINE_PRECOMPILE") == nullptr) {
+		m_program_cache->pending_recipes = std::move(recipes);
+	}
+	PipelineCacheLog("Shader precompile: replaying {} recorded permutations and {} graphics pipelines",
+	                 records.size(), m_program_cache->pending_recipes.size());
+	// The guest starts once both are compiled (WaitForStartupPrecompile); the window shows the
+	// progress meanwhile.
+	BeginStartupPrecompile();
+	SetStartupPrecompileProgress(true, 0, 0, static_cast<uint32_t>(records.size()));
 	m_precompile_done.store(false, std::memory_order_release);
 	m_precompile_thread = std::jthread(
 	    [this, records = std::move(records)]() mutable { ReplayPrecompiled(std::move(records)); });
@@ -1638,8 +1790,22 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 
 	std::vector<Replayed> replayed(records.size());
 	std::atomic_size_t    next {0};
+	std::atomic_size_t    finished {0};
+	// Counts a record for the progress screen however its iteration ends.
+	struct Tick {
+		std::atomic_size_t& finished;
+		size_t              total;
+		~Tick() {
+			const auto done = ++finished;
+			if (done % 8 == 0 || done == total) {
+				SetStartupPrecompileProgress(true, 0, static_cast<uint32_t>(done),
+				                             static_cast<uint32_t>(total));
+			}
+		}
+	};
 	const auto            work = [&] {
 		for (size_t index = next.fetch_add(1); index < records.size(); index = next.fetch_add(1)) {
+			const Tick   tick {finished, records.size()};
 			auto&        record = records[index];
 			ShaderParams params;
 			const auto   options    = options_for(record, params);
@@ -1676,7 +1842,8 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			}
 		}
 	};
-	const auto threads = std::clamp(std::thread::hardware_concurrency(), 2u, 8u) - 1u;
+	// The guest waits for the whole precompile (WaitForStartupPrecompile): all cores but one.
+	const auto threads = std::clamp(std::thread::hardware_concurrency(), 2u, 16u) - 1u;
 	{
 		std::vector<std::jthread> helpers;
 		for (uint32_t i = 1; i < threads; i++) {
@@ -1685,9 +1852,19 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		work();
 	}
 
+	// Where each record's permutation ended up, for the graphics recipes.
+	std::vector<std::pair<ProgramCache::SourceEntry*, uint32_t>> located(records.size(),
+	                                                                      {nullptr, 0u});
 	size_t              compiled = 0;
 	size_t              skipped  = 0;
+	{
 	Common::LockGuard   lock(m_mutex);
+	const auto note_record = [&](size_t index, ProgramCache::SourceEntry& source, size_t permutation) {
+		located[index] = {&source, static_cast<uint32_t>(permutation)};
+		std::lock_guard record_lock(m_program_cache->record_mutex);
+		m_program_cache->record_of_shader[source.permutations[permutation].handle.id] = {
+		    static_cast<uint32_t>(index), records[index].hash};
+	};
 	for (size_t index = 0; index < records.size(); index++) {
 		auto& record = records[index];
 		auto& result = replayed[index];
@@ -1704,16 +1881,22 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		key.code_size       = static_cast<uint32_t>(record.code.size());
 		std::visit([&](auto& info) { BuildStageStaticKey(info, key.static_state); }, record.info);
 		auto entry = m_program_cache->programs.find(key);
-		if (entry != m_program_cache->programs.end() &&
-		    std::ranges::any_of(entry->second.permutations, [&](const auto& candidate) {
-			    const auto& layout = candidate.program.bindings;
-			    return candidate.specialization == record.specialization &&
-				       layout.push_data_start_dword ==
-				           ShaderRecompiler::IR::PushData::StartFor(record.push_data_start_dword,
-				                                                    layout.ShaderDataDwords());
-		    })) {
-			m_graphics.device.destroyShaderModule(result.compiled.module, nullptr);
-			continue;
+		if (entry != m_program_cache->programs.end()) {
+			const auto& permutations = entry->second.permutations;
+			const auto  existing =
+			    std::ranges::find_if(permutations, [&](const auto& candidate) {
+				    const auto& layout = candidate.program.bindings;
+				    return candidate.specialization == record.specialization &&
+					       layout.push_data_start_dword ==
+					           ShaderRecompiler::IR::PushData::StartFor(record.push_data_start_dword,
+					                                                    layout.ShaderDataDwords());
+			    });
+			if (existing != permutations.end()) {
+				m_graphics.device.destroyShaderModule(result.compiled.module, nullptr);
+				note_record(index, entry->second,
+				            static_cast<size_t>(existing - permutations.begin()));
+				continue;
+			}
 		}
 		if (entry == m_program_cache->programs.end()) {
 			std::unique_lock insert_lock(m_program_cache->programs_mutex);
@@ -1722,10 +1905,101 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 		}
 		entry->second.permutations.push_back(m_program_cache->MakePermutation(
 		    options, record.specialization, std::move(result.compiled)));
+		note_record(index, entry->second, entry->second.permutations.size() - 1u);
 		++compiled;
+	}
 	}
 	PipelineCacheLog("Shader precompile: replayed {} permutations on {} threads; skipped {}",
 	                 compiled, threads, skipped);
+
+	// Then the graphics pipelines earlier sessions created. The game has not started (it waits in
+	// WaitForStartupPrecompile), so nothing else adds permutations or library parts meanwhile.
+	auto recipes = std::move(m_program_cache->pending_recipes);
+	if (!recipes.empty()) {
+		const auto start = std::chrono::steady_clock::now();
+		SetStartupPrecompileProgress(true, 1, 0, static_cast<uint32_t>(recipes.size()));
+		GraphicsWarmShared shared;
+		std::atomic_size_t next_recipe {0};
+		std::atomic_size_t recipes_done {0};
+		std::atomic_size_t recipes_warmed {0};
+		static const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
+		// The permutation of a recipe stage, when its record was replayed and is the same shader.
+		const auto stage_permutation = [&](uint32_t record, uint64_t hash) -> ProgramCache::Permutation* {
+			if (record >= records.size() || located[record].first == nullptr ||
+			    records[record].hash != hash) {
+				return nullptr;
+			}
+			return &located[record].first->permutations[located[record].second];
+		};
+		const auto warm = [&] {
+			for (size_t index = next_recipe.fetch_add(1); index < recipes.size();
+			     index = next_recipe.fetch_add(1)) {
+				const auto& recipe = recipes[index];
+				std::array<ShaderVertexInputInfo, 3> vertex_info {};
+				ShaderPixelInputInfo                 pixel_info {};
+				GraphicsPrograms                     programs;
+				bool valid = recipe.vertex_stage_count == 1 || recipe.vertex_stage_count == 3;
+				for (uint32_t stage = 0; valid && stage < recipe.vertex_stage_count; stage++) {
+					auto*       permutation = stage_permutation(recipe.records[stage], recipe.hashes[stage]);
+					const auto* info        = permutation != nullptr
+					                              ? std::get_if<ShaderVertexInputInfo>(
+					                                    &records[recipe.records[stage]].info)
+					                              : nullptr;
+					valid = info != nullptr;
+					if (valid) {
+						vertex_info[stage]       = *info;
+						vertex_info[stage].stage = {.program   = &permutation->program,
+						                            .resources = &no_resources};
+						programs.vertex[stage]   = permutation->handle;
+					}
+				}
+				if (valid && recipe.has_pixel != 0) {
+					auto*       permutation = stage_permutation(recipe.records[3], recipe.hashes[3]);
+					const auto* info =
+					    permutation != nullptr
+					        ? std::get_if<ShaderPixelInputInfo>(&records[recipe.records[3]].info)
+					        : nullptr;
+					valid = info != nullptr;
+					if (valid) {
+						pixel_info       = *info;
+						pixel_info.stage = {.program = &permutation->program, .resources = &no_resources};
+						programs.pixel   = permutation->handle;
+					}
+				}
+				if (valid &&
+				    WarmGraphicsPipeline(m_graphics, recipe.rendering, recipe.vertex_input,
+				                         std::span(vertex_info).first(recipe.vertex_stage_count),
+				                         recipe.has_pixel != 0 ? &pixel_info : nullptr, programs,
+				                         recipe.static_params, m_libraries.get(), m_driver_cache,
+				                         shared)) {
+					++recipes_warmed;
+				}
+				const auto done = ++recipes_done;
+				if (done % 4 == 0 || done == recipes.size()) {
+					SetStartupPrecompileProgress(true, 1, static_cast<uint32_t>(done),
+					                             static_cast<uint32_t>(recipes.size()));
+				}
+			}
+		};
+		{
+			std::vector<std::jthread> helpers;
+			for (uint32_t i = 1; i < threads; i++) {
+				helpers.emplace_back(warm);
+			}
+			warm();
+		}
+		PipelineCacheLog("Pipeline precompile: compiled {} of {} graphics pipelines in {:.1f} s",
+		                 recipes_warmed.load(), recipes.size(),
+		                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+		// What the precompile compiled is worth keeping even if this session ends badly.
+		m_unsaved_pipelines.fetch_add(recipes_warmed.load(), std::memory_order_relaxed);
+	}
+	EndStartupPrecompile();
+}
+
+void WaitForStartupPrecompile() {
+	std::unique_lock lock(g_startup_mutex);
+	g_startup_cv.wait(lock, [] { return !g_startup_running; });
 }
 
 void PipelineCache::Save() {
@@ -1742,6 +2016,7 @@ void PipelineCache::Save() {
 	}
 	Common::LockGuard lock(m_mutex);
 	m_program_cache->recording.Close();
+	m_program_cache->recipes.Close();
 	std::lock_guard file_lock(m_cache_file_mutex);
 	if (m_driver_cache == nullptr) {
 		return;
@@ -2457,6 +2732,36 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	if (m_program_cache->recipes.IsOpen()) {
+		// Kept for the next session's startup precompile when every stage has a journal record.
+		GraphicsRecipe recipe;
+		std::memset(&recipe, 0, sizeof(recipe));
+		recipe.rendering          = iter->first.rendering;
+		recipe.vertex_input       = iter->first.vertex_input;
+		recipe.static_params      = iter->first.static_params;
+		recipe.vertex_stage_count = static_cast<uint32_t>(vertex_info.size());
+		recipe.has_pixel          = ps_active ? 1u : 0u;
+		bool complete             = vertex_info.size() <= 3;
+		std::lock_guard record_lock(m_program_cache->record_mutex);
+		const auto      add = [&](size_t slot, uint64_t shader_id) {
+            const auto found = m_program_cache->record_of_shader.find(shader_id);
+            if (found == m_program_cache->record_of_shader.end()) {
+                complete = false;
+                return;
+            }
+            recipe.records[slot] = found->second.index;
+            recipe.hashes[slot]  = found->second.hash;
+		};
+		for (size_t stage = 0; complete && stage < vertex_info.size(); stage++) {
+			add(stage, programs.vertex[stage].id);
+		}
+		if (complete && ps_active) {
+			add(3, programs.pixel.id);
+		}
+		if (complete) {
+			m_program_cache->recipes.Append(recipe);
+		}
+	}
 	m_last_graphics_key      = iter->first;
 	m_last_graphics_pipeline = iter->second.get();
 

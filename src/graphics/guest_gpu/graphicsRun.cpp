@@ -1641,6 +1641,41 @@ bool CommandProcessor::DrawIndirectFromGpuArgs(uint64_t address, IndirectDrawReg
 	const bool patches = registers.vertex_offset != Pm4::SH_NOP ||
 	                     registers.instance_offset != Pm4::SH_NOP ||
 	                     registers.index_offset != Pm4::SH_NOP;
+	// KYTY_DEBUG_INDIRECT_REASONS=1: every 2000 indirect draws, why they read arguments on the CPU.
+	static const bool reasons = std::getenv("KYTY_DEBUG_INDIRECT_REASONS") != nullptr;
+	if (reasons) [[unlikely]] {
+		static std::array<std::atomic_uint64_t, 10> counts {};
+		const bool gpu_path_ok =
+		    gpu_args && !patches &&
+		    (indexed ? (mesh || (list && m_index_type_and_size != 2u)) && m_index_buffer_size != 0 &&
+		                   !(mesh && draw_count > 1)
+		             : !mesh && prim_type != Prospero::PrimitiveType::kQuadListLegacy);
+		counts[0]++;
+		counts[1] += gpu_path_ok ? 1 : 0;
+		counts[2] += !gpu_args ? 1 : 0;
+		counts[3] += registers.vertex_offset != Pm4::SH_NOP ? 1 : 0;
+		counts[4] += registers.instance_offset != Pm4::SH_NOP ? 1 : 0;
+		counts[5] += registers.index_offset != Pm4::SH_NOP ? 1 : 0;
+		counts[6] += indexed && !mesh && !list ? 1 : 0;
+		counts[7] += indexed && m_index_type_and_size == 2u ? 1 : 0;
+		counts[8] += mesh && draw_count > 1 ? 1 : 0;
+		counts[9] += count_addr != 0 ? 1 : 0;
+		if (counts[0] % 2000 == 0) {
+			std::printf("indirect-reasons: total=%llu gpu=%llu cpu_args=%llu vtx_off=%llu "
+			            "inst_off=%llu idx_off=%llu strip=%llu idx8=%llu mesh_multi=%llu "
+			            "gpu_count=%llu\n",
+			            static_cast<unsigned long long>(counts[0].load()),
+			            static_cast<unsigned long long>(counts[1].load()),
+			            static_cast<unsigned long long>(counts[2].load()),
+			            static_cast<unsigned long long>(counts[3].load()),
+			            static_cast<unsigned long long>(counts[4].load()),
+			            static_cast<unsigned long long>(counts[5].load()),
+			            static_cast<unsigned long long>(counts[6].load()),
+			            static_cast<unsigned long long>(counts[7].load()),
+			            static_cast<unsigned long long>(counts[8].load()),
+			            static_cast<unsigned long long>(counts[9].load()));
+		}
+	}
 	if (indexed && gpu_args && !patches && (mesh || (list && m_index_type_and_size != 2u)) &&
 	    m_index_buffer_size != 0 && Config::GpuMeshIndirectEnabled() &&
 	    !(mesh && draw_count > 1)) {

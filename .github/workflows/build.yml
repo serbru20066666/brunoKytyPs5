@@ -140,6 +140,17 @@ jobs:
           path: _Build/windows/install/**
           if-no-files-found: error
 
+      # The linker map and PDB of the fixed-base executable, for profiling and crash addresses.
+      - name: Upload Windows symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64-symbols
+          path: |
+            _Build/windows/kyty_emulator*.map
+            _Build/windows/kyty_emulator.pdb
+          if-no-files-found: warn
+          retention-days: 14
+
   macos:
     name: Build KytyPS5 (macOS)
     # This fork is developed and tested on Windows only.

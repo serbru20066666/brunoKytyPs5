@@ -192,6 +192,9 @@ static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
 	    [](void* param) {
+		    // Compiling the recorded shaders and pipelines first keeps the game from stopping to
+		    // compile them; the window shows the progress meanwhile.
+		    Libs::Graphics::WaitForStartupPrecompile();
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
 	    },

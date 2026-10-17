@@ -23,8 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -214,6 +216,12 @@ struct TrophyNotification {
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
 std::atomic<bool>              g_trophy_notification_active {false};
+// Startup precompile progress (see SetStartupPrecompileProgress).
+std::atomic<bool>     g_precompile_active {false};
+std::atomic<uint32_t> g_precompile_phase {0};
+std::atomic<uint32_t> g_precompile_done {0};
+std::atomic<uint32_t> g_precompile_total {0};
+
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
@@ -516,6 +524,13 @@ void InitializeSplashScreen(const std::filesystem::path& sce_sys) {
 	                      std::memory_order_release);
 }
 
+void SetStartupPrecompileProgress(bool active, uint32_t phase, uint32_t done, uint32_t total) {
+	g_precompile_phase.store(phase, std::memory_order_relaxed);
+	g_precompile_done.store(done, std::memory_order_relaxed);
+	g_precompile_total.store(total, std::memory_order_relaxed);
+	g_precompile_active.store(active, std::memory_order_release);
+}
+
 void HideSplashScreen() {
 	Clock::duration::rep expected = 0;
 	g_splash_hidden_at.compare_exchange_strong(expected, Clock::now().time_since_epoch().count());
@@ -575,10 +590,12 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
-	return {core.active || dialog.active || system.active || trophy_active || splash ||
+	const bool precompile    = g_precompile_active.load(std::memory_order_acquire);
+	return {core.active || dialog.active || system.active || trophy_active || splash || precompile ||
 	            g_settings_open.load(std::memory_order_acquire),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + g_settings_generation.load(std::memory_order_acquire)};
+	            (splash ? 2u : 0u) + g_settings_generation.load(std::memory_order_acquire) +
+	            (precompile ? 4u + g_precompile_done.load(std::memory_order_relaxed) * 8u : 0u)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -764,6 +781,9 @@ struct SystemOverlay::Impl {
 			if (trophy_notification_image) {
 				ImGui::UnregisterUserTexture(trophy_notification_image.get());
 			}
+			if (precompile_background) {
+				ImGui::UnregisterUserTexture(precompile_background.get());
+			}
 			for (const auto& texture: retired_trophy_images) {
 				ImGui::UnregisterUserTexture(texture.get());
 			}
@@ -786,6 +806,15 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		// The default font stays the first (every other overlay uses it); the precompile screen
+		// draws large text with Segoe UI Bold when Windows has it.
+		io.Fonts->AddFontDefault();
+		if (const char* windir = std::getenv("WINDIR"); windir != nullptr) {
+			const std::string path = std::string(windir) + "\\Fonts\\segoeuib.ttf";
+			if (Common::File::IsFileExisting(path)) {
+				precompile_font = io.Fonts->AddFontFromFileTTF(path.c_str(), 32.0f);
+			}
+		}
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -918,6 +947,126 @@ struct SystemOverlay::Impl {
 			draw->AddImage(
 			    splash_dds[i]->Texture(), begin, end, {0, 0}, {1, 1},
 			    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * (i == 0 ? 1.0f : logo))));
+		}
+	}
+
+	// The startup precompile's screen: the game waits for it, so it covers the window.
+	void DrawStartupPrecompile(vk::Extent2D frame_extent) {
+		if (!g_precompile_active.load(std::memory_order_acquire)) {
+			return;
+		}
+		const auto  phase  = g_precompile_phase.load(std::memory_order_relaxed);
+		const auto  done   = g_precompile_done.load(std::memory_order_relaxed);
+		const auto  total  = std::max(g_precompile_total.load(std::memory_order_relaxed), 1u);
+		const float ratio  = std::clamp(static_cast<float>(done) / static_cast<float>(total), 0.0f, 1.0f);
+		const auto  lang   = Config::GetConsoleLanguage();
+		const bool  es     = lang == 3 || lang == 20; // Spanish, Spanish (Latin America)
+		const ImVec2 screen {static_cast<float>(frame_extent.width),
+		                     static_cast<float>(frame_extent.height)};
+		auto*       draw  = ImGui::GetForegroundDrawList();
+		ImFont*     font  = precompile_font != nullptr ? precompile_font : ImGui::GetFont();
+		const float unit  = screen.y / 1080.0f;
+		draw->AddRectFilled({0, 0}, screen, IM_COL32(0x28, 0x24, 0x4a, 255));
+		// An optional picture behind it: assets/precompile_background.jpg (or .png) next to the
+		// emulator, scaled to cover the window.
+		if (!precompile_background_attempted) {
+			precompile_background_attempted = true;
+			precompile_background           = LoadPrecompileBackground();
+		}
+		if (precompile_background) {
+			const float  image_w = static_cast<float>(precompile_background->Width);
+			const float  image_h = static_cast<float>(precompile_background->Height);
+			const float  cover   = std::max(screen.x / image_w, screen.y / image_h);
+			const ImVec2 size {image_w * cover, image_h * cover};
+			const ImVec2 begin {(screen.x - size.x) * 0.5f, (screen.y - size.y) * 0.5f};
+			draw->AddImage(precompile_background->GetTexRef(), begin,
+			               {begin.x + size.x, begin.y + size.y});
+		}
+
+		// White text with a black outline reads on any picture.
+		const auto outlined = [&](const char* text, float size, ImVec2 pos, ImU32 color) {
+			const float o = std::max(1.0f, size / 14.0f);
+			for (const ImVec2 d: {ImVec2 {-o, 0}, ImVec2 {o, 0}, ImVec2 {0, -o}, ImVec2 {0, o},
+			                      ImVec2 {-o, -o}, ImVec2 {o, -o}, ImVec2 {-o, o}, ImVec2 {o, o}}) {
+				draw->AddText(font, size, {pos.x + d.x, pos.y + d.y}, IM_COL32(0, 0, 0, 255), text);
+			}
+			draw->AddText(font, size, pos, color, text);
+		};
+		// With the picture, the text goes in its right half, clear of the controller.
+		const float column = precompile_background ? screen.x * 0.73f : screen.x * 0.5f;
+		const auto centered = [&](const char* text, float size, float y, ImU32 color) {
+			const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+			outlined(text, size, {column - extent.x * 0.5f, y}, color);
+		};
+		const char* title = es ? "Preparando el juego" : "Preparing the game";
+		const char* stage = phase == 0 ? (es ? "Compilando sombreadores..." : "Compiling shaders...")
+		                               : (es ? "Compilando pipelines graficos..."
+		                                     : "Compiling graphics pipelines...");
+		const char* note  = es ? "Solo tarda la primera vez tras instalar o actualizar."
+		                       : "Only slow the first time after installing or updating.";
+		const char* note2 = es ? "Despues el juego ya no se detiene a compilar."
+		                       : "Afterwards the game no longer stops to compile.";
+		const ImU32 white = IM_COL32(255, 255, 255, 255);
+		const float top = screen.y * 0.38f;
+		centered(title, 48.0f * unit, top, white);
+		centered(stage, 28.0f * unit, top + 62.0f * unit, white);
+
+		// A white bar with a black border, on a dark translucent track.
+		const float  width  = screen.x * (precompile_background ? 0.38f : 0.5f);
+		const float  height = 20.0f * unit;
+		const ImVec2 begin {column - width * 0.5f, top + 112.0f * unit};
+		const ImVec2 end {begin.x + width, begin.y + height};
+		const float  round  = height * 0.5f;
+		const float  border = std::max(2.0f, 3.0f * unit);
+		draw->AddRectFilled({begin.x - border, begin.y - border}, {end.x + border, end.y + border},
+		                    IM_COL32(0, 0, 0, 255), round + border);
+		draw->AddRectFilled(begin, end, IM_COL32(0, 0, 0, 140), round);
+		if (ratio > 0.0f) {
+			draw->AddRectFilled(begin, {begin.x + std::max(width * ratio, height), end.y}, white,
+			                    round);
+		}
+
+		const auto counter = fmt::format("{}%   ({} / {})", static_cast<int>(ratio * 100.0f), done,
+		                                 g_precompile_total.load(std::memory_order_relaxed));
+		centered(counter.c_str(), 26.0f * unit, end.y + 18.0f * unit, white);
+		centered(note, 22.0f * unit, end.y + 66.0f * unit, white);
+		centered(note2, 22.0f * unit, end.y + 96.0f * unit, white);
+	}
+
+	std::unique_ptr<ImTextureData> LoadPrecompileBackground() {
+		const char* base_path = SDL_GetBasePath();
+		if (base_path == nullptr) {
+			return nullptr;
+		}
+		for (const char* name: {"assets/precompile_background.jpg", "assets/precompile_background.png"}) {
+			const std::string path   = std::string(base_path) + name;
+			int               width  = 0;
+			int               height = 0;
+			if (!stbi_info(path.c_str(), &width, &height, nullptr) || width <= 0 || height <= 0 ||
+			    width > 4096 || height > 4096) {
+				continue;
+			}
+			auto* pixels = stbi_load(path.c_str(), &width, &height, nullptr, 4);
+			if (pixels == nullptr) {
+				continue;
+			}
+			auto texture = std::make_unique<ImTextureData>();
+			texture->Create(ImTextureFormat_RGBA32, width, height);
+			std::memcpy(texture->Pixels, pixels,
+			            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+			texture->UseColors = true;
+			stbi_image_free(pixels);
+			ImGui::RegisterUserTexture(texture.get());
+			return texture;
+		}
+		return nullptr;
+	}
+
+	// Lets the backend retire the background once the precompile screen is gone.
+	void RetirePrecompileBackground() {
+		if (precompile_background && !g_precompile_active.load(std::memory_order_acquire)) {
+			precompile_background->WantDestroyNextFrame = true;
+			retired_trophy_images.push_back(std::move(precompile_background));
 		}
 	}
 
@@ -1546,7 +1695,8 @@ struct SystemOverlay::Impl {
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_splash_active.load(std::memory_order_acquire)) {
+		    !g_splash_active.load(std::memory_order_acquire) &&
+		    !g_precompile_active.load(std::memory_order_acquire)) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1577,6 +1727,8 @@ struct SystemOverlay::Impl {
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
 		DrawSplash(frame_extent);
+		DrawStartupPrecompile(frame_extent);
+		RetirePrecompileBackground();
 		GetOverlaySnapshot(&snapshot);
 		if (has_overlay && snapshot.session == prepared_session) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {
@@ -1646,6 +1798,9 @@ struct SystemOverlay::Impl {
 	ImVec2                                right_stick {};
 	OverlaySession                              session;
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
+	std::unique_ptr<ImTextureData>              precompile_background;
+	bool                                        precompile_background_attempted = false;
+	ImFont*                                     precompile_font                 = nullptr;
 	std::optional<TrophyNotification>           trophy_notification;
 	Clock::time_point                           trophy_notification_born;
 	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;

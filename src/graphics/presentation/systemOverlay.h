@@ -24,6 +24,10 @@ struct SystemOverlayVisualState {
 
 void                     InitializeSplashScreen(const std::filesystem::path& sce_sys);
 void                     HideSplashScreen();
+// The startup precompile's progress screen: phase 0 shaders, 1 graphics pipelines.
+void SetStartupPrecompileProgress(bool active, uint32_t phase, uint32_t done, uint32_t total);
+// Defined with the pipeline cache: returns once the startup precompile has finished.
+void WaitForStartupPrecompile();
 void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);

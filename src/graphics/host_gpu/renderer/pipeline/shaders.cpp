@@ -28,6 +28,7 @@
 #include <future>
 #include <bit>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -1044,6 +1045,138 @@ uint32_t PrefetchLibraryParts(GraphicContext& graphics, const PipelineRenderingS
 		queued++;
 	}
 	return queued;
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+bool WarmGraphicsPipeline(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                          const PipelineVertexInputState&        vertex_input,
+                          std::span<const ShaderVertexInputInfo> vertex_info,
+                          const ShaderPixelInputInfo*            ps_input_info,
+                          const PipelineCache::GraphicsPrograms& programs,
+                          const PipelineStaticParameters&        static_params,
+                          PipelineLibraryCache* libraries, vk::PipelineCache driver_cache,
+                          GraphicsWarmShared& shared) {
+	GraphicsPipelineState state(graphics.device);
+	BuildGraphicsPipelineState(state, graphics, rendering, vertex_input, vertex_info, ps_input_info,
+	                           programs, static_params);
+	const auto destroy_layouts = [&](const PipelineCache::Pipeline& layouts) {
+		graphics.device.destroyPipelineLayout(layouts.pipeline_layout, nullptr);
+		graphics.device.destroyDescriptorSetLayout(layouts.descriptor_set_layout, nullptr);
+		graphics.device.destroyDescriptorSetLayout(layouts.pixel_set_layout, nullptr);
+	};
+	if (libraries == nullptr || !UsesLibraries(graphics, state)) {
+		// Built monolithic by the draw too: compiling it once fills the driver cache.
+		PipelineCache::Pipeline pipeline;
+		CreateMonolithicPipeline(graphics, pipeline, state, driver_cache);
+		graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		destroy_layouts(pipeline);
+		return true;
+	}
+
+	PipelineCache::Pipeline layouts;
+	CreateGraphicsLayouts(graphics, layouts, state, LibraryPushStages(state));
+	const auto layout = layouts.pipeline_layout;
+	const auto keys   = BuildLibraryPartKeys(state, programs);
+	bool       built  = false;
+	// The first thread to need a part compiles it and the others wait for it; a part an earlier
+	// recipe (or session) left in the library cache is taken as it is.
+	const auto obtain = [&](const std::string& key, const auto& compile) -> vk::Pipeline {
+		std::promise<vk::Pipeline>       promise;
+		std::shared_future<vk::Pipeline> future;
+		{
+			std::lock_guard lock(shared.mutex);
+			if (libraries->Contains(key)) {
+				return libraries->Find(key).pipeline;
+			}
+			if (const auto claim = shared.claims.find(key); claim != shared.claims.end()) {
+				future = claim->second;
+			} else {
+				shared.claims.emplace(key, promise.get_future().share());
+			}
+		}
+		if (future.valid()) {
+			return future.get();
+		}
+		const vk::Pipeline part = compile();
+		if (part != nullptr) {
+			std::lock_guard lock(shared.mutex);
+			libraries->Insert(key, part);
+			built = true;
+		}
+		promise.set_value(part);
+		return part;
+	};
+
+	const vk::PipelineRenderingCreateInfo shader_rendering {};
+	vk::PipelineDynamicStateCreateInfo    shared_dynamic_state {};
+	shared_dynamic_state.dynamicStateCount = state.shared_dynamic_state_count;
+	shared_dynamic_state.pDynamicStates    = state.dynamic_states.data();
+	const auto pre_raster = obtain(keys.pre_raster, [&] {
+		return CreatePreRasterPart(graphics, state, layout, driver_cache, true);
+	});
+	const auto fragment = obtain(keys.fragment, [&] {
+		return CreateFragmentPart(graphics, state, keys.depth_stencil, layout, driver_cache, true);
+	});
+	vk::Pipeline vertex_part = nullptr;
+	if (!state.mesh) {
+		vertex_part = obtain(keys.vertex_input, [&] {
+			vk::GraphicsPipelineCreateInfo info {};
+			info.pVertexInputState   = &state.vertex_input;
+			info.pInputAssemblyState = &state.input_assembly;
+			info.pDynamicState       = &shared_dynamic_state;
+			return CreateLibraryPart(graphics, vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface,
+			                         info, shader_rendering, driver_cache, true);
+		});
+	}
+	const auto fragment_output = obtain(keys.output, [&] {
+		vk::GraphicsPipelineCreateInfo info {};
+		info.pMultisampleState = &state.multisampling;
+		info.pColorBlendState  = &state.color_blending;
+		info.pDynamicState     = &state.dynamic_state;
+		return CreateLibraryPart(graphics, vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
+		                         info, state.rendering, driver_cache, true);
+	});
+
+	bool ok = pre_raster != nullptr && fragment != nullptr && fragment_output != nullptr &&
+	          (state.mesh || vertex_part != nullptr);
+	if (ok) {
+		// The draw links the same parts in the same order (see CreateLibraryPipeline), so both
+		// links find their results in the driver cache.
+		const std::array all_parts {pre_raster, fragment, fragment_output, vertex_part};
+		const std::span  parts = std::span(all_parts).first(state.mesh ? 3u : 4u);
+		vk::PipelineLibraryCreateInfoKHR link_libraries {};
+		link_libraries.libraryCount = static_cast<uint32_t>(parts.size());
+		link_libraries.pLibraries   = parts.data();
+		vk::GraphicsPipelineCreateInfo link {};
+		link.pNext             = &link_libraries;
+		link.layout            = layout;
+		link.basePipelineIndex = -1;
+		vk::Pipeline linked    = nullptr;
+		if (graphics.device.createGraphicsPipelines(libraries->FastLinkCache(), 1, &link, nullptr,
+		                                            &linked) == vk::Result::eSuccess) {
+			graphics.device.destroyPipeline(linked, nullptr);
+		} else {
+			ok = false;
+		}
+		static const bool no_lto = std::getenv("KYTY_NO_LTO") != nullptr;
+		if (ok && !no_lto) {
+			link.flags = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT;
+			linked     = nullptr;
+			if (graphics.device.createGraphicsPipelines(driver_cache, 1, &link, nullptr, &linked) ==
+			    vk::Result::eSuccess) {
+				graphics.device.destroyPipeline(linked, nullptr);
+			}
+		}
+	}
+	if (built) {
+		// Parts this thread compiled were created with this layout.
+		std::lock_guard lock(shared.mutex);
+		const std::array set_layouts {layouts.descriptor_set_layout, layouts.pixel_set_layout};
+		libraries->KeepLayout(layout, set_layouts);
+	} else {
+		destroy_layouts(layouts);
+	}
+	return ok;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

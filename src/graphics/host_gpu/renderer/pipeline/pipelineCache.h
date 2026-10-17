@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -333,6 +334,28 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
                            const PipelineStaticParameters&        static_params,
                            PipelineLibraryCache* libraries, vk::PipelineCache driver_cache,
                            bool link_later = false);
+
+// Startup precompile: the library parts the warming threads compile, claimed by the first thread
+// that needs one so the others wait for it instead of compiling it again.
+struct GraphicsWarmShared {
+	std::mutex                                                         mutex;
+	std::unordered_map<std::string, std::shared_future<vk::Pipeline>> claims;
+};
+// Compiles a recorded graphics pipeline ahead of the game: its library parts go into libraries,
+// and its fast and link-time-optimized links (or the monolithic pipeline) into the driver cache,
+// so the draw that needs it later finds everything compiled. The linked pipelines are destroyed.
+// Runs on several threads at once while the guest waits; false when a part failed to compile.
+bool WarmGraphicsPipeline(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                          const PipelineVertexInputState&        vertex_input,
+                          std::span<const ShaderVertexInputInfo> vertex_info,
+                          const ShaderPixelInputInfo*            ps_input_info,
+                          const PipelineCache::GraphicsPrograms& programs,
+                          const PipelineStaticParameters&        static_params,
+                          PipelineLibraryCache* libraries, vk::PipelineCache driver_cache,
+                          GraphicsWarmShared& shared);
+// The guest's main thread waits here until the startup precompile (shaders and recorded graphics
+// pipelines) has finished, while the window shows its progress.
+void WaitForStartupPrecompile();
 // Compiles the missing shader library parts of a graphics pipeline on the library cache's worker
 // threads. Returns the number of parts queued. `ready`, when given, receives whether the
 // pipeline can be created without waiting for a shader part to compile.
