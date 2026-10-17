@@ -522,3 +522,8 @@ GPU 碰撞只给脚部 IK：`GpuCollisionManager::CastRay` 全镜像唯一调用
   冷步行逐秒最低 24 fps，无秒级冻结。画面截图与之前一致。
 - 日常设置（新 exe、本机缓存空）：40.25 / 40.40 / 40.60 fps，逐窗口回升到还原后的 40.8 附近——测量开始时后台还在
   替换原生 XPR 变体的优化版。正常退出会把优化版存进 `_PipelineCache/local/<exe SHA256>`，下次直接命中。
+
+## 2026-10-17 08:10 — "Sin TAA" modes darker in some zones (pending)
+- User: with the game's TAA the image is fine; without it (sin TAA) whole scenes are darker in some zones.
+- TAA shader a44e580f4f0cfb2b (dumped with KYTY_SHADER_DUMP): works in tonemapped space (c/(1+luma 0.3/0.59/0.11), inverse at the end); multiplies the history (5-tap bicubic of the previous output) by a constant (S_BUFFER_LOAD offset 24 of the buffer at s30+240), likely an exposure ratio. Steady state out = w*cur/(1-(1-w)K): brighter than the raw frame when K > 1. Skipping the TAA loses it.
+- Next: log that constant per frame in those zones; then apply the same factor before the upscaler. Also a bug found: DlssUpscale passes jitter 0 (meant for the TAA's resolved output), but with KYTY_TAA_REPLACE=upscaler the input is the raw jittered frame: it needs the camera jitter like the TAA path.
