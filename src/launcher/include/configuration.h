@@ -129,10 +129,12 @@ public:
 	bool                   trophy_enabled              = true;
 	bool                   skip_notice_screen          = false;
 	int                    vblank_frequency            = 60;
-	// --reported-resolution: 0 automatic, 1 1080p, 2 2160p.
+	// --reported-resolution: 0 automatic, 1 1080p, 2 2160p, 3 by video memory.
 	int                    reported_resolution         = 0;
 	// --texture-lod-bias, from -3 to 0.
 	double                 texture_lod_bias            = 0.0;
+	// --dcc-gpu-clear: apply GPU-written DCC fast clears on the GPU.
+	bool                   dcc_gpu_clear_enabled       = true;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -174,6 +176,7 @@ public:
 		vblank_frequency            = other.vblank_frequency;
 		reported_resolution         = other.reported_resolution;
 		texture_lod_bias            = other.texture_lod_bias;
+		dcc_gpu_clear_enabled       = other.dcc_gpu_clear_enabled;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
@@ -202,6 +205,7 @@ public:
 			// ASTRO's PLAYROOM. Its threads read back what the GPU writes every frame, and
 			// waiting for each read costs most of the frame rate.
 			present_mode              = PresentMode::Immediate;
+			dcc_gpu_clear_enabled     = true;
 			readback_linear_images    = true;
 			relaxed_readback_enabled  = true;
 			shader_validation_enabled = false;
@@ -225,10 +229,14 @@ public:
 		}
 		if (id == QLatin1String("PPSA34015")) {
 			// EA SPORTS FC 27. Told that the output is 1080p it renders for 1080p: told 2160p it
-			// renders up to 2656x1496 and outgrows an 8 GB card. No LOD bias: it streams
-			// texture mips in, and finer mips not loaded yet come out black (the pitch).
-			reported_resolution       = 1;
+			// renders up to 2656x1496 (sharp players) and outgrows an 8 GB card, so the emulator
+			// picks 2160p only with 12 GB of video memory or more. No LOD bias: it streams
+			// texture mips in, and finer mips not loaded yet come out black (the pitch). At 2160p
+			// its compute DCC writes only partly clear the menu backgrounds, which the GPU clear
+			// check does not take (black backgrounds); the CPU path reads them right.
+			reported_resolution       = 3;
 			texture_lod_bias          = 0.0;
+			dcc_gpu_clear_enabled     = false;
 			present_mode              = PresentMode::Immediate;
 			readback_linear_images    = true;
 			relaxed_readback_enabled  = false;

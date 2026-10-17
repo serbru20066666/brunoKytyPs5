@@ -492,7 +492,55 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// Without the per-dispatch barriers, a run of small dispatches spreads over the GPU as on the
 	// console: EA SPORTS FC 27 issues dozens of single-group cloth dispatches back to back. LDS
 	// emulated in one shared buffer cannot overlap.
-	const bool overlap = DispatchOverlap() && bindings.shared_memory.buffer == nullptr;
+	bool overlap = DispatchOverlap() && bindings.shared_memory.buffer == nullptr;
+	// Overlapping dispatches must not touch what an earlier one, still unordered, writes (or write
+	// what it reads): FC 27 at 2160p declared runs a dispatch over buffers a previous one is still
+	// writing, without a guest flush in between, and a later shader then loops forever on the
+	// half-written data (GPU timeout). Such a dispatch waits; unrelated ones still overlap.
+	{
+		struct Touched {
+			uint64_t begin;
+			uint64_t end;
+			bool     written;
+		};
+		static std::vector<Touched> unordered;
+		static bool                 unordered_image_write = false;
+		if (!overlap) {
+			unordered.clear();
+			unordered_image_write = false;
+		} else {
+			std::vector<Touched> mine;
+			mine.reserve(program.info.buffers.size());
+			for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+				const auto r     = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				const auto begin = r.Base48();
+				const auto size  = r.GetSize();
+				if (begin != 0 && size != 0) {
+					mine.push_back({begin, begin + size, program.info.buffers[i].written});
+				}
+			}
+			const bool writes_image =
+			    std::any_of(program.info.images.begin(), program.info.images.end(),
+			                [](const auto& image) { return image.written; });
+			bool hazard = unordered.size() > 512 ||
+			              (unordered_image_write && !program.info.images.empty()) ||
+			              (writes_image && !unordered.empty());
+			for (const auto& a: mine) {
+				for (const auto& b: unordered) {
+					if (hazard) break;
+					hazard = (a.written || b.written) && a.begin < b.end && b.begin < a.end;
+				}
+				if (hazard) break;
+			}
+			if (hazard) {
+				ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+				unordered.clear();
+				unordered_image_write = false;
+			}
+			unordered.insert(unordered.end(), mine.begin(), mine.end());
+			unordered_image_write = unordered_image_write || writes_image;
+		}
+	}
 	if (has_storage_writes && !overlap) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.

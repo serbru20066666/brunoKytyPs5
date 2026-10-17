@@ -131,6 +131,8 @@ bool     VrEnabled();
 bool     AmdCpuEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetReportedResolution();
+// Replaces --reported-resolution 3 (by video memory) with what the device chose.
+void     SetReportedResolution(uint32_t value);
 float    GetTextureLodBias();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();

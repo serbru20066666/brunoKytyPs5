@@ -1111,6 +1111,21 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
+	// --reported-resolution 3: a game told the output is 2160p renders for it (EA SPORTS FC 27 up
+	// to 2656x1496), which outgrows a card of 8 GB; 12 GB or more of video memory takes it.
+	if (Config::GetReportedResolution() == 3) {
+		uint64_t    local  = 0;
+		const auto& memory = graphic_ctx.physical_device_memory_properties;
+		for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+			if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local += memory.memoryHeaps[heap].size;
+			}
+		}
+		const uint32_t chosen = local >= (12ull << 30u) - (512ull << 20u) ? 2u : 1u;
+		Config::SetReportedResolution(chosen);
+		std::printf("Reported resolution by video memory (%llu MiB): %s\n",
+		            static_cast<unsigned long long>(local >> 20u), chosen == 2 ? "2160p" : "1080p");
+	}
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());

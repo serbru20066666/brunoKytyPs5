@@ -264,6 +264,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.texture_lod_bias != 0.0) {
 		args << "--texture-lod-bias" << QString::number(info.texture_lod_bias, 'f', 2);
 	}
+	if (!info.dcc_gpu_clear_enabled) {
+		args << "--dcc-gpu-clear" << "false";
+	}
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
 	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
