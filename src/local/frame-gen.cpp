@@ -1691,6 +1691,13 @@ struct TaaBypassPipeline {
 	vk::PipelineLayout      layout     = nullptr;
 	vk::Pipeline            pipeline   = nullptr;
 	vk::Sampler             sampler    = nullptr;
+	VkBuffer                stats      = VK_NULL_HANDLE; // (taa-bypass.comp's Stats: sums, the gain)
+	VmaAllocation           stats_mem  = nullptr;
+	VkBuffer                readback   = VK_NULL_HANDLE; // (a copy of it for the log)
+	VmaAllocation           readback_mem = nullptr;
+	const float*            readback_mapped = nullptr;
+	VulkanImage             dlaa;                        // KYTY_TAA_REPLACE=dlss: DLAA's output, then into the TAA's
+	vk::ImageView           dlaa_view = nullptr;
 	bool                    failed     = false;
 } g_bypass;
 
@@ -1699,10 +1706,12 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	if (g_bypass.failed) return false;
 	g_bypass.failed   = true; // until it is made
 	const auto device = graphics.device;
-	std::array<vk::DescriptorSetLayoutBinding, 2> bindings {};
-	for (uint32_t i = 0; i < 2; ++i) {
+	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
+	for (uint32_t i = 0; i < 3; ++i) {
 		bindings[i].binding         = i;
-		bindings[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		bindings[i].descriptorType  = i == 0   ? vk::DescriptorType::eCombinedImageSampler
+		                              : i == 1 ? vk::DescriptorType::eStorageImage
+		                                       : vk::DescriptorType::eStorageBuffer;
 		bindings[i].descriptorCount = 1;
 		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
 	}
@@ -1711,7 +1720,7 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
 	set_info.pBindings    = bindings.data();
 	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_bypass.set_layout) != vk::Result::eSuccess) return false;
-	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 8};
+	vk::PushConstantRange        push {vk::ShaderStageFlagBits::eCompute, 0, 16};
 	vk::PipelineLayoutCreateInfo layout_info {};
 	layout_info.setLayoutCount         = 1;
 	layout_info.pSetLayouts            = &g_bypass.set_layout;
@@ -1743,29 +1752,92 @@ bool EnsureBypassPipeline(GraphicContext& graphics) {
 	sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
 	sampler.maxLod       = 0.0f;
 	if (device.createSampler(&sampler, nullptr, &g_bypass.sampler) != vk::Result::eSuccess) return false;
+	{
+		VkBufferCreateInfo create {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		create.size  = 16;
+		create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_bypass.stats, &g_bypass.stats_mem, nullptr) != VK_SUCCESS)
+			return false;
+		create.usage   = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo mapped {};
+		if (vmaCreateBuffer(graphics.allocator, &create, &allocate, &g_bypass.readback, &g_bypass.readback_mem, &mapped) ==
+		    VK_SUCCESS)
+			g_bypass.readback_mapped = static_cast<const float*>(mapped.pMappedData);
+	}
 	g_bypass.failed = false;
 	return true;
+}
+
+bool EnsureDlaaImage(GraphicContext& graphics, vk::Extent2D extent) {
+	if (g_bypass.dlaa.image != nullptr && g_bypass.dlaa.extent.width == extent.width &&
+	    g_bypass.dlaa.extent.height == extent.height)
+		return true;
+	if (g_bypass.dlaa_view != nullptr) {
+		graphics.device.waitIdle();
+		graphics.device.destroyImageView(g_bypass.dlaa_view, nullptr);
+		g_bypass.dlaa_view = nullptr;
+	}
+	if (g_bypass.dlaa.image != nullptr) graphics.DeleteImage(g_bypass.dlaa);
+	g_bypass.dlaa.image = nullptr;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_bypass.dlaa)) {
+		g_bypass.dlaa.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = g_bypass.dlaa.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = create.format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_bypass.dlaa_view) != vk::Result::eSuccess) {
+		graphics.DeleteImage(g_bypass.dlaa);
+		g_bypass.dlaa.image = nullptr;
+		g_bypass.dlaa_view  = nullptr;
+		return false;
+	}
+	g_bypass.dlaa.state = {};
+	return true;
+}
+
+float EnvFloatOr(const char* name, float fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != '\0' ? static_cast<float>(std::atof(value)) : fallback;
 }
 } // namespace
 
 bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
-	if (!g_taa_bypass || g_taa_bypass_copy || g_cache == nullptr || g_graphics_ctx == nullptr || images.size() < 7)
-		return false;
-	if (!Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the game's TAA)
+	const bool bypass = g_taa_bypass && !g_taa_bypass_copy;
+	if ((!bypass && !g_taa_dlss) || g_cache == nullptr || g_graphics_ctx == nullptr || images.size() < 7) return false;
+	if (bypass && !Fsr3::UpscaleWanted() && !g_dlss_sr && !Xess::Wanted()) return false; // (no upscaler: the TAA's)
 	const auto& color_b = images[0];
 	const auto& out_b   = images[6];
 	if (!color_b.image_id || !out_b.image_id || color_b.image_view == nullptr || out_b.image_view == nullptr) return false;
 	auto&           color  = g_cache->GetImage(color_b.image_id);
 	auto&           output = g_cache->GetImage(out_b.image_id);
+	const vk::Extent2D render {color.backing.extent.width, color.backing.extent.height};
 	static uint32_t logs   = 0;
-	if (color.backing.extent.width != output.backing.extent.width ||
-	    color.backing.extent.height != output.backing.extent.height || color.backing.image == output.backing.image ||
-	    output.backing.format != vk::Format::eR16G16B16A16Sfloat || !EnsureBypassPipeline(*g_graphics_ctx)) {
+	if (output.backing.extent.width != render.width || output.backing.extent.height != render.height ||
+	    color.backing.image == output.backing.image || output.backing.format != vk::Format::eR16G16B16A16Sfloat ||
+	    !EnsureBypassPipeline(*g_graphics_ctx)) {
 		if (logs < 2) {
 			++logs;
-			std::printf("TAA: kept (color %ux%u, output %ux%u format %d)\n", color.backing.extent.width,
-			            color.backing.extent.height, output.backing.extent.width, output.backing.extent.height,
-			            static_cast<int>(output.backing.format));
+			std::printf("TAA: kept (color %ux%u, output %ux%u format %d)\n", render.width, render.height,
+			            output.backing.extent.width, output.backing.extent.height, static_cast<int>(output.backing.format));
 			std::fflush(stdout);
 		}
 		return false;
@@ -1773,56 +1845,123 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 	LocalVulkanRecording::Drain();
 #endif
-	// The TAA's writes (and its reads of the color) before this pass.
-	vk::MemoryBarrier2 before {};
-	before.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead;
-	before.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	before.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &before;
-	vk_command.pipelineBarrier2(dependency);
-	const auto color_layout =
-	    color_b.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : color_b.layout;
-	vk::DescriptorImageInfo infos[2] {};
-	infos[0] = {g_bypass.sampler, color_b.image_view, color_layout};
+	// The TAA's writes (and its reads) before what follows.
+	const auto compute_barrier = [&](vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst_access;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		vk_command.pipelineBarrier2(dependency);
+	};
+	compute_barrier(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+
+	// The source of the color: the raw jittered frame, or DLAA's output (KYTY_TAA_REPLACE=dlss).
+	vk::ImageView   source_view   = color_b.image_view;
+	vk::ImageLayout source_layout = color_b.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : color_b.layout;
+	if (!bypass) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+		const auto& depth_b = images[1];
+		const auto& mv_b    = images[3];
+		if (!g_sr_ready || !depth_b.image_id || !mv_b.image_id || depth_b.image_view == nullptr ||
+		    mv_b.image_view == nullptr || !EnsureDlaaImage(*g_graphics_ctx, render))
+			return false;
+		auto& depth  = g_cache->GetImage(depth_b.image_id);
+		auto& motion = g_cache->GetImage(mv_b.image_id);
+		if (depth.backing.extent.width != render.width || motion.backing.extent.width != render.width) return false;
+		static bool     reset = true;
+		static uint64_t last  = 0;
+		const uint64_t  frame = g_guest_frame;
+		reset = reset || frame > last + 2; // (a gap: menus, loading screens or movies in between)
+		last  = frame;
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+		           vk::PipelineStageFlagBits2::eComputeShader);
+		DlssLayouts layouts;
+		layouts.color  = color_b.layout;
+		layouts.depth  = depth_b.layout;
+		layouts.motion = mv_b.layout;
+		layouts.output = vk::ImageLayout::eGeneral;
+		const bool done = DlssEvaluate(static_cast<VkCommandBuffer>(vk_command), color.backing, color_b.image_view,
+		                               depth.backing, depth_b.image_view, motion.backing, mv_b.image_view, g_bypass.dlaa,
+		                               g_bypass.dlaa_view, render, render, g_camera, reset, true, layouts);
+		command.InvalidateGraphicsState();
+		if (!done) return false; // (the TAA's output stays)
+		reset = false;
+		Transition(vk_command, g_bypass.dlaa, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eComputeShader);
+		source_view   = g_bypass.dlaa_view;
+		source_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+#else
+		return false;
+#endif
+	}
+
+	vk::DescriptorImageInfo  infos[2] {};
+	infos[0] = {g_bypass.sampler, source_view, source_layout};
 	infos[1] = {nullptr, out_b.image_view, vk::ImageLayout::eGeneral};
-	vk::WriteDescriptorSet writes[2] {};
-	for (uint32_t i = 0; i < 2; ++i) {
+	vk::DescriptorBufferInfo stats {g_bypass.stats, 0, 16};
+	vk::WriteDescriptorSet   writes[3] {};
+	for (uint32_t i = 0; i < 3; ++i) {
 		writes[i].dstBinding      = i;
 		writes[i].descriptorCount = 1;
-		writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
-		writes[i].pImageInfo      = &infos[i];
+		writes[i].descriptorType  = i == 0   ? vk::DescriptorType::eCombinedImageSampler
+		                            : i == 1 ? vk::DescriptorType::eStorageImage
+		                                     : vk::DescriptorType::eStorageBuffer;
+		if (i < 2) writes[i].pImageInfo = &infos[i];
+		else writes[i].pBufferInfo = &stats;
 	}
 	const bool out_general = out_b.layout == vk::ImageLayout::eGeneral;
-	if (!out_general) output.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+	if (!out_general)
+		output.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
 	vk_command.bindPipeline(vk::PipelineBindPoint::eCompute, g_bypass.pipeline);
-	vk_command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bypass.layout, 0, 2, writes);
-	static const float gain = [] {
-		const char* value = std::getenv("KYTY_TAA_BYPASS_GAIN");
-		const float f     = value != nullptr ? static_cast<float>(std::atof(value)) : 1.0f;
-		return f > 0.0f ? f : 1.0f;
-	}();
+	vk_command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_bypass.layout, 0, 3, writes);
+	// KYTY_TAA_MATCH=0: no luminance match (the raw frame as it is); KYTY_TAA_MATCH_SMOOTH: this frame's weight.
+	static const float scale     = std::max(EnvFloatOr("KYTY_TAA_BYPASS_GAIN", 1.0f), 0.01f);
+	static const bool  match     = EnvFloatOr("KYTY_TAA_MATCH", 1.0f) != 0.0f;
+	static const float smoothing = std::clamp(EnvFloatOr("KYTY_TAA_MATCH_SMOOTH", 0.1f), 0.001f, 1.0f);
 	struct {
-		float   gain;
-		int32_t keep_alpha;
-	} push {gain, 1};
-	vk_command.pushConstants(g_bypass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	vk_command.dispatch((output.backing.extent.width + 7) / 8, (output.backing.extent.height + 7) / 8, 1);
-	vk::MemoryBarrier2 after {};
-	after.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	after.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
-	after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-	dependency.pMemoryBarriers = &after;
-	vk_command.pipelineBarrier2(dependency);
-	if (!out_general) output.Transit(out_b.layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
+		float   scale;
+		int32_t mode;
+		float   smoothing;
+		int32_t match;
+	} push {scale, 0, smoothing, match ? 1 : 0};
+	const uint32_t groups_x = (render.width + 7) / 8, groups_y = (render.height + 7) / 8;
+	for (int32_t mode = 0; mode < 3; ++mode) {
+		push.mode = mode;
+		vk_command.pushConstants(g_bypass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		if (mode == 1) vk_command.dispatch(1, 1, 1);
+		else vk_command.dispatch(groups_x, groups_y, 1);
+		compute_barrier(vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+		                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferRead);
+	}
+	if (g_bypass.readback_mapped != nullptr) {
+		const vk::BufferCopy copy {0, 0, 16};
+		vk_command.copyBuffer(g_bypass.stats, g_bypass.readback, 1, &copy);
+	}
+	compute_barrier(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	if (!out_general)
+		output.Transit(out_b.layout, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, {}, vk_command);
 	command.InvalidateGraphicsState(); // (this pass bound its own pipeline and descriptors)
-	if (logs < 2) {
-		++logs;
-		std::printf("TAA: ran, then its color replaced by the raw %ux%u frame (gain %.3f, its alpha kept) for the upscaler\n",
-		            color.backing.extent.width, color.backing.extent.height, static_cast<double>(gain));
+	static uint64_t calls = 0;
+	if (logs < 2 || (calls++ % 600 == 0 && g_bypass.readback_mapped != nullptr)) {
+		const bool first = logs < 2;
+		if (first) ++logs;
+		float gain = 0.0f, measured = 0.0f;
+		if (g_bypass.readback_mapped != nullptr) {
+			(void)vmaInvalidateAllocation(g_graphics_ctx->allocator, g_bypass.readback_mem, 0, VK_WHOLE_SIZE);
+			gain     = g_bypass.readback_mapped[2];
+			measured = g_bypass.readback_mapped[3];
+		}
+		if (first)
+			std::printf("TAA: ran, then its color replaced by %s %ux%u (its alpha kept, brightness matched to the TAA's: %s)\n",
+			            bypass ? "the raw frame for the upscaler" : "DLAA's", render.width, render.height,
+			            match ? "on" : "off");
+		std::printf("TAA: brightness gain %.3f (TAA/raw this frame %.3f, fixed factor %.3f)\n", static_cast<double>(gain),
+		            static_cast<double>(measured), static_cast<double>(scale));
 		std::fflush(stdout);
 	}
 	return true;
@@ -1831,7 +1970,7 @@ bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<co
 bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images) {
 	if (g_taa_bypass) return g_taa_bypass_copy && BypassTaa(vk_command, images);
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_taa_dlss || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
+	if (!g_taa_dlss || !g_taa_bypass_copy || !g_sr_ready || g_cache == nullptr || images.size() < 7) return false;
 	const auto& color_b = images[0];
 	const auto& depth_b = images[1];
 	const auto& mv_b    = images[3];

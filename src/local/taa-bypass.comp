@@ -1,22 +1,73 @@
 #version 450
-// KYTY_TAA_REPLACE=upscaler (frame-gen.cpp, AfterTaa): after the game's TAA ran, its output's color replaced by the
-// raw jittered frame (times a gain), its alpha kept. The TAA's alpha is not a color: it packs a per-pixel counter and
-// flags (stability << 6 | id) that later passes read; the earlier bypass (a copy of the raw frame) lost them.
+// KYTY_TAA_REPLACE=upscaler / dlss (frame-gen.cpp, AfterTaa): after the game's TAA ran, its output's color replaced by
+// the raw jittered frame's (or DLAA's), its alpha kept (a per-pixel counter and flags later passes read).
+// The TAA's output is brighter than its input in some zones (it scales its history by a game constant: its steady
+// state is w*cur/(1-(1-w)K)); with the raw frame alone those zones looked dark. So the raw frame is scaled by the
+// ratio of the two images' mean luminance, measured on the GPU every frame (no readback):
+//   mode 0: sums of luminance (TAA output, raw) into the buffer
+//   mode 1: one thread: the gain from them (smoothed over frames), the sums reset
+//   mode 2: the output = raw * gain, the TAA's alpha kept
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D raw_color;
 layout(binding = 1, rgba16f) uniform image2D taa_output;
+layout(std430, binding = 2) buffer Stats {
+	uint  sum_taa;
+	uint  sum_raw;
+	float gain;      // the smoothed gain in use
+	float measured;  // the last frame's ratio (logging)
+} stats;
 
 layout(push_constant) uniform Push {
-	float gain;
-	int   keep_alpha;
+	float scale;     // KYTY_TAA_BYPASS_GAIN: a fixed factor on top
+	int   mode;
+	float smoothing; // mode 1: the weight of this frame's ratio
+	int   match;     // 0: no luminance match (gain 1)
 } push;
+
+shared uint group_taa;
+shared uint group_raw;
+
+float Luma(vec3 c) {
+	return clamp(dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)), 0.0, 64.0);
+}
 
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	ivec2 size  = imageSize(taa_output);
+	if (push.mode == 1) {
+		if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0) {
+			float previous = stats.gain > 0.0 && stats.gain < 16.0 ? stats.gain : 1.0;
+			float ratio    = stats.sum_raw > 64u ? float(stats.sum_taa) / float(stats.sum_raw) : previous;
+			ratio          = clamp(ratio, 0.25, 8.0);
+			stats.measured = ratio;
+			stats.gain     = push.match != 0 ? mix(previous, ratio, push.smoothing) : 1.0;
+			stats.sum_taa  = 0u;
+			stats.sum_raw  = 0u;
+		}
+		return;
+	}
+	if (push.mode == 0) {
+		if (gl_LocalInvocationIndex == 0u) {
+			group_taa = 0u;
+			group_raw = 0u;
+		}
+		barrier();
+		if (pixel.x < size.x && pixel.y < size.y) {
+			// (Fixed point, 1/1024: a group's mean at most 64*1024 = 65536; the 57600 groups of 2560x1440 fit 32 bits.)
+			atomicAdd(group_taa, uint(Luma(imageLoad(taa_output, pixel).rgb) * 1024.0));
+			atomicAdd(group_raw, uint(Luma(texelFetch(raw_color, pixel, 0).rgb) * 1024.0));
+		}
+		barrier();
+		if (gl_LocalInvocationIndex == 0u) {
+			atomicAdd(stats.sum_taa, group_taa / 64u);
+			atomicAdd(stats.sum_raw, group_raw / 64u);
+		}
+		return;
+	}
 	if (pixel.x >= size.x || pixel.y >= size.y) return;
-	vec4 raw = texelFetch(raw_color, pixel, 0);
-	vec4 taa = imageLoad(taa_output, pixel);
-	imageStore(taa_output, pixel, vec4(raw.rgb * push.gain, push.keep_alpha != 0 ? taa.a : raw.a));
+	float gain = (stats.gain > 0.0 && stats.gain < 16.0 ? stats.gain : 1.0) * push.scale;
+	vec4  raw  = texelFetch(raw_color, pixel, 0);
+	vec4  taa  = imageLoad(taa_output, pixel);
+	imageStore(taa_output, pixel, vec4(raw.rgb * gain, taa.a));
 }
