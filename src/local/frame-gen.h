@@ -164,6 +164,9 @@ void UpscaleComposite(CommandBuffer& command, const RenderState& rendering, std:
 // False: the dispatch runs as usual.
 [[nodiscard]] bool TaaReplaceWanted();
 bool ReplaceTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images);
+// KYTY_TAA_REPLACE=upscaler (KYTY_TAA_BYPASS_MODE not copy): right after the TAA dispatch, its output's color replaced
+// by the raw jittered frame's, its alpha (flags later passes read) kept. False: nothing done.
+bool AfterTaa(CommandBuffer& command, vk::CommandBuffer vk_command, std::span<const TextureBinding> images);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,

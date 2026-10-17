@@ -213,8 +213,14 @@ bool Upscale(const UpscaleDesc& desc) {
 	exec.velocityTexture = ViewInfo(*desc.motion, desc.motion_view, false);
 	exec.depthTexture    = ViewInfo(*desc.depth, desc.depth_view, true);
 	exec.outputTexture   = ViewInfo(*desc.output, desc.output_view, false);
-	exec.jitterOffsetX   = 0.0f; // (the game's TAA already resolved its jitter)
-	exec.jitterOffsetY   = 0.0f;
+	// (After the game's TAA: 0, its jitter resolved. KYTY_TAA_REPLACE=upscaler: the camera's; KYTY_XESS_JITTER_SIGN=-1 the
+	// other way round.)
+	static const float jitter_sign = [] {
+		const char* value = std::getenv("KYTY_XESS_JITTER_SIGN");
+		return value != nullptr && std::atof(value) < 0 ? -1.0f : 1.0f;
+	}();
+	exec.jitterOffsetX   = jitter_sign * desc.jitter[0];
+	exec.jitterOffsetY   = jitter_sign * desc.jitter[1];
 	exec.exposureScale   = 1.0f;
 	exec.resetHistory    = desc.reset ? 1u : 0u;
 	exec.inputWidth      = desc.render.width;

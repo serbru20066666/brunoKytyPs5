@@ -1108,6 +1108,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		const bool taa_replaced = FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaReplaceWanted() &&
 		                          FrameGen::ReplaceTaa(buffer, vk_buffer, std::span<const TextureBinding> {bindings.images});
 		if (!taa_replaced) vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		if (!taa_replaced && FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaReplaceWanted())
+			(void)FrameGen::AfterTaa(buffer, vk_buffer, std::span<const TextureBinding> {bindings.images});
 		DispatchTiming::End(m_context.GetGraphics(), m_context.GetCommandScheduler(), vk_buffer, timing,
 		                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
 		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,

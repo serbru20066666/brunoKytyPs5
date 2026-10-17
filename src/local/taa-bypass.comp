@@ -1,0 +1,22 @@
+#version 450
+// KYTY_TAA_REPLACE=upscaler (frame-gen.cpp, AfterTaa): after the game's TAA ran, its output's color replaced by the
+// raw jittered frame (times a gain), its alpha kept. The TAA's alpha is not a color: it packs a per-pixel counter and
+// flags (stability << 6 | id) that later passes read; the earlier bypass (a copy of the raw frame) lost them.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D raw_color;
+layout(binding = 1, rgba16f) uniform image2D taa_output;
+
+layout(push_constant) uniform Push {
+	float gain;
+	int   keep_alpha;
+} push;
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size  = imageSize(taa_output);
+	if (pixel.x >= size.x || pixel.y >= size.y) return;
+	vec4 raw = texelFetch(raw_color, pixel, 0);
+	vec4 taa = imageLoad(taa_output, pixel);
+	imageStore(taa_output, pixel, vec4(raw.rgb * push.gain, push.keep_alpha != 0 ? taa.a : raw.a));
+}

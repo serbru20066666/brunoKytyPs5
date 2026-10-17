@@ -843,7 +843,7 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 	up.output.description.usage = FFX_API_RESOURCE_USAGE_UAV;
 	// The game's TAA already resolved its jitter into the image (no jitter left); its vectors are in UV units along the
 	// motion (FSR wants pixels towards the previous position, as for frame generation).
-	up.jitterOffset      = {0.0f, 0.0f};
+	up.jitterOffset      = {desc.jitter[0], desc.jitter[1]}; // (0 after the TAA; the camera's for the raw frame)
 	up.motionVectorScale = {mv_sign * static_cast<float>(desc.render.width), mv_sign * static_cast<float>(desc.render.height)};
 	up.renderSize        = {desc.render.width, desc.render.height};
 	up.upscaleSize       = {desc.upscale.width, desc.upscale.height};

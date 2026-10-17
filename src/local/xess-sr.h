@@ -37,6 +37,7 @@ struct UpscaleDesc {
 	vk::Extent2D       render {};
 	vk::Extent2D       upscale {};
 	bool               reset = false;
+	float jitter[2] {0.0f, 0.0f}; // (pixels, as DLSS takes it: the raw jittered frame of KYTY_TAA_REPLACE=upscaler)
 };
 // Color, depth and motion in SHADER_READ_ONLY_OPTIMAL, the output in GENERAL.
 bool Upscale(const UpscaleDesc& desc);

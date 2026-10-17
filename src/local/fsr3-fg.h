@@ -56,6 +56,7 @@ struct UpscaleDesc {
 	const FrameGen::Camera*  camera   = nullptr;
 	bool                     reset    = false;
 	float                    delta_ms = 16.7f;
+	float jitter[2] {0.0f, 0.0f}; // (pixels, as DLSS takes it: the raw jittered frame of KYTY_TAA_REPLACE=upscaler)
 };
 bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc);
 bool               CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* out);
