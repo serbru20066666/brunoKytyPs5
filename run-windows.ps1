@@ -614,6 +614,8 @@ if ($Prompt -and ($offer -or !$tested)) {
 # working set grew back to 3.5 GB in a minute of play at 60 fps): with 16 GB Windows pages the rest out.
 $os = Get-CimInstance Win32_OperatingSystem
 [double]$ram = $os.TotalVisibleMemorySize * 1KB
+# KYTY_SIMULATE_RAM_MB (launcher: Simular PC 16 GB / 8 GB): the warnings as on such a PC too.
+if ([double]"$($environment['KYTY_SIMULATE_RAM_MB'])" -gt 0) { $ram = [double]$environment['KYTY_SIMULATE_RAM_MB'] * 1MB }
 [double]$commit = $os.FreeVirtualMemory * 1KB
 if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 	# A system-managed page file grows to 3 x RAM (at most an eighth of its disk) while the disk has room.

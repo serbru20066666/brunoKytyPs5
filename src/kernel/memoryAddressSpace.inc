@@ -2495,6 +2495,18 @@ private:
 	}
 #endif
 
+	// DLSS frame generation (KYTY_FRAMEGEN) or DLSS super resolution (KYTY_UPSCALE=dlss, KYTY_TAA_REPLACE=dlss): both
+	// go through NGX, which reserves its address space as the device is made. (DLSS without frame generation closed
+	// the emulator there: the guest had taken the whole range, the ceiling was only for KYTY_FRAMEGEN.)
+	static bool NvidiaNgxWanted() {
+		const char* framegen = std::getenv("KYTY_FRAMEGEN");
+		if (framegen != nullptr && std::atoi(framegen) > 0) return true;
+		const char* upscale = std::getenv("KYTY_UPSCALE");
+		if (upscale != nullptr && std::strcmp(upscale, "dlss") == 0) return true;
+		const char* taa = std::getenv("KYTY_TAA_REPLACE");
+		return taa != nullptr && std::strcmp(taa, "dlss") == 0;
+	}
+
 	void ReserveGuestRegions() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
@@ -2502,13 +2514,13 @@ private:
 		auto               guest_end         = HOST_USER_MAX + 1u;
 		auto               next_addr         = HOST_SYSTEM_MANAGED_MIN;
 		// KYTY_RESERVE_CEILING=<hex>: stop below it, leaving the top of the 40-bit range to the
-		// driver. DLSS frame generation (KYTY_FRAMEGEN) needs it: NVIDIA's optical flow and NGX
+		// driver. DLSS (frame generation or super resolution: NvidiaNgxWanted) needs it: NVIDIA's optical flow and NGX
 		// interop reserve about 44 GiB of host address space below 1 TiB when the device is
 		// created, and fail it (VK_ERROR_INITIALIZATION_FAILED) when the guest took all of it.
 		uint64_t ceiling = 0;
 		if (const char* value = std::getenv("KYTY_RESERVE_CEILING"); value != nullptr && *value != '\0') {
 			ceiling = std::strtoull(value, nullptr, 16);
-		} else if (const char* framegen = std::getenv("KYTY_FRAMEGEN"); framegen != nullptr && std::atoi(framegen) > 0) {
+		} else if (NvidiaNgxWanted()) {
 			ceiling = 0xE000000000ull;
 		}
 		if (ceiling != 0) {
