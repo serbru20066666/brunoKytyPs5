@@ -616,6 +616,14 @@ $os = Get-CimInstance Win32_OperatingSystem
 [double]$ram = $os.TotalVisibleMemorySize * 1KB
 # KYTY_SIMULATE_RAM_MB (launcher: Simular PC 16 GB / 8 GB): the warnings as on such a PC too.
 if ([double]"$($environment['KYTY_SIMULATE_RAM_MB'])" -gt 0) { $ram = [double]$environment['KYTY_SIMULATE_RAM_MB'] * 1MB }
+# Under 24 GB of RAM (or simulated so): the working set past 8 GB emptied every 30 s (KYTY_TRIM_RAM_SECONDS), so the RAM
+# in use is what the game touches meanwhile (after a trim it grew back to about 3.5 GB in a minute of play, 10-09) and
+# Windows keeps room for itself; the configs leave it off (0) for bigger PCs. -Set KYTY_TRIM_RAM_SECONDS=... wins.
+if ($ram -lt 24GB -and "$($environment['KYTY_TRIM_RAM_SECONDS'])" -in @('', '0') -and !($Set -match 'KYTY_TRIM_RAM_SECONDS=')) {
+	$environment['KYTY_TRIM_RAM_SECONDS'] = '30'
+	if (!$environment['KYTY_TRIM_RAM_MB']) { $environment['KYTY_TRIM_RAM_MB'] = '8192' }
+	Write-Host 'memory:   under 24 GB of RAM: the working set past 8 GB is emptied every 30 s'
+}
 [double]$commit = $os.FreeVirtualMemory * 1KB
 if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 	# A system-managed page file grows to 3 x RAM (at most an eighth of its disk) while the disk has room.
