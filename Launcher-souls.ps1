@@ -270,7 +270,7 @@ function New-Check([string]$text, $x, $y, $w, [string]$key) {
 }
 $chkHdr   = New-Check 'HDR' 350 100 90 'hdr'
 $chkVsync = New-Check 'VSync' 450 100 100 'vsync'
-$chkLowPc = New-Check 'Modo PC de pocos recursos' 665 58 230 'lowpc'
+$chkLowPc = New-Check 'Modo PC de pocos recursos' 670 14 230 'lowpc'
 $tips = New-Object System.Windows.Forms.ToolTip
 $tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de pantalla de Windows')
 $tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
