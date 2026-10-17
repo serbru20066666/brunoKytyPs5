@@ -22,6 +22,8 @@ $fgModes = @(
 	@('   Frame generation DLSS x2',                    'dlss-x2.json'),
 	@('   Frame generation DLSS x3',                    'dlss-x3.json'),
 	@('   Frame generation DLSS x4',                    'dlss-x4.json'),
+	@('   Frame generation DLSS x5',                    'dlss-x5.json'),
+	@('   Frame generation DLSS x6',                    'dlss-x6.json'),
 	@('   224 FPS Nvidia Smooth x6',                    'dlss-x6-224.json'),
 	@('   120 FPS Nvidia Smooth Souls',                 'dlss-x3-120.json')
 )
@@ -139,7 +141,10 @@ function Start-Game {
 	# Con frame generation: vblank virtual de 360 Hz (run-windows -Vblank; corrige la velocidad del juego). Por
 	# debajo de 60 cada frame sale a su tiempo (20 ms -> ~20, no 33 como a 60 Hz: los trompicones); el juego sigue
 	# hasta 60 reales (FrameGenFloor), videos y menus a 60, y los Smooth (KYTY_FLIP_FPS 40/45) en vblanks justos.
-	if ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
+	# DLSS x4: el juego frenado a 56 (KYTY_FLIP_FPS), 4 vblanks justos de 224 Hz -> 224 en pantalla. x5 (40) y x6 (36)
+	# caen justos en los 360 Hz (9 y 10 vblanks): el juego no dibuja frames de mas que se tirarian antes del DLSS.
+	if ($config -eq 'dlss-x4.json') { $psargs += @('-Vblank', '224') }
+	elseif ($config -ne 'sin-fg.json') { $psargs += @('-Vblank', '360') }
 	$res    = $script:resShown[[math]::Max(0, $cmbRes.SelectedIndex)]
 	if ($res[1] -eq 0) { $res = $resModes[0] }
 	# DLSS (reescalado) carga Streamline de NVIDIA; con la generacion de frames de AMD el emulador se cerraba al crear
