@@ -39,12 +39,13 @@ void     AudioOutClose(int handle);
 bool     AudioOutHasDevice(int handle);
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking = true);
 
-// KYTY_AUDIO_STATS (on unless =0): every 5 s the run log shows what each audio stage carried (AJM decodes,
-// AudioOut2 ports and objects, the AudioOut devices), each with its peak level, to find where a sound is lost.
+// KYTY_AUDIO_STATS=1: every 5 s the run log shows what each audio stage carried (AJM decodes, AudioOut2 ports
+// and objects, the AudioOut devices), each with its peak level, to find where a sound is lost. Off otherwise: it
+// scanned every decoded block for its peak and filled nine tenths of a session's log (18 MB in 55 minutes).
 inline bool StatsWanted() {
 	static const bool wanted = [] {
 		const char* value = std::getenv("KYTY_AUDIO_STATS");
-		return value == nullptr || *value != '0';
+		return value != nullptr && *value != '\0' && *value != '0';
 	}();
 	return wanted;
 }
