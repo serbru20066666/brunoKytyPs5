@@ -70,6 +70,9 @@ constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | Tra
 // anything). KYTY_LANE_LOCAL_COOP=0/1 overrides the cooperative halves either way, KYTY_TABLE_SLOTS_AT_USE=0/1 the
 // table slots' loads.
 void                   SetTranslatorFeatures(uint32_t features);
+// The GPU leaves the cooperative halves out unless KYTY_LANE_LOCAL_COOP=1 asks for them (AMD GPUs that emulate wave64
+// compute on 32-lane subgroups: the RDNA2 cards; their results there broke Demon's Souls' lighting into dark squares).
+void                   SetCooperativeHalvesUnsafe(bool unsafe);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

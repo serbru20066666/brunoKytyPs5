@@ -35,6 +35,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -610,6 +611,14 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	const char* setting = std::getenv("KYTY_COMPUTE_WAVE64");
 	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0" : amd_rdna3_or_later;
 	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && wanted;
+	// An AMD GPU that emulates wave64 compute on 32-lane subgroups (RDNA2: an RX 6800 XT, Adrenalin 26.x) drew Demon's
+	// Souls' lighting with dark squares of 32 and 64 pixels with the lane-local cooperative halves, and none without them
+	// (KYTY_LANE_LOCAL_COOP=0); NVIDIA GPUs, 32-lane too, draw them right, and RDNA3 and later run wave64 natively.
+	const bool cooperative_unsafe = device_properties.vendorID == 0x1002u && !graphics.SupportsComputeWave64();
+	ShaderRecompiler::Frontend::SetCooperativeHalvesUnsafe(cooperative_unsafe);
+	if (cooperative_unsafe) {
+		std::printf("Lane-local cooperative halves: off on this AMD GPU (KYTY_LANE_LOCAL_COOP=1 turns them on)\n");
+	}
 	std::printf("Vulkan compute wave64: %s (%s, device 0x%04x:0x%04x)\n",
 	            graphics.SupportsComputeWave64() ? "native" : "emulated on 32-lane subgroups",
 	            setting != nullptr && *setting != '\0' ? "KYTY_COMPUTE_WAVE64"

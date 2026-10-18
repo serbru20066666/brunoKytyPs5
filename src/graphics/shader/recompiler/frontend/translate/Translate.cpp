@@ -23,6 +23,12 @@ void SetTranslatorFeatures(uint32_t features) {
 	g_translator_features.store(features & TranslatorFeatures, std::memory_order_relaxed);
 }
 
+static std::atomic<bool> g_cooperative_unsafe {false};
+
+void SetCooperativeHalvesUnsafe(bool unsafe) {
+	g_cooperative_unsafe.store(unsafe, std::memory_order_relaxed);
+}
+
 uint32_t TranslatorFeatureSet() {
 	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, KYTY_TABLE_SLOTS_AT_USE=0/1 the table slots' loads
 	// at the entry or where they are read, whatever the store was made with.)
@@ -37,6 +43,8 @@ uint32_t TranslatorFeatureSet() {
 		if (value >= 0) features = value != 0 ? features | feature : features & ~feature;
 	};
 	apply(cooperative, TranslatorFeatureCooperativeHalves);
+	// (Whatever a store was made with: what the precompile stamps then matches what the game translates.)
+	if (cooperative < 0 && g_cooperative_unsafe.load(std::memory_order_relaxed)) features &= ~TranslatorFeatureCooperativeHalves;
 	apply(slots_at_use, TranslatorFeatureTableSlotsAtUse);
 	return features;
 }

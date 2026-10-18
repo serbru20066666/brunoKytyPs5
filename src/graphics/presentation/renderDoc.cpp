@@ -156,7 +156,23 @@ static void StartCapture() {
 	LOGF("RenderDoc: capture started\n");
 }
 
+// A capture asked for from outside the game window: the file _RenderDoc/capturar appears (it is taken away), looked
+// for once a second. RenderDoc's own capture key reads the keyboard, which a test cannot press.
+static bool CaptureFileRequested() {
+	static auto next_check = std::chrono::steady_clock::time_point {};
+	const auto  now        = std::chrono::steady_clock::now();
+	if (now < next_check) {
+		return false;
+	}
+	next_check = now + std::chrono::seconds(1);
+	std::error_code error;
+	return std::filesystem::remove("_RenderDoc/capturar", error);
+}
+
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	if (g_api != nullptr && g_state.load(std::memory_order_acquire) == RenderDocState::Idle && CaptureFileRequested()) {
+		RenderDocRequestCapture();
+	}
 	const auto state = g_state.load(std::memory_order_acquire);
 	if (g_api == nullptr || state == RenderDocState::Idle) {
 		return;
