@@ -37,6 +37,9 @@ void OnDevice(GraphicContext& graphics, const QueuePlan& plan);
 // The swapchain. Create: replaces vkCreateSwapchainKHR (false: frame generation off, create it the
 // normal way). The others replace their Vulkan function while Active().
 [[nodiscard]] bool Active();
+// The last second's frame rates (the run log's [fsr3] line): the game's real frames and the frames shown, generated
+// ones included. False before the first second or while frame generation is off.
+[[nodiscard]] bool LastRates(double& real, double& shown);
 // The real frames' least interval (seconds) for the shown frames to stay under KYTY_VRR_CAP_FPS (the G-SYNC cap), 0
 // when no cap applies. The flip queue holds the game's flips to it (videoOut.cpp), so no frame of the game is dropped.
 [[nodiscard]] double RealFrameInterval();

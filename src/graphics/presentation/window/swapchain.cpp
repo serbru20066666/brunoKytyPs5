@@ -566,14 +566,18 @@ struct Presenter::Impl {
 			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
+			double fsr_real = 0.0, fsr_shown = 0.0;
 			if (presents > 1) {
-				std::snprintf(title.data(), title.size(), "%.0f FPS", hud_frames / seconds * presents);
-				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
+				std::snprintf(title.data(), title.size(), "%.0f fps reales  |  %.0f con generacion", game, hud_frames / seconds * presents);
+			} else if (Fsr3::LastRates(fsr_real, fsr_shown) && fsr_shown > game * 1.2) {
+				// FSR 3 frame generation: the game's frames and those shown, generated ones included.
+				std::snprintf(title.data(), title.size(), "%.0f fps reales  |  %.0f con generacion", game, fsr_shown);
 			} else {
-				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
+				std::snprintf(title.data(), title.size(), "%.0f fps", game);
 			}
-			hud.title  = title.data();
-			hud.detail = detail.data();
+			hud.title   = title.data();
+			hud.detail  = detail.data();
+			hud.compact = level < 2;
 			// The last 10 seconds' frames: their average time, the render thread's busy part, the worst 1% as
 			// fps and the longest.
 			const auto summary = PerfOverlay::Summarize(10.0);

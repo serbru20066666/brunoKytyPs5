@@ -1157,9 +1157,10 @@ struct SystemOverlay::Impl {
 		};
 		if (!hud.title.empty()) {
 			panel("##FpsHud", [&] {
-				ImGui::PushFont(hud_font, 46.0f * unit);
+				ImGui::PushFont(hud_font, (hud.compact ? 22.0f : 46.0f) * unit);
 				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
 				ImGui::PopFont();
+				if (hud.compact) return;
 				if (!hud.detail.empty()) {
 					ImGui::PushFont(hud_font, 21.0f * unit);
 					ImGui::TextUnformatted(hud.detail.c_str());

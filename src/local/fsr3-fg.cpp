@@ -126,6 +126,7 @@ struct Stats {
 } g_stats;
 
 std::mutex g_mutex; // the contexts are not thread safe (presents, prepare, destruction)
+std::atomic<double> g_rate_real {0.0}, g_rate_shown {0.0}; // LastRates
 
 bool EnvOn(const char* name, bool fallback) {
 	const char* value = std::getenv(name);
@@ -937,6 +938,8 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 		            g_stats.no_inputs, g_stats.movie, g_stats.real != 0 ? g_stats.prepare_ms / g_stats.real : 0.0,
 		            g_stats.real != 0 ? g_stats.present_ms / g_stats.real : 0.0, g_stats.max_present_ms);
 		std::fflush(stdout);
+		g_rate_real.store(g_stats.real / window, std::memory_order_relaxed);
+		g_rate_shown.store(static_cast<double>(shown) / window, std::memory_order_relaxed);
 		g_stats                   = {};
 		g_stats.start             = now;
 		g_stats.presents_at_start = presents;
@@ -1157,5 +1160,11 @@ void RecordHudLayer(GraphicContext&, vk::CommandBuffer, vk::Image, vk::Extent2D,
                     const FrameGen::FrameInputs*) {}
 
 #endif
+
+bool LastRates(double& real, double& shown) {
+	real  = g_rate_real.load(std::memory_order_relaxed);
+	shown = g_rate_shown.load(std::memory_order_relaxed);
+	return Active() && shown > 0.0;
+}
 
 } // namespace Libs::Graphics::Fsr3

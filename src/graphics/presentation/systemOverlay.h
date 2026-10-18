@@ -39,6 +39,7 @@ struct SystemOverlayPerf {
 struct SystemOverlayHud {
 	std::string title;  // large first line (empty: no frame rate panel)
 	std::string detail; // small second line
+	bool        compact = false; // the title small, nothing under it (the first overlay level)
 	SystemOverlayPerf perf; // under them
 	std::string status; // the progress line (empty: none), over a bar
 	float       status_fraction = 0.0f;
