@@ -381,7 +381,8 @@ while ($first.Count -or $second.Count -or $running.Count) {
 $env:KYTY_PRECOMPILE_CLAIMS = $null
 # (-Quick: what the store held of the other shaders stays. Recorded play that could not be gathered: the pipelines an
 # earlier run made for it stay too - pruned to the seeds alone, the game compiled them all again while playing.)
-$mergeArguments = @('--merge')
+# (--stamp: the store's translation features, those this run used: ShaderRecompiler TranslatorFeatures.)
+$mergeArguments = @('--merge', '--stamp')
 if (!$Quick -and !$recordedLost) { $mergeArguments += '--prune' }
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }

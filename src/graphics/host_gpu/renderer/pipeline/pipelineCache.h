@@ -175,7 +175,7 @@ public:
 	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
 	// older runs left that no seed makes any more is dropped).
 	// `keep_shards`: the shard files stay (a merge in the middle of a run, which its final pruning merge counts).
-	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false);
+	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false, bool stamp = false);
 #endif
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:

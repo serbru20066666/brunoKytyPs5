@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <string>
 
 namespace Libs::Graphics {
 struct RenderState;
@@ -88,6 +89,13 @@ void NoteGpuWaitMs(double ms);
 void NoteFlipPresentMs(double ms);
 void NoteSubmitMs(double ms);        // present thread: record + submit of the copy into the swapchain
 void NoteBeforePresentMs(double ms); // BeforePresent (Streamline tags and options)
+// Before the device is created: why Streamline says DLSS-G cannot run with this GPU, driver and Windows (e.g.
+// hardware-accelerated GPU scheduling turned off), logged; empty when it can, or when frame generation is off. A refused
+// device's error repeats it.
+[[nodiscard]] std::string SupportProblem(vk::PhysicalDevice physical_device);
+// A refused device's advice when this process runs without bottom-up ASLR (issue #45: forcing it on for the emulator in
+// Windows' Exploit protection let the driver make the device); empty otherwise.
+[[nodiscard]] std::string RefusedDeviceAdvice();
 // After the device exists: checks that DLSS-G is available on it.
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device);
 // Right after the dispatcher is loaded for the device (before the recording layer copies it):
@@ -104,6 +112,10 @@ void BypassCommandHooks(vk::Device device);
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2D region,
                    vk::Format format, uint32_t image_count);
 void AfterPresent();
+// Present thread: the swapchain is made again (DLSS-G off until frames with inputs turn it on again).
+void SwapchainChanging();
+// Any thread: a frame with inputs was left unshown (the presenter kept a newer one): the next one resets DLSS-G's history.
+void NoteDroppedFrame();
 // Present thread: the frames DLSS-G showed per presented frame (1 without generation), as last
 // queried (about once a second), for the KYTY_FPS_HUD panel.
 [[nodiscard]] uint32_t PresentedFrames();

@@ -40,6 +40,7 @@
 #include <sl_consts.h>
 #include <sl_dlss.h>
 #include <sl_dlss_g.h>
+#include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
@@ -50,6 +51,11 @@
 #include <string>
 #include <vector>
 #endif
+
+extern "C" {
+// DLSS-G frames' Reflex sleep (slReflexSleep, every present): 0 skips it (KYTY_FRAMEGEN_SLEEP=0).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_framegen_sleep {1};
+}
 
 namespace Libs::Graphics::FrameGen {
 
@@ -455,6 +461,65 @@ void NoteAcquireMs(double) {}
 void NoteGpuWaitMs(double) {}
 void NoteFlipPresentMs(double) {}
 #endif
+std::string SupportProblem(vk::PhysicalDevice physical_device) {
+	if (g_generate == 0) {
+		return {};
+	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (Streamline answers before the device too: its programming guide asks while the adapters are enumerated. Issue
+	// #45: a device refused with no word why; the driver's own refusal says nothing either.)
+	sl::AdapterInfo adapter {};
+	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+	const auto  result       = g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter);
+	std::string problem;
+	switch (result) {
+		case sl::Result::eOk: break;
+		case sl::Result::eErrorOSDisabledHWS:
+			problem = "Windows' hardware-accelerated GPU scheduling is off (Settings > System > Display > Graphics > "
+			          "Advanced graphics settings; then restart the PC)";
+			break;
+		case sl::Result::eErrorOSOutOfDate: problem = "this Windows version is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorDriverOutOfDate: problem = "the NVIDIA driver is too old for DLSS frame generation"; break;
+		case sl::Result::eErrorNoSupportedAdapterFound:
+		case sl::Result::eErrorAdapterNotSupported:
+			problem = "this graphics card has no DLSS frame generation (NVIDIA RTX 40 or newer)";
+			break;
+		default: problem = std::string("Streamline does not offer DLSS frame generation here (") + sl::getResultAsStr(result) + ")"; break;
+	}
+	if (problem.empty()) {
+		LOGF("frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+		std::printf("Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows\n");
+	} else {
+		LOGF("frame generation: %s\n", problem.c_str());
+		std::printf("Frame generation: %s\n", problem.c_str());
+	}
+	// (Where the driver's reservations go, for a refused device's log: RefusedDeviceAdvice.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr))) {
+		std::printf("Frame generation: bottom-up ASLR %s for the emulator\n", aslr.EnableBottomUpRandomization != 0 ? "on" : "off");
+	}
+	std::fflush(stdout);
+	return problem;
+#else
+	(void)physical_device;
+	return {};
+#endif
+}
+
+std::string RefusedDeviceAdvice() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// (The emulator is built with fixed addresses, so without bottom-up ASLR its host allocations pack upward from the
+	// guest's ceiling; an RTX 5080's driver refused the device until Exploit protection forced it on for the emulator.)
+	PROCESS_MITIGATION_ASLR_POLICY aslr {};
+	if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessASLRPolicy, &aslr, sizeof(aslr)) &&
+	    aslr.EnableBottomUpRandomization == 0) {
+		return " If it keeps failing, in Windows Security: App & browser control > Exploit protection > Program settings > "
+		       "add kyty_emulator.exe > Randomize memory allocations (Bottom-up ASLR): Override system settings, On "
+		       "(issue #45).";
+	}
+#endif
+	return {};
+}
 
 bool WantsCamera() {
 	return g_ready && !g_camera.valid;
@@ -792,7 +857,10 @@ sl::Constants MakeConstants(bool usable, const Camera& camera_in, vk::Extent2D r
 	constants.depthInverted       = sl::Boolean::eTrue;
 	constants.cameraMotionIncluded = sl::Boolean::eTrue;
 	constants.motionVectors3D     = sl::Boolean::eFalse;
-	constants.reset               = usable ? sl::Boolean::eFalse : sl::Boolean::eTrue;
+	// (A frame left unshown before this one: its motion and matrices are to the game's previous frame, not to the one
+	// presented last.)
+	const bool discontinuity      = g_discontinuity.exchange(false, std::memory_order_relaxed);
+	constants.reset               = usable && !discontinuity ? sl::Boolean::eFalse : sl::Boolean::eTrue;
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
@@ -1200,6 +1268,31 @@ void AfterPresent() {
 		std::fflush(stdout);
 	}
 #endif
+}
+
+void SwapchainChanging() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
+	if (!g_ready || !g_mode_on) return;
+	sl::DLSSGOptions options {};
+	options.mode                = sl::DLSSGMode::eOff;
+	options.flags               = sl::DLSSGFlags::eRetainResourcesWhenOff;
+	options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+	if (const auto result = g_api.dlssg_set_options(sl::ViewportHandle {0}, options); result != sl::Result::eOk)
+		LOGF("frame generation: slDLSSGSetOptions (off) failed (%d)\n", static_cast<int>(result));
+	g_mode_on     = false;
+	g_run_with    = 0;
+	g_options_set = false; // (the next present sends its sizes again)
+#endif
+}
+
+void NoteDroppedFrame() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	g_discontinuity.store(true, std::memory_order_relaxed);
+#endif
+	static std::atomic<uint32_t> dropped {0};
+	if (const auto count = dropped.fetch_add(1, std::memory_order_relaxed) + 1; count <= 8 || count % 600 == 0)
+		LOGF("frame generation: %u frame(s) with inputs left unshown (the next resets DLSS-G's history)\n", count);
 }
 
 uint32_t PresentedFrames() {

@@ -2781,7 +2781,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 4);
 	// Emission, as DispatchDirect's.
 	buffer.EndRendering();
-	const bool chain     = DemonsSouls::ComputeChains();
+	const bool chain     = DemonsSouls::ComputeChains(pair.programs[0]->shader_hash);
 	const auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
 	TableWatchEnd(cache.GetTableUploadBuffer(), cache, m_context.GetGraphics(),
 	              Role() == 0 && Spec::Current() == nullptr ? &m_context.GetCommandScheduler() : nullptr, vk_buffer,

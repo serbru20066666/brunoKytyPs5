@@ -501,6 +501,8 @@ function(add_kyty_full_emulator_test target source)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
+		# The threads' stacks as the emulator's (below): the driver compiles pipelines on the calling thread.
+		target_link_options(${target} PRIVATE "/STACK:16777216")
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored
@@ -846,6 +848,7 @@ if(LINUX)
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/textureCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 		"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
@@ -908,7 +911,12 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
+	# /STACK: 16 MiB reserved for each thread that does not ask for a size (committed only as it is used), not
+	# Windows' 1 MiB. The driver compiles a pipeline on the thread that creates it: NVIDIA 566.07's compiler ran a
+	# wave64 compute shader's cooperative halves (9935d547) past 1 MiB (STATUS_STACK_OVERFLOW in nvoglv64.dll, a
+	# precompile shard on an RTX 3080 Laptop) and through it at 16 MiB.
 	target_link_options(kyty_emulator PRIVATE
+		"/STACK:16777216"
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"

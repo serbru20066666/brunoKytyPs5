@@ -390,8 +390,15 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		// (DLSS-G off while the swapchain is made again; the next frame with its inputs turns it on.)
+		if (FrameGen::Enabled()) FrameGen::SwapchainChanging();
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+#if defined(_WIN32)
+		// The display's refresh again (PresentDue): a window moved to another display, its mode or full screen changed (a
+		// TV between 60 and 120 Hz).
+		min_present_interval = std::chrono::nanoseconds {-1};
+#endif
 	}
 
 	Image& ResolveSurface(const ImageInfo& info, ImageId* out_id = nullptr) {
@@ -620,6 +627,8 @@ struct Presenter::Impl {
 			dropped = std::exchange(waiting, next);
 		}
 		waiting_changed.notify_one();
+		// (A game frame DLSS-G had inputs for never shown: the next one's motion spans two frames.)
+		if (dropped.frame != nullptr && !dropped.reuse && dropped.frame->fg.valid) FrameGen::NoteDroppedFrame();
 		// (A last frame shown again stays the last one.)
 		if (dropped.frame != nullptr) frames.Release(dropped.frame, dropped.reuse);
 	}

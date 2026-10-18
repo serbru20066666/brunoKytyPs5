@@ -97,6 +97,14 @@ with a bar for each core, and the memory in use. (The overlays seen in videos wi
 of every part come from separate tools such as MSI Afterburner's RivaTuner Statistics Server.) In the
 game, F8 switches the panel between Off, "Frame rate" and "Detailed", whatever the launcher started it with
 (also when started with `run.cmd`).
+"Safe GPU mode" (off by default) prevents the crashes and blue screens that come from the graphics card
+hanging ("device lost", the screen going black while the graphics driver restarts, a VIDEO_TDR_FAILURE blue
+screen), but **the frame rate is about 37% lower**. The emulator normally lets the graphics card overlap
+Demon's Souls' compute work; in this mode it runs the steps one after another. On a laptop RTX 3080 (driver
+566.07) that had these hangs, 3 of 4 runs through Boletaria hung without it and none of 3 with it, at 17 fps
+instead of 27. It does not help the MEMORY_MANAGEMENT blue screens of a full RAM (see RAM under System
+requirements). Leave it off when the game runs without such crashes; a current graphics driver can help as well.
+(With `run.cmd` or `run-windows.ps1`: `-Set KYTY_COMPUTE_CHAIN=0`.)
 Its settings and language list follow the KytyPS5 launcher (`src/launcher` in the source, by the
 KytyPS5 developers).
 
@@ -215,11 +223,18 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 ## Known issues
 
 - It crashes now and then.
+- On some PCs the graphics card hangs ("device lost", the screen goes black and the driver restarts, or a
+  VIDEO_TDR_FAILURE blue screen), in a laptop RTX 3080's case within minutes at Boletaria: turn on "Safe GPU
+  mode" in the launcher (see above). The frame rate is then about 37% lower.
 - Sound: 3D sound has no direction, and there is no reverb.
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
+- With DLSS frame generation on, the game may stop at start-up with "Could not create the Vulkan device with DLSS
+  frame generation". A user's fix on an RTX 5080 (issue #45): in Windows Security, App & browser control > Exploit
+  protection > Program settings, add `kyty_emulator.exe` and, under "Randomize memory allocations (Bottom-up ASLR)",
+  tick "Override system settings" and turn it On.
 - Windows may say "Windows protected your PC" (the programs are not signed): click
   "More info → Run anyway". For a zip downloaded from the internet, you can tick "Unblock" in the
   zip file's properties before extracting it.

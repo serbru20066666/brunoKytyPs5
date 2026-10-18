@@ -467,9 +467,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		alloc_info.requiredFlags = 0;
 		alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 	}
+	vk::Result result = vk::Result::eSuccess;
 	const auto create = [&] {
 		vk::Image::CType native_image = VK_NULL_HANDLE;
-		const auto       result       = static_cast<vk::Result>(
+		result                        = static_cast<vk::Result>(
 		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 		                   &alloc_info, &native_image, &image.allocation, nullptr));
 		image.image = native_image;
@@ -485,9 +486,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			const bool created        = create();
 			VmaAllocationInfo allocated {};
 			if (created) vmaGetAllocationInfo(allocator, image.allocation, &allocated);
-			ReportMemoryFallback(created ? "an image is in system memory" : "an image could not be created",
-			                     allocated.size);
-			if (!created) return false;
+			if (created) {
+				ReportMemoryFallback("an image is in system memory", allocated.size);
+			} else {
+				// (Which memory ran out: OUT_OF_HOST_MEMORY is the system's commit, OUT_OF_DEVICE_MEMORY the GPU's.)
+				const auto what = "an image could not be created (" + vk::to_string(result) + ")";
+				ReportMemoryFallback(what.c_str(), 0);
+				return false;
+			}
 		}
 	}
 
