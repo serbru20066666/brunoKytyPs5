@@ -1,4 +1,4 @@
-{
+﻿{
   "checkpoint": "stage1-20260927",
   "environment": {
     "KYTY_SHADER_WARMUP": "1",
@@ -14,7 +14,7 @@
     "KYTY_BINDING_SCRATCH": "1",
     "KYTY_DRAW_RUN_RANGES": "1",
     "KYTY_BUFFER_RESIDENCY": "1",
-    "KYTY_COPY_FEEDBACK": "1",
+    "KYTY_COPY_FEEDBACK": "0",
     "KYTY_ASYNC_LOD_STATS": "1",
     "KYTY_BACKING_READ": "1",
     "KYTY_STREAM_UPLOAD": "1",

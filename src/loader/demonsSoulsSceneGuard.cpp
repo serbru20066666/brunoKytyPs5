@@ -176,6 +176,12 @@ std::vector<ChildLoop> FindChildLoops(const Program& program) {
 //   mov rdx, [rax+0x50]; mov rcx, [rax+0x58]; mov [rcx+0x50], rdx; mov rax, [rax+0x50]; test rax, rax; je; mov [rax+0x58], rcx
 constexpr const char* UnlinkCode = "48 8b 50 50 48 8b 48 58 48 89 51 50 48 8b 40 50 48 85 c0 74 ?? 48 89 48 58";
 constexpr uint32_t    UnlinkMoved = 8; // mov rcx, [rax+0x58]; mov [rcx+0x50], rdx
+// A test of an object's count before the prologue (01.005.000 eboot+0x895820, PPSA01342): xor eax, eax; cmp dword
+// [rdi + 0x5c], 0; jle to its ret (0, nothing to do); then the prologue. A job worker called it on a null object while
+// the world loaded (eboot+0x895822 reading 0x5c, 10-18, three times on an RX 6800 XT: the sessions closed). A null
+// object has a count of none: 0, as for a count <= 0.
+constexpr const char* CountTest  = "31 c0 83 7f 5c 00 7e ?? 55 48 89 e5 41 56 53 48 83 7f 20 00 48 89 fb 75";
+constexpr uint32_t    CountMoved = 8; // the xor, the cmp and the jle
 
 uint64_t              g_base = 0;
 std::atomic<uint32_t> g_skips {0};
@@ -334,7 +340,9 @@ void Install(Program* program) {
 	for (const auto at: GuestCode::Find(*program, GuestCode::Pattern(Dispatch), 4))
 		if (std::memcmp(reinterpret_cast<const void*>(at), Prologue.data(), Prologue.size()) == 0) dispatches.push_back(at);
 	if (dispatches.empty()) std::printf("Demon's Souls scene guard: no event dispatch of a known build found; retaining their guest code\n");
-	if (!traversals && loops.empty() && unlink == 0 && dispatches.empty()) return;
+	uint64_t count_test = 0;
+	if (const auto found = GuestCode::FindUnique(*program, GuestCode::Pattern(CountTest))) count_test = *found;
+	if (!traversals && loops.empty() && unlink == 0 && dispatches.empty() && count_test == 0) return;
 	const auto requested = program->base_vaddr + CaveOffset;
 	const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    requested, PageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_scene_guard", true);
@@ -392,6 +400,43 @@ void Install(Program* program) {
 	std::vector<const uint8_t*> dispatch_stubs;
 	for (const auto entry: dispatches)
 		dispatch_stubs.push_back(null_stub(entry, Empty::Zero));
+	// The count test: a null object printed (as a null node is) and 0 returned, else the test as the guest has it.
+	const uint8_t* count_stub = nullptr;
+	if (count_test != 0) {
+		const auto* code = reinterpret_cast<const uint8_t*>(count_test);
+		Xbyak::Label null_object, none;
+		c.align(16);
+		count_stub = c.getCurr();
+		c.xor_(eax, eax);
+		c.test(rdi, rdi);
+		c.jz(null_object, Xbyak::CodeGenerator::T_NEAR);
+		c.db(code + 2, 4); // cmp dword [rdi + 0x5c], 0
+		c.jle(none);
+		c.jmp(reinterpret_cast<const void*>(count_test + CountMoved));
+		c.L(none);
+		c.ret();
+		c.L(null_object);
+		c.pushfq();
+		for (const auto& reg: {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11})
+			c.push(reg);
+		c.mov(rsi, ptr[rsp + 80]); // the return address
+		c.mov(rdi, count_test - program->base_vaddr);
+		c.mov(rdx, rbx);
+		c.mov(rcx, r14);
+		c.mov(r8, r12);
+		c.mov(r9, r15);
+		c.sub(rsp, 520); // entry rsp is 8 mod 16: 80 + 520 bytes align it for FXSAVE
+		c.db(save_fp, sizeof(save_fp));
+		c.mov(rax, reinterpret_cast<uint64_t>(&Skipped));
+		c.call(rax);
+		c.fxrstor64(ptr[rsp]);
+		c.add(rsp, 520);
+		for (const auto& reg: {r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
+			c.pop(reg);
+		c.popfq();
+		c.xor_(eax, eax);
+		c.ret();
+	}
 	// A children loop: the child's load, a null child continues with the next one, else the moved instruction and back.
 	std::vector<const uint8_t*> loop_stubs;
 	for (const auto& loop: loops) {
@@ -492,6 +537,7 @@ void Install(Program* program) {
 	if (unlink != 0) patch(unlink, unlink_stub, UnlinkMoved);
 	for (size_t i = 0; i < dispatches.size(); i++)
 		patch(dispatches[i], dispatch_stubs[i], 5);
+	if (count_test != 0) patch(count_test, count_stub, CountMoved);
 	if (traversals) {
 		std::string at;
 		for (const auto entry: entries) {
@@ -512,6 +558,9 @@ void Install(Program* program) {
 	for (const auto entry: dispatches)
 		std::printf("Demon's Souls scene guard: installed (the event dispatch at eboot+0x%llx skips a null object)\n",
 		            static_cast<unsigned long long>(entry - program->base_vaddr));
+	if (count_test != 0)
+		std::printf("Demon's Souls scene guard: installed (the count test at eboot+0x%llx returns 0 for a null object)\n",
+		            static_cast<unsigned long long>(count_test - program->base_vaddr));
 #endif
 }
 } // namespace Loader::DemonsSoulsSceneGuard
