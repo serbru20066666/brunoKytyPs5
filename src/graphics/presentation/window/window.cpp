@@ -934,6 +934,7 @@ void WindowContext::UpdateTitle(bool new_frame) {
 	                             Common::Timer::QueryPerformanceFrequency(), new_frame)) {
 		return;
 	}
+	SetFpsOverlayRates(frame_statistics.FrameRate(), frame_statistics.PresentRate());
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];

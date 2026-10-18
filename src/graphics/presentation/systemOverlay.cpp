@@ -584,6 +584,21 @@ void ShutdownSystemOverlayInput() {
 	g_input_window = nullptr;
 }
 
+static std::atomic<double> g_fps_game {0.0}, g_fps_presents {0.0};
+
+bool FpsOverlayEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FPS_HUD");
+		return value != nullptr && *value != '\0' && *value != '0';
+	}();
+	return enabled;
+}
+
+void SetFpsOverlayRates(double game_fps, double present_fps) noexcept {
+	g_fps_game.store(game_fps, std::memory_order_relaxed);
+	g_fps_presents.store(present_fps, std::memory_order_relaxed);
+}
+
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
@@ -1584,6 +1599,35 @@ struct SystemOverlay::Impl {
 			SetSettingsOpen(false);
 		}
 	}
+	// The frame rate, one small line at the top right: the game's frames, and with frame generation the frames shown.
+	void DrawFps(vk::Extent2D frame_extent) {
+		const double game     = g_fps_game.load(std::memory_order_relaxed);
+		const double presents = g_fps_presents.load(std::memory_order_relaxed);
+		if (game <= 0.0) return;
+		char text[64];
+		if (presents > game * 1.2) {
+			std::snprintf(text, sizeof(text), "%.0f fps reales  |  %.0f con generacion", game, presents);
+		} else {
+			std::snprintf(text, sizeof(text), "%.0f fps", game);
+		}
+		const float unit = std::max(static_cast<float>(frame_extent.height) / 1080.0f, 0.5f);
+		ImGui::SetNextWindowPos({static_cast<float>(frame_extent.width) - 28.0f * unit, static_cast<float>(frame_extent.height) * 0.10f},
+		                        ImGuiCond_Always, {1.0f, 0.0f});
+		ImGui::SetNextWindowBgAlpha(0.45f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {12.0f * unit, 6.0f * unit});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * unit);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+		                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+		                                   ImGuiWindowFlags_NoFocusOnAppearing;
+		ImGui::Begin("##FpsHud", nullptr, flags);
+		ImGui::PushFont(nullptr, 22.0f * unit);
+		ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", text);
+		ImGui::PopFont();
+		ImGui::End();
+		ImGui::PopStyleVar(3);
+	}
+
 	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
@@ -1710,7 +1754,7 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !g_precompile_active.load(std::memory_order_acquire)) {
+		    !g_precompile_active.load(std::memory_order_acquire) && !FpsOverlayEnabled()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1754,6 +1798,10 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now);
+		if (FpsOverlayEnabled() && !g_splash_active.load(std::memory_order_acquire) &&
+		    !g_precompile_active.load(std::memory_order_acquire)) {
+			DrawFps(frame_extent);
+		}
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

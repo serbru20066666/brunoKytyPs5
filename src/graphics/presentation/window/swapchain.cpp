@@ -1761,7 +1761,7 @@ bool Presenter::Impl::PresentOnce(bool new_frame, float generate_ms) {
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			    (overlay_visual.active || FpsOverlayEnabled()) && swapchain.PrepareSystemOverlay();
 			vk::Image generated_image = nullptr;
 			if (generate_ms > 0.0f) {
 				// The frame is brought down through its mip chain as presentation does, and the

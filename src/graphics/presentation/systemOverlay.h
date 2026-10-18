@@ -32,6 +32,10 @@ void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
+// KYTY_FPS_HUD=1: the frame rate in one small line at the top right of the picture, drawn with each present (not a
+// reason to present: it does not keep the overlay active). With frame generation, the frames shown too.
+bool                     FpsOverlayEnabled() noexcept;
+void                     SetFpsOverlayRates(double game_fps, double present_fps) noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);
 
