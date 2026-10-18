@@ -497,7 +497,9 @@ struct Presenter::Impl {
 	void UpdateStatus(std::chrono::steady_clock::time_point now) {
 		const auto progress = renderer.GetPipelineCache().GetPrefetchProgress();
 		hud.status.clear();
-		if (progress.total == 0) {
+		// Only with the performance overlay on (F8): the background preparation does not stop the game, and its line
+		// over every launch only got in the way.
+		if (progress.total == 0 || PerfOverlay::Level() == 0) {
 			return;
 		}
 		std::array<char, 128> line {};
