@@ -1,4 +1,4 @@
-﻿﻿# Builds the packages of the PS5 ports: <Game>.exe (brunoPortLauncher, with the game's icon and name), its picture,
+﻿# Builds the packages of the PS5 ports: <Game>.exe (brunoPortLauncher, with the game's icon and name), its picture,
 # juego.ini, LEEME.txt, LICENCIA.txt and the hidden "motor" folder with the engine, its caches and (if asked) saves.
 # Usage: empaquetar_ports_ps5.ps1 -Juego DemonsSouls|FC27|Astro -Destino <folder> [-ConPartidas] [-Publico [-Zip <file>]]
 # -Publico: for a release: a neutral icon and no picture (no publisher art), no saves, no caches, no seed files (they
@@ -96,7 +96,9 @@ if ($Juego -eq 'DemonsSouls') {
 	Copiar "$kyty\assets" "$motor\assets"
 	$serie = $j.Series
 	if (!$Publico) { Copiar "$portable\_PipelineCache" "$motor\_PipelineCache" @("$serie.shaders", "$serie.bin", "$serie.pipelines") }
-	if ($Juego -eq 'Astro') { Copiar "$portable\_Patches" "$motor\_Patches" @('PPSA01325*.json') }
+	# ASTRO's PLAYROOM's resolution patches: the played install's, else the repository's.
+	$parches = if (Test-Path "$portable\_Patches") { "$portable\_Patches" } else { "$kytyRepo\patches" }
+	if ($Juego -eq 'Astro') { Copiar $parches "$motor\_Patches" @('PPSA01325*.json') }
 	if ($ConPartidas) {
 		Copiar "$portable\_SaveData\$serie" "$motor\_SaveData\$serie"
 		if (Test-Path "$portable\_DownloadData\$serie") { Copiar "$portable\_DownloadData\$serie" "$motor\_DownloadData\$serie" }
