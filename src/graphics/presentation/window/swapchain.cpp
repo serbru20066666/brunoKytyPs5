@@ -564,7 +564,7 @@ struct Presenter::Impl {
 			// presents (those it got, each with its generated ones) are, and the game's rate is below it.
 			const double   game     = PerfOverlay::Summarize(seconds).fps;
 			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
-			std::array<char, 32>  title {};
+			std::array<char, 64>  title {};
 			std::array<char, 128> detail {};
 			double fsr_real = 0.0, fsr_shown = 0.0;
 			if (presents > 1) {
