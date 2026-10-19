@@ -1199,7 +1199,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.programs);
 	if (pipeline.pipeline == nullptr) {
 		LOGF("ExecuteDraw: pipeline creation failed, skipping draw %s (indexed=%d)\n",
-		     draw.Name().data(), draw.IsIndexed() ? 1 : 0);
+		     draw.Name(), draw.IsIndexed() ? 1 : 0);
 		ResetBindings();
 		return;
 	}
