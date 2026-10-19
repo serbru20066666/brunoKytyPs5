@@ -991,6 +991,23 @@ void Disconnect(int id) {
 		}
 	}
 	g_controller->Disconnect(id);
+	// Player 1 without a gamepad while a further player has one: that gamepad becomes player 1's (a controller swap),
+	// and its player signs out.
+	const int active = g_controller->GetActiveControllerId();
+	if (active == HOST_INPUT_CONTROLLER_ID || active == -1) {
+		Common::LockGuard lock(g_player_mutex);
+		for (int player = 1; player < MAX_PLAYERS; player++) {
+			const int pad = g_player_pad[player].load(std::memory_order_acquire);
+			if (pad != -1) {
+				g_players[player]->Disconnect(pad);
+				g_player_pad[player].store(-1, std::memory_order_release);
+				g_user_events.push_back({false, PlayerUserId(player)});
+				g_controller->Connect(pad);
+				std::printf("Controller %d: now player 1's\n", pad);
+				break;
+			}
+		}
+	}
 }
 
 void SetButton(int id, uint32_t button, bool down) {
