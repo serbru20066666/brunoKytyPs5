@@ -381,7 +381,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
-	if (result != vk::Result::eSuccess) {
 		LOGF("CommandScheduler: vkQueueSubmit returned %s, continuing gracefully\n",
 		     vk::to_string(result).c_str());
 	}
