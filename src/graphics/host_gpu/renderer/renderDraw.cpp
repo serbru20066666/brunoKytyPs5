@@ -374,6 +374,8 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		line_width = 1.0f;
 	}
 	dynamic_state.SetLineWidth(line_width);
+	const auto&      blend = ctx.GetBlendColor();
+	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	dynamic_state.SetBlendConstants(blend_constants);
 #if defined(__APPLE__)
 	// Without a depth attachment the test is a no-op per the Vulkan spec, but MoltenVK/Metal
