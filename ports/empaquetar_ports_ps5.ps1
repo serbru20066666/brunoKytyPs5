@@ -6,7 +6,7 @@
 # A destination that exists is moved aside first (nothing is deleted).
 param([Parameter(Mandatory)][ValidateSet('DemonsSouls', 'FC27', 'Astro')][string]$Juego,
       [Parameter(Mandatory)][string]$Destino, [switch]$ConPartidas, [string]$Version = '1.0.0', [switch]$Publico,
-      [string]$Zip = '')
+      [string]$Zip = '', [string]$Instalacion = '')
 $ErrorActionPreference = 'Stop'
 # brunoKytyPs5's ports folder, or the folder with brunoKytyPs5, brunoPortLauncher and kytyDemonsSouls side by side.
 $enRepo   = Test-Path "$PSScriptRoot\launcher\CMakeLists.txt"
@@ -27,6 +27,8 @@ $portable = $kytyRepo
 $buscarExtra = @{}
 $entornoLocal = @{}
 if (Test-Path "$PSScriptRoot\empaquetar_local.ps1") { . "$PSScriptRoot\empaquetar_local.ps1" }
+# -Instalacion: another install to take the saves and caches from (the usual one may be on a disk not connected).
+if ($Instalacion) { $portable = $Instalacion }
 . "$PSScriptRoot\recursos_exe.ps1"
 
 function Copiar([string]$desde, [string]$a, [string[]]$archivos = @('*')) {
