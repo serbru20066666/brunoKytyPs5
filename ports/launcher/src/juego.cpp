@@ -81,19 +81,19 @@ std::vector<Opcion> OpcionesDe(const std::string& perfil) {
 	std::vector<Opcion> o;
 	if (perfil == "demons_souls") {
 		o.push_back(Lista("resolucion", "Resolución de salida", "El tamaño de la imagen final (la interfaz del juego es 4K).",
-		                  kResoluciones, "auto", "auto"));
+		                  kResoluciones, "2560x1440", "2560x1440"));
 		o.push_back(Interruptor("pantalla_completa", "Pantalla completa", "F11 o Alt+Intro la cambian en el juego.", true, true));
 		o.push_back(Lista("render", "Resolución 3D",
 		                  "La altura a la que el juego dibuja el 3D antes de escalarlo. Más baja: más rápida donde manda la "
 		                  "tarjeta gráfica, menos nítida.",
 		                  {{"1440 (como PS5)", "1440"}, {"1296", "1296"}, {"1152", "1152"}, {"1080", "1080"}, {"900", "900"}},
-		                  "1440", "1440"));
+		                  "1080", "1080"));
 		o.push_back(Lista("calidad", "Calidad gráfica",
 		                  "Baja y Mínima acortan sombras y simplifican lo lejano: ayudan donde manda el procesador.",
 		                  {{"Estándar (como PS5)", "standard"}, {"Baja", "low"}, {"Mínima", "lowest"}}, "standard", "standard"));
 		o.push_back(Interruptor("generacion", "Generación de cuadros (FSR 3)",
 		                        "Dobla los cuadros que se muestran con AMD FSR 3. Más fluido; la respuesta a los mandos no mejora.",
-		                        false, true, "amd_fidelityfx_vk.dll"));
+		                        true, true, "amd_fidelityfx_vk.dll"));
 		o.push_back(Interruptor("fps120", "Hasta 120 fps",
 		                        "Deja que el juego pase de 60 donde el equipo puede. Los vídeos y menús siguen a 60.", false, false));
 		o.push_back(Interruptor("vsync", "Sincronización vertical", "Sin cortes en la imagen; puede añadir algo de retardo.", false,
@@ -119,16 +119,16 @@ std::vector<Opcion> OpcionesDe(const std::string& perfil) {
 		                        false, true));
 		o.push_back(Lista("idioma", "Idioma del juego", "", Idiomas(), "20", "20"));
 	} else if (perfil == "astro_playroom") {
-		o.push_back(Lista("resolucion", "Resolución de salida", "El tamaño de la imagen final.", kResoluciones, "auto", "auto"));
+		o.push_back(Lista("resolucion", "Resolución de salida", "El tamaño de la imagen final.", kResoluciones, "2560x1440", "2560x1440"));
 		o.push_back(Interruptor("pantalla_completa", "Pantalla completa", "", true, true));
 		o.push_back(Lista("parche", "Resolución interna",
 		                  "La resolución a la que dibuja el juego (parches del juego, sin iluminación global por trazado de "
 		                  "rayos). 1440p mantiene los fps más estables que 4K.",
 		                  {{"1440p", "PPSA01325_1440p.json"}, {"1080p", "PPSA01325_1080p.json"}, {"4K", "PPSA01325_4K.json"},
 		                   {"Nativa", "PPSA01325.json"}},
-		                  "PPSA01325_1440p.json", "PPSA01325_1440p.json"));
+		                  "PPSA01325_1080p.json", "PPSA01325_1080p.json"));
 		o.push_back(Interruptor("fsr", "Escalado FSR", "Escala la imagen interna a toda la pantalla con AMD FSR.", true, true));
-		o.push_back(Interruptor("generacion", "Generación de cuadros", "Cuadros intermedios generados: más fluido.", false, false));
+		o.push_back(Interruptor("generacion", "Generación de cuadros", "Cuadros intermedios generados: más fluido.", true, true));
 		o.push_back(Interruptor("vsync", "Sincronización vertical", "", false, false));
 		o.push_back(Interruptor("nucleos", "Solo núcleos de rendimiento",
 		                        "El juego en los núcleos rápidos del procesador y con prioridad alta.", true, true));
