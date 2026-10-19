@@ -493,9 +493,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline_layout == nullptr) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout FAILED (%s).\n", vk::to_string(result).c_str());
+		if (tess_control_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+		}
+		if (tess_eval_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+		}
+		pipeline.pipeline = nullptr;
+		return;
+	}
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -571,15 +579,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
-
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	}
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+	}
+	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		LOGF("PipelineTrace: vkCreateGraphicsPipelines FAILED (%s). Skipping pipeline creation to allow execution to continue.\n",
+		     vk::to_string(result).c_str());
+		pipeline.pipeline = nullptr;
+		return;
 	}
 }
 
@@ -623,9 +633,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                                                  &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline_layout == nullptr) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS FAILED (%s).\n", vk::to_string(result).c_str());
+		pipeline.pipeline = nullptr;
+		return;
+	}
 
 	vk::ComputePipelineCreateInfo info {};
 	info.stage             = comp_shader_stage_info;
@@ -640,9 +652,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		LOGF("PipelineTrace: vkCreateComputePipelines FAILED (%s). Skipping pipeline creation.\n",
+		     vk::to_string(result).c_str());
+		pipeline.pipeline = nullptr;
+		return;
+	}
 }
 
 } // namespace Libs::Graphics

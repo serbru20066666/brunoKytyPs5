@@ -1197,6 +1197,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	if (pipeline.pipeline == nullptr) {
+		LOGF("ExecuteDraw: pipeline creation failed, skipping draw %s (indexed=%d)\n",
+		     draw.Name().data(), draw.IsIndexed() ? 1 : 0);
+		ResetBindings();
+		return;
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,

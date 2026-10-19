@@ -1045,12 +1045,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	if (cached->pipeline == nullptr) {
+		LOGF("PipelineCache: GetGraphicsPipeline failed for VS=%" PRIu64 " PS=%" PRIu64 ", caching null pipeline to skip gracefully.\n",
+		     vs_id, ps_id);
+	}
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
-	CheckpointDriverCache();
+	if (iter->second->pipeline != nullptr) {
+		CheckpointDriverCache();
+	}
 
 	return *iter->second;
 }
@@ -1080,12 +1084,16 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		                       m_driver_cache);
 	}
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	if (cached->pipeline == nullptr) {
+		LOGF("PipelineCache: GetComputePipeline failed for CS=%" PRIu64 ", caching null pipeline to skip gracefully.\n",
+		     compute_program.id);
+	}
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	CheckpointDriverCache();
+	if (iter->second->pipeline != nullptr) {
+		CheckpointDriverCache();
+	}
 
 	return *iter->second;
 }
