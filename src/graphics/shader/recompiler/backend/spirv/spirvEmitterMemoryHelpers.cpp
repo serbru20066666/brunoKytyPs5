@@ -243,7 +243,6 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
 #endif
-#endif
 	return access;
 }
 
