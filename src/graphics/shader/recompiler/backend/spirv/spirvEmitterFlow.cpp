@@ -658,11 +658,20 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		state.builder.AddFunction(
+		    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+		    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
+		                          spv::MemorySemanticsImageMemoryMask));
+		return;
+	}
+#endif
 	state.builder.AddFunction(
 	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
 	    ConstantU32(state, spv::ScopeDevice),
 	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
-	                          spv::MemorySemanticsImageMemoryMask));
+		                          spv::MemorySemanticsImageMemoryMask));
 }
 
 void EmitDataCacheInvalidate(EmitterState& state) {
@@ -769,6 +778,11 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
+#if defined(__APPLE__)
+	if (ctx.state.program.stage == ShaderType::Vertex) {
+		return predicate;
+	}
+#endif
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
 	                              TypeBool(ctx.state), result,

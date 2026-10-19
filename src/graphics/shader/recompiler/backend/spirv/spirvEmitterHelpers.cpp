@@ -232,6 +232,11 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		return ConstantBool(state, true);
+	}
+#endif
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));

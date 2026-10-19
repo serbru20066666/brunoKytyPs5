@@ -470,6 +470,20 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto ballot_type = TypeU32Vector(state, 4);
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		const auto pred_id = other_half == nullptr || half == 0 ? Def(predicate)
+		                                                        : other_half->Def(predicate);
+		const auto pred_u32 = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), pred_u32, pred_id,
+		                          ConstantU32(state, 1), ConstantU32(state, 0));
+		const auto ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot,
+		                          pred_u32, ConstantU32(state, 0),
+		                          ConstantU32(state, 0), ConstantU32(state, 0));
+		return ballot;
+	}
+#endif
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
@@ -492,6 +506,11 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		return ConstantU32(state, 0);
+	}
+#endif
 	if (other_half == nullptr) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
@@ -518,6 +537,11 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		return Arg(inst, index);
+	}
+#endif
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
