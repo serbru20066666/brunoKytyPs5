@@ -81,6 +81,7 @@ struct GraphicContext {
 	// KYTY_READBACK_QUEUE (set at device creation): a transfer-only queue for guest readback
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
+	uint32_t                           readback_queue_index = 0; // its index in the family (KYTY_READBACK_FAMILY)
 	vk::Queue                          readback_queue  = nullptr;
 	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
 	// driver can block a present in the kernel until earlier GPU work on its queue is done;

@@ -654,7 +654,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priorities[3] = {1.0f, 1.0f, 1.0f};
+	// (One priority per queue of a family: up to the graphics family's main, present, compute, readback and FSR 3 queues.)
+	const float               queue_priorities[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
@@ -686,34 +687,74 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		}
 	}
 #endif
+	graphics.readback_queue_index = 0;
 	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
 	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
 		uint32_t family_count = 0;
 		physical_device.getQueueFamilyProperties(&family_count, nullptr);
 		std::vector<vk::QueueFamilyProperties> families(family_count);
 		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		// KYTY_READBACK_FAMILY: transfer (default), a transfer-only family (the copy engine); compute, a compute family
+		// without graphics; graphics, one more queue of the graphics family. AMD's transfer-only family is its SDMA
+		// engine: on Windows each small copy there waits long to start, and the guest thread that asked waits with it.
+		const char*          wanted        = std::getenv("KYTY_READBACK_FAMILY");
+		const std::string    kind          = wanted != nullptr && wanted[0] != '\0' ? wanted : "transfer";
 		const vk::QueueFlags transfer_only = vk::QueueFlagBits::eTransfer | vk::QueueFlagBits::eSparseBinding;
-		for (uint32_t family = 0; family < family_count; ++family) {
-			const auto flags = families[family].queueFlags;
-			if (family != queue_family && families[family].queueCount != 0 &&
-			    (flags & vk::QueueFlagBits::eTransfer) && (flags & ~transfer_only) == vk::QueueFlags {}) {
-				graphics.readback_family                         = family;
-				queue_create_infos[1].queueFamilyIndex           = family;
-				queue_create_count                               = 2;
-				LOGF("\treadback queue family %u\n", family);
-				break;
+		if (kind == "graphics") {
+			const uint32_t index = queue_create_infos[0].queueCount;
+			if (queue_family < family_count && families[queue_family].queueCount > index &&
+			    index < std::size(queue_priorities)) {
+				graphics.readback_family       = queue_family;
+				graphics.readback_queue_index  = index;
+				queue_create_infos[0].queueCount = index + 1;
+			}
+		} else {
+			for (uint32_t family = 0; family < family_count; ++family) {
+				const auto flags = families[family].queueFlags;
+				const bool fits  = kind == "compute"
+				                       ? (flags & vk::QueueFlagBits::eCompute) && !(flags & vk::QueueFlagBits::eGraphics)
+				                       : (flags & vk::QueueFlagBits::eTransfer) && (flags & ~transfer_only) == vk::QueueFlags {};
+				if (family != queue_family && families[family].queueCount != 0 && fits) {
+					graphics.readback_family               = family;
+					queue_create_infos[1].queueFamilyIndex = family;
+					queue_create_count                     = 2;
+					break;
+				}
 			}
 		}
+		if (graphics.readback_family != static_cast<uint32_t>(-1))
+			std::printf("Readback queue: %s family %u, queue %u\n", kind.c_str(), graphics.readback_family,
+			            graphics.readback_queue_index);
+		else
+			std::printf("Readback queue: no %s family: readbacks stay on the graphics queue\n", kind.c_str());
 	}
 
 #if defined(_WIN32)
 	g_fsr3_plan = {};
 	if (Libs::Graphics::Fsr3::Requested() &&
 	    Libs::Graphics::Fsr3::PlanQueues(physical_device, queue_family, queue_create_infos[0].queueCount, g_fsr3_plan)) {
-		queue_create_infos[0].queueCount                   = g_fsr3_plan.graphics_index + 1;
-		queue_create_infos[queue_create_count].queueFamilyIndex = g_fsr3_plan.compute_family;
-		queue_create_infos[queue_create_count].queueCount       = g_fsr3_plan.compute_count;
-		++queue_create_count;
+		queue_create_infos[0].queueCount = g_fsr3_plan.graphics_index + 1;
+		if (queue_create_count == 2 && g_fsr3_plan.compute_family == graphics.readback_family) {
+			// The readback queue's compute family: one create info for it, FSR 3's queues first, the readback queue after.
+			uint32_t family_count = 0;
+			physical_device.getQueueFamilyProperties(&family_count, nullptr);
+			std::vector<vk::QueueFamilyProperties> families(family_count);
+			physical_device.getQueueFamilyProperties(&family_count, families.data());
+			if (families[graphics.readback_family].queueCount > g_fsr3_plan.compute_count) {
+				graphics.readback_queue_index    = g_fsr3_plan.compute_count;
+				queue_create_infos[1].queueCount = g_fsr3_plan.compute_count + 1;
+			} else {
+				// No queue left for the readbacks: FSR 3 keeps the family, the readbacks the graphics queue.
+				std::printf("Readback queue: FSR 3 takes family %u: readbacks stay on the graphics queue\n",
+				            graphics.readback_family);
+				graphics.readback_family         = static_cast<uint32_t>(-1);
+				queue_create_infos[1].queueCount = g_fsr3_plan.compute_count;
+			}
+		} else {
+			queue_create_infos[queue_create_count].queueFamilyIndex = g_fsr3_plan.compute_family;
+			queue_create_infos[queue_create_count].queueCount       = g_fsr3_plan.compute_count;
+			++queue_create_count;
+		}
 	}
 #endif
 
@@ -1592,7 +1633,7 @@ void WindowContext::CreateVulkan() {
 		LOGF("\tcompute queue: family %u index 2\n", queue_family);
 	}
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
-		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, graphic_ctx.readback_queue_index, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
 		DeviceFault::NoteQueue(graphic_ctx.readback_queue, "readback");
 	}
@@ -1734,7 +1775,7 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1))
-		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, graphic_ctx.readback_queue_index, &graphic_ctx.readback_queue);
 	return graphic_ctx.queue != nullptr && graphic_ctx.CreateAllocator();
 }
 
