@@ -720,7 +720,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		if (!m_graphics.mesh_shader_enabled) {
+			static Pipeline dummy_pipeline {};
+			return dummy_pipeline;
+		}
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;

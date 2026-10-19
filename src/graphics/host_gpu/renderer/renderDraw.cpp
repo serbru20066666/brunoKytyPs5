@@ -919,15 +919,17 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	const bool tess_active =
 	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch;
-	if (!state.programs.vertex[0] ||
+	const bool mesh_active = state.vertex_info[0].logical_stage == ShaderType::Mesh;
+	if ((mesh_active && !m_context.GetGraphics().mesh_shader_enabled) ||
+	    !state.programs.vertex[0] ||
 	    (tess_active && (!state.programs.vertex[1] || !state.programs.vertex[2])) ||
 	    (state.ps_active && !state.programs.pixel)) {
-		// A shader needs device features the host lacks (e.g. cull distance); the
+		// A shader needs device features the host lacks (e.g. cull distance or mesh shaders); the
 		// program was dropped before SPIR-V emission, so skip the draw.
 		static std::atomic_uint log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
-			LOGF("Draw %s: shader program uses unsupported device features; skipping\n",
-			     draw.Name());
+			LOGF("Draw %s: shader program uses unsupported device features (mesh=%d); skipping\n",
+			     draw.Name(), mesh_active);
 		}
 		return false;
 	}
