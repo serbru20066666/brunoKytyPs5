@@ -796,6 +796,11 @@ uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.other_half != nullptr) {
 		value = EmitUMin32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
 	}
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		return value;
+	}
+#endif
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce, value);

@@ -217,7 +217,12 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
+#if defined(__APPLE__)
+			if (wave_size == 64u && inst.GetOpcode() == ValueOpcode::UMin32 &&
+			    program.stage != ShaderType::Vertex) {
+#else
 			if (wave_size == 64u && inst.GetOpcode() == ValueOpcode::UMin32) {
+#endif
 				const auto seed = UMinReductionMatcher(block).Match(inst);
 				if (!seed.IsEmpty()) {
 					const auto position = std::find_if(block->begin(), block->end(),
