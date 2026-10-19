@@ -721,8 +721,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	if (mesh_active) {
 		if (!m_graphics.mesh_shader_enabled) {
-			static Pipeline dummy_pipeline {};
-			return dummy_pipeline;
+			return {};
 		}
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
