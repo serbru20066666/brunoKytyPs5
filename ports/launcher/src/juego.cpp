@@ -102,15 +102,15 @@ std::vector<Opcion> OpcionesDe(const std::string& perfil) {
 		                        true));
 		o.push_back(Lista("idioma", "Idioma del juego", "", Idiomas(), "3", "3"));
 	} else if (perfil == "fc27") {
-		o.push_back(Lista("resolucion", "Resolución de salida", "El tamaño de la imagen final.", kResoluciones, "1920x1080",
-		                  "1920x1080"));
+		o.push_back(Lista("resolucion", "Resolución de salida", "El tamaño de la imagen final.", kResoluciones, "2560x1440",
+		                  "2560x1440"));
 		o.push_back(Interruptor("pantalla_completa", "Pantalla completa", "", true, true));
 		o.push_back(Lista("interna", "Resolución del juego",
 		                  "La salida que el juego cree tener. 2160p dibuja hasta 2656x1496 (jugadores nítidos) y necesita 12 GB "
 		                  "de memoria de vídeo; Automática la elige según tu tarjeta.",
-		                  {{"Automática", "3"}, {"1080p", "1"}, {"2160p", "2"}}, "3", "3"));
-		o.push_back(Interruptor("generacion", "Generación de cuadros", "Cuadros intermedios generados: más fluido.", false, false));
-		o.push_back(Interruptor("fsr", "Escalado FSR", "Escala la imagen a la resolución de salida con AMD FSR.", false, false));
+		                  {{"Automática", "3"}, {"1080p", "1"}, {"2160p", "2"}}, "1", "1"));
+		o.push_back(Interruptor("generacion", "Generación de cuadros", "Cuadros intermedios generados: más fluido.", true, true));
+		o.push_back(Interruptor("fsr", "Escalado FSR", "Escala la imagen a la resolución de salida con AMD FSR.", true, true));
 		o.push_back(Interruptor("vsync", "Sincronización vertical", "", false, false));
 		o.push_back(Interruptor("nucleos", "Solo núcleos de rendimiento",
 		                        "El juego en los núcleos rápidos del procesador y con prioridad alta.", true, true));
