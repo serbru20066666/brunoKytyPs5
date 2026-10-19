@@ -1226,7 +1226,37 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+// The garbage collector's dirty buffers whose downloads the GPU finished: their bytes are home now.
+void BufferCache::FinishGcPending() {
+	std::erase_if(m_gc_pending, [this](const GcPending& pending) {
+		if (IsBufferInvalid(pending.id)) {
+			return true;
+		}
+		auto& buffer = m_slot_buffers[pending.id];
+		// Used again (perhaps written) since its download: it stays, GPU-owned as it is.
+		if (buffer.CpuAddress() != pending.address || buffer.lru_tick != pending.lru_tick) {
+			return true;
+		}
+		if (!m_scheduler.IsPublished(pending.tick)) {
+			return false;
+		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
+		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			EXIT("BufferCache: garbage collection retained GPU ownership\n");
+		}
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		g_allocation_counters.game_buffers_collected.fetch_add(1, std::memory_order_relaxed);
+		Unregister(pending.id);
+		m_slot_buffers.erase(pending.id);
+		return true;
+	});
+}
+
 void BufferCache::RunGarbageCollector() {
+	if (!m_gc_pending.empty()) {
+		FinishGcPending();
+	}
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -1251,6 +1281,9 @@ void BufferCache::RunGarbageCollector() {
 		if (dirty && !aggressive) {
 			return false;
 		}
+		if (std::ranges::any_of(m_gc_pending, [id](const GcPending& pending) { return pending.id == id; })) {
+			return false;
+		}
 		if (dirty) {
 			// Pages armed by an in-flight readback publish with the wait below.
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()) &&
@@ -1267,8 +1300,18 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	// Publish all queued downloads before releasing their tracked pages and owners.
+	// Publish all queued downloads before releasing their tracked pages and owners: later, once the GPU is done
+	// with them (a wait here drained the GPU about once a frame in a 2160p FC 27 match, ~4 ms each).
 	const auto completion_tick = m_scheduler.CurrentTick();
+	// KYTY_DEBUG_AB=gcdefer: the old wait in every other window (same-process A/B).
+	static const bool gc_ab   = AbSelected("gcdefer");
+	const bool        gc_wait = gc_ab && AbFeatureOff();
+	if (!gc_wait) {
+		for (const auto id: dirty_buffers) {
+			m_gc_pending.push_back({id, m_slot_buffers[id].CpuAddress(), completion_tick, m_slot_buffers[id].lru_tick});
+		}
+		return;
+	}
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {

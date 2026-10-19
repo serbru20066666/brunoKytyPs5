@@ -1728,7 +1728,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		// it to max_count on its own). Otherwise read as before; an armed page fault catches a
 		// write the tracker missed.
 		static const bool no_gpu_count = std::getenv("KYTY_DEBUG_NO_GPU_INDIRECT_COUNT") != nullptr;
-		if (!no_gpu_count && max_count_or_count > 1 &&
+		// (A single draw too: drawIndirectCount with a maximum of 1 draws it or not, as the count says.)
+		static const bool count1_ab = AbSelected("gpucount1");
+		const uint32_t    min_count = count1_ab && AbFeatureOff() ? 2u : 1u;
+		if (!no_gpu_count && max_count_or_count >= min_count &&
 		    (stride_in_bytes == 0 || stride_in_bytes >= args_size) &&
 		    (buffers.IsRegionGpuModified(count_vaddr, sizeof(uint32_t)) ||
 		     buffers.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t)) ||

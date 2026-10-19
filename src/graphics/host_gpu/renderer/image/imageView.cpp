@@ -4,6 +4,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <cstdio>
+#include <utility>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -339,6 +342,22 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const auto view_layers  = slice_view && levels_valid
 	                              ? std::max(image.extent.depth >> normalized.base_level, 1u)
 	                              : image.layers;
+	// An array view of more layers than the cached image has (FC 27's menus: a 6-layer 2D array asked of a 1-layer
+	// 256x256 BC3 image at the same address) takes the layers there are, instead of ending the game.
+	if (levels_valid && normalized.type == vk::ImageViewType::e2DArray && normalized.base_layer < view_layers &&
+	    normalized.layer_count > view_layers - normalized.base_layer) {
+		static bool reported = false;
+		if (!std::exchange(reported, true)) {
+			std::printf("image view: %u layers asked of an image with %u: clamped (reported once)\n",
+			            normalized.layer_count, view_layers);
+		}
+		normalized.layer_count = view_layers - normalized.base_layer;
+		for (const auto& cached: views) {
+			if (cached.info == normalized) {
+				return cached.view;
+			}
+		}
+	}
 	const bool ranges_valid = levels_valid && normalized.layer_count != 0 &&
 	                          normalized.base_layer < view_layers &&
 	                          normalized.layer_count <= view_layers - normalized.base_layer;

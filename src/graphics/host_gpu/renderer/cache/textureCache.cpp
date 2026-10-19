@@ -34,6 +34,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_set>
+#include <utility>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -1493,6 +1494,11 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	if (!m_dcc_gpu_clear || count == 0) {
 		return false;
 	}
+	// KYTY_DEBUG_AB=dcccpu: the CPU path (--dcc-gpu-clear false) in every other window.
+	static const bool cpu_ab = AbSelected("dcccpu");
+	if (cpu_ab && AbFeatureOff()) {
+		return false;
+	}
 	GpuZones::KeyScope zone_key(m_slot_images[id].info.data.address);
 	std::array<vk::ClearColorValue, DccClearResolver::CodeCount> colors {};
 	uint32_t                                                     code_mask = 0;
@@ -1521,13 +1527,42 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 	// attachment, as a render target the game fast-clears and then samples without drawing to it
 	// first: on the CPU path each such lookup drained the GPU (once a frame near Astro Bot's
 	// crashed ship, waiting about 25 ms behind the frame's heaviest draw).
-	const auto& view = desc.view_info;
-	if ((desc.type != BindingType::RenderTarget && desc.type != BindingType::Texture) ||
-	    desc.info.IsVolume() ||
-	    count > DccClearResolver::MaxSlices || view.base_level != 0 ||
-	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
-	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+	// KYTY_DCC_GPU_ONLY=rt|tex (tests): the GPU check for render targets or for sampled textures only, the CPU path
+	// for the others.
+	static const int gpu_only = [] {
+		const char* value = std::getenv("KYTY_DCC_GPU_ONLY");
+		return value == nullptr ? 0 : std::strcmp(value, "rt") == 0 ? 1 : std::strcmp(value, "tex") == 0 ? 2 : 0;
+	}();
+	if ((gpu_only == 1 && desc.type != BindingType::RenderTarget) || (gpu_only == 2 && desc.type != BindingType::Texture)) {
 		return false;
+	}
+	const auto& view = desc.view_info;
+	// KYTY_DEBUG_DCC_FALLBACK=1: why a view takes the CPU path (which waits for the GPU), once per reason and type.
+	static const bool debug_fallback = std::getenv("KYTY_DEBUG_DCC_FALLBACK") != nullptr;
+	const auto        fallback       = [&](int why) {
+		if (debug_fallback) {
+			static std::array<bool, 64> told {};
+			const auto key = static_cast<size_t>(why * 8 + static_cast<int>(desc.type)) % told.size();
+			if (!std::exchange(told[key], true)) {
+				std::printf("DCC CPU path: reason %d type %d format %d base_level %u count %u volume %d\n", why,
+				            static_cast<int>(desc.type), static_cast<int>(view.format), view.base_level, count,
+				            desc.info.IsVolume() ? 1 : 0);
+			}
+		}
+		return false;
+	};
+	// Storage images too (FC 27's compute passes read and write an R16G16 float image with DCC: ~5% of the render
+	// thread waited for the GPU on the CPU path). KYTY_DEBUG_AB=dccstorage: not them in every other window.
+	static const bool storage_ab = AbSelected("dccstorage");
+	const bool        storage_ok = desc.type == BindingType::Storage && !(storage_ab && AbFeatureOff());
+	if (desc.type != BindingType::RenderTarget && desc.type != BindingType::Texture && !storage_ok) {
+		return fallback(1);
+	}
+	if (desc.info.IsVolume() || count > DccClearResolver::MaxSlices || view.base_level != 0) {
+		return fallback(2);
+	}
+	if (!(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures & vk::FormatFeatureFlagBits::eColorAttachment)) {
+		return fallback(3);
 	}
 	{
 		std::scoped_lock lock {m_lock};
@@ -1535,7 +1570,7 @@ bool TextureCache::MaterializeDccClearOnGpu(ImageId id, const ImageDesc& desc,
 		if (image.depth_id || image.backing.image == nullptr ||
 		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) ||
 		    image_first >= image.backing.layers || count > image.backing.layers - image_first) {
-			return false;
+			return fallback(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment ? 5 : 4);
 		}
 	}
 	m_dcc_gpu_checks++;
@@ -3034,6 +3069,11 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 	}
 	bool                 reclaimed = false;
 	std::vector<ImageId> pending_retirement;
+	// The stencil images of each depth image (depth id -> any of them GPU-modified), from one walk of every image the
+	// first time a depth candidate needs it: a walk per depth candidate took ~6% of the render thread in a 2160p FC 27
+	// match, where the collector runs every frame.
+	std::unordered_map<ImageId, bool> stencils;
+	bool                              stencils_known = false;
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -3068,14 +3108,20 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 				continue;
 			}
 			if (owner->info.IsDepth()) {
-				bool dirty_stencil = false;
-				bool known_stencil = !owner->info.HasStencil();
-				m_slot_images.ForEach([&](ImageId, const Image& associated) {
-					if (associated.depth_id == id) {
-						known_stencil = true;
-						dirty_stencil |= associated.IsGpuModified();
-					}
-				});
+				// KYTY_DEBUG_AB=stencilmap: the old walk per depth candidate in every other window.
+				static const bool stencil_ab = AbSelected("stencilmap");
+				if (!stencils_known || (stencil_ab && AbFeatureOff())) {
+					stencils.clear();
+					m_slot_images.ForEach([&](ImageId, const Image& associated) {
+						if (associated.depth_id) {
+							stencils[associated.depth_id] |= associated.IsGpuModified();
+						}
+					});
+					stencils_known = true;
+				}
+				const auto found         = stencils.find(id);
+				const bool known_stencil = !owner->info.HasStencil() || found != stencils.end();
+				const bool dirty_stencil = found != stencils.end() && found->second;
 				if (dirty_stencil || !known_stencil) {
 					continue;
 				}
@@ -3098,6 +3144,7 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 				pending_retirement.push_back(id);
 			} else {
 				FreeImage(id);
+				stencils_known = false; // (freeing a depth image drops its stencil association)
 			}
 			reclaimed = true;
 			if (m_total_used_memory < release_threshold && aggressive) {

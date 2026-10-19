@@ -23,6 +23,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <fmt/format.h>
@@ -213,7 +214,9 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip(uint32_t micros);
+	bool Flip(uint32_t micros, bool immediate = false);
+	// A flip group is ready to present, or becomes so within `micros` (KYTY_FLIP_IMMEDIATE).
+	bool WaitReady(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
@@ -915,6 +918,27 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+
+		// KYTY_FLIP_IMMEDIATE=1: a frame that becomes ready between two vblanks is presented then, not at the next
+		// vblank (the vblanks, and the game clock that counts them, keep their rate). A game that misses a vblank by
+		// a little no longer waits a whole period: FC 27 drew its frames in 17 or 33 ms, never in between.
+		static const bool immediate = [] {
+			const char* value = std::getenv("KYTY_FLIP_IMMEDIATE");
+			return value != nullptr && value[0] == '1';
+		}();
+		while (immediate && total_wait > 0 && !token.stop_requested() && !m_presenter.IsGuestPaused()) {
+			const auto wait_begin   = Common::Timer::QueryPerformanceCounter();
+			const auto remaining_us = (static_cast<uint64_t>(total_wait) * 1000000u) / frequency;
+			if (remaining_us < 200) {
+				break;
+			}
+			const bool ready   = m_flip_queue.WaitReady(static_cast<uint32_t>(remaining_us - 100));
+			const bool flipped = ready && m_flip_queue.Flip(0, true);
+			total_wait -= static_cast<int64_t>(Common::Timer::QueryPerformanceCounter() - wait_begin);
+			if (ready && !flipped) {
+				break; // A throttled flip: it waits for its vblank.
+			}
+		}
 	}
 }
 
@@ -1192,7 +1216,30 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::WaitReady(uint32_t micros) {
+	m_mutex.Lock();
+	const auto ready = [this] {
+		const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
+		                               [](const auto& r) { return r.group == r.id; });
+		if (owner == m_requests.end()) {
+			return false;
+		}
+		const uint64_t group = owner->id;
+		return std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+		                    [group](const auto& r) { return r.group == group; }) &&
+		       std::none_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
+			       return r.group == group && r.state != RequestState::Ready;
+		       });
+	};
+	if (!ready() && !m_processing) {
+		m_submit_cond_var.WaitFor(&m_mutex, micros);
+	}
+	const bool result = !m_processing && ready();
+	m_mutex.Unlock();
+	return result;
+}
+
+bool FlipQueue::Flip(uint32_t micros, bool immediate) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1238,6 +1285,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
+			// Between vblanks only an unthrottled flip (a flip rate makes the game wait for vblanks on purpose).
+			due &= !immediate || r.cfg->flip_rate == 0;
 		}
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}

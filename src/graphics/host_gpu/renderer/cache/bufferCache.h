@@ -137,6 +137,7 @@ public:
 	[[nodiscard]] bool SynchronizeBdaSelective(const RangeSet& mapped);
 	[[nodiscard]] bool CheckBdaHintInvariant(const RangeSet& mapped);
 	void               RunGarbageCollector();
+	void               FinishGcPending();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -213,6 +214,15 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Dirty buffers the garbage collector downloaded, deleted once the download is published (no full GPU wait);
+	// a buffer used again before that stays. KYTY_DEBUG_AB=gcdefer waits as before in every other window.
+	struct GcPending {
+		BufferId id;
+		uint64_t address;
+		uint64_t tick;
+		uint64_t lru_tick;
+	};
+	std::vector<GcPending> m_gc_pending;
 	uint64_t m_readback_token     = 0;
 	// Tracker pages hit by CPU read faults, with the tick of their latest fault.
 	static constexpr size_t HotReadbackPages = 64;
