@@ -296,10 +296,11 @@ Juego::Orden Juego::OrdenJugar(int pantalla_ancho, int pantalla_alto) const {
 	a += L" --frame-generation " + std::wstring(si("generacion") ? L"true" : L"false");
 	a += L" --fsr-upscaling " + std::wstring(si("fsr") ? L"true" : L"false");
 	if (m_perfil == "fc27") {
-		// Told 1080p it draws for 1080p; told 2160p, up to 2656x1496. Its menus' compute DCC clears only partly clear
-		// at 2160p: the CPU path reads them right.
+		// Told 1080p it draws for 1080p; told 2160p, up to 2656x1496. Its DCC clears on the GPU: the CPU path drained
+		// the GPU ~4 times a frame (22 -> 30 fps in a 2160p match), and its menus draw right since 0.5.7's dispatch
+		// barriers.
 		a += L" --reported-resolution " + Sistema::Ancho(Valor("interna"));
-		a += L" --relaxed-readback false --dcc-gpu-clear false";
+		a += L" --relaxed-readback true";
 	} else if (m_perfil == "astro_playroom") {
 		// Its threads read back what the GPU writes every frame; relaxed readbacks and pipelines compiled aside.
 		a += L" --relaxed-readback true --async-pipelines true --gpu-frames-ahead 2 --label-flush-interval-us 5000";
@@ -308,6 +309,9 @@ Juego::Orden Juego::OrdenJugar(int pantalla_ancho, int pantalla_alto) const {
 	}
 	orden.entorno.insert(orden.entorno.end(), m_entorno.begin(), m_entorno.end());
 	if (si("mostrar_fps")) orden.entorno.push_back({"KYTY_FPS_HUD", "1"});
+	// FC 27: a frame ready between two vblanks flips then (frames took 17 or 33 ms, never in between: 37 fps steady
+	// in a 2160p match with it).
+	if (m_perfil == "fc27") orden.entorno.push_back({"KYTY_FLIP_IMMEDIATE", "1"});
 	orden.argumentos               = a;
 	orden.solo_nucleos_rendimiento = si("nucleos");
 	return orden;
