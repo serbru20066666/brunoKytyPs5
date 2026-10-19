@@ -75,6 +75,11 @@ void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
 int  GetActiveControllerId();
+// Users signed in with a controller: player 1 always, players 2-4 while their gamepad is connected.
+bool IsUserLoggedIn(int user_id);
+int  UserNumber(int user_id);
+int  LoggedInUsers(int* user_ids, int max);
+bool PopUserEvent(bool* login, int* user_id);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

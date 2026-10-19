@@ -1,10 +1,12 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -74,6 +76,14 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 		event->user_id    = Config::GetUserId();
 		return OK;
 	}
+	// Players 2-4: their gamepad was connected or disconnected (libs/controller.cpp).
+	bool login   = false;
+	int  user_id = 0;
+	if (Controller::PopUserEvent(&login, &user_id)) {
+		event->event_type = login ? UserServiceEventTypeLogin : UserServiceEventTypeLogout;
+		event->user_id    = user_id;
+		return OK;
+	}
 
 	return USER_SERVICE_ERROR_NO_EVENT;
 }
@@ -83,22 +93,26 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 
 	EXIT_NOT_IMPLEMENTED(user_id_list == nullptr);
 
-	user_id_list->user_id[0] = Config::GetUserId();
+	user_id_list->user_id[0] = -1;
 	user_id_list->user_id[1] = -1;
 	user_id_list->user_id[2] = -1;
 	user_id_list->user_id[3] = -1;
+	(void)Controller::LoggedInUsers(user_id_list->user_id, 4);
 
 	return OK;
 }
 
 static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t size) {
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 	EXIT_NOT_IMPLEMENTED(size < 5);
 
+	// Players 2-4 are named after player 1 with their number.
 	const auto& user_name = Config::GetUserName();
-	int         s         = snprintf(name, size, "%s", user_name.c_str());
+	const int   number    = Controller::UserNumber(user_id);
+	int         s         = number <= 1 ? snprintf(name, size, "%s", user_name.c_str())
+	                                    : snprintf(name, size, "%s %d", user_name.c_str(), number);
 
 	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);
 
@@ -111,11 +125,11 @@ static KYTY_SYSV_ABI int UserServiceGetUserNumber(int user_id, int32_t* number) 
 	if (number == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
-	*number = 1;
+	*number = std::max(Controller::UserNumber(user_id), 1);
 
 	return OK;
 }
@@ -126,7 +140,7 @@ static KYTY_SYSV_ABI int UserServiceGetGamePresets(int user_id, UserServiceGameP
 	if (presets == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -147,7 +161,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityVibration(int user_id, int32
 	if (vibration == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -163,7 +177,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityTriggerEffect(int      user_
 	if (trigger_effect == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -178,7 +192,7 @@ static KYTY_SYSV_ABI int UserServiceGetAgeLevel(int user_id, uint32_t* age_level
 	if (age_level == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -194,7 +208,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityChatTranscription(int      u
 	if (chat_transcription == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -210,7 +224,7 @@ UserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hol
 	if (press_and_hold_delay == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -226,7 +240,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomEnabled(int      user_id
 	if (zoom_enabled == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -242,7 +256,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomFollowFocus(int      use
 	if (zoom_follow_focus == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 

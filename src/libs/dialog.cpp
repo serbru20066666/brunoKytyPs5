@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -334,7 +335,7 @@ int KYTY_SYSV_ABI SigninDialogOpen(const void* param) {
 	if (p->size != sizeof(SigninDialogParam) || p->reserved[0] != 0 || p->reserved[1] != 0) {
 		return SIGNIN_ERROR_PARAM_INVALID;
 	}
-	if (p->user_id != Config::GetUserId()) {
+	if (!Controller::IsUserLoggedIn(p->user_id)) {
 		return SIGNIN_ERROR_INVALID_USER_ID;
 	}
 	SetDialogStatus(g_signin, SIGNIN_STATUS_RUNNING, lock);
