@@ -524,8 +524,15 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::GlobalInvocationId: type = TypeU32Vector(state, 3); break;
 			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
 			case IR::StageInputKind::TessCoord:
+#if defined(__APPLE__)
 			case IR::StageInputKind::BaryCoordSmooth:
-			case IR::StageInputKind::BaryCoordNoPerspective: type = TypeF32Vector(state, 3); break;
+			case IR::StageInputKind::BaryCoordNoPerspective:
+				continue;
+#else
+			case IR::StageInputKind::BaryCoordSmooth:
+			case IR::StageInputKind::BaryCoordNoPerspective:
+#endif
+				type = TypeF32Vector(state, 3); break;
 			case IR::StageInputKind::FrontFacing: type = TypeBool(state); break;
 			case IR::StageInputKind::Parameter:
 				if (state.program.stage == ShaderType::Vertex ||
@@ -817,11 +824,15 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
 	}
 	const bool fragment_barycentric =
+#if defined(__APPLE__)
+	    false;
+#else
 	    state.program.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
 		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
 	    });
+#endif
 	if (fragment_barycentric) {
 		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");

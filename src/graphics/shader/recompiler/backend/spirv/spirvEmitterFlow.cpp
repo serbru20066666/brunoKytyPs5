@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -43,6 +44,15 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	}
 	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
 	const bool sample = kind == IR::StageInputKind::BaryCoordSmoothSample;
+#if defined(__APPLE__)
+	if (centroid || sample || kind == IR::StageInputKind::BaryCoordSmooth ||
+	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
+		const float coord = (component == 0) ? 0.333333f : ((component == 1) ? 0.333333f : 0.333334f);
+		uint32_t bits = 0;
+		std::memcpy(&bits, &coord, sizeof(float));
+		return ConstantU32(state, bits);
+	}
+#endif
 	const auto variable = InputVariableForKind(
 	    state, centroid || sample ? IR::StageInputKind::BaryCoordSmooth : kind);
 	if (variable == 0) {
