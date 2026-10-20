@@ -16,11 +16,6 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
-#if defined(__APPLE__)
-	if (state.program.stage == ShaderType::Vertex) {
-		return source;
-	}
-#endif
 	if (state.lane_count == 2) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
@@ -1583,11 +1578,6 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});
-#if defined(__APPLE__)
-	if (state.program.stage == ShaderType::Vertex) {
-		return atomic;
-	}
-#endif
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
@@ -1717,11 +1707,6 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-#if defined(__APPLE__)
-	if (ctx.state.program.stage == ShaderType::Vertex) {
-		return ctx.Arg(inst, 0);
-	}
-#endif
 	auto&      state   = ctx.state;
 	auto       lane    = EmitSubgroupLocalInvocationId(state);
 	if (state.lane_count == 2) {

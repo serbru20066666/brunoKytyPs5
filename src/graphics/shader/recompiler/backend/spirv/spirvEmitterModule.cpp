@@ -801,30 +801,23 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-#if defined(__APPLE__)
-	const bool subgroup_caps_allowed = state.program.stage != ShaderType::Vertex;
-#else
-	const bool subgroup_caps_allowed = true;
-#endif
-	if (subgroup_caps_allowed) {
-		if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
-		    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
-		    state.program.info.subgroup_shuffle ||
-		    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
-			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
-		}
-		if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
-			state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
-		}
-		if (state.program.info.subgroup_vote) {
-			state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
-		}
-		if (state.program.info.subgroup_shuffle) {
-			state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
-		}
-		if (state.program.info.subgroup_arithmetic) {
-			state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
-		}
+	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
+	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
+	    state.program.info.subgroup_shuffle ||
+	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	}
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	}
+	if (state.program.info.subgroup_vote) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	}
+	if (state.program.info.subgroup_shuffle) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.program.info.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
