@@ -15,6 +15,11 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   bool maintenance8_enabled = false,
                                   bool emit_debug_info = false);
 
+// Bounds guest loop iterations per invocation so a non-terminating loop cannot trip the host GPU
+// watchdog. Enabled by default on Apple (Metal loses the device after repeated hangs).
+void SetLoopIterationGuard(bool enabled);
+bool LoopIterationGuardEnabled();
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */

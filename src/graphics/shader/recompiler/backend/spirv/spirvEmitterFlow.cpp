@@ -44,15 +44,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	}
 	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
 	const bool sample = kind == IR::StageInputKind::BaryCoordSmoothSample;
-#if defined(__APPLE__)
-	if (centroid || sample || kind == IR::StageInputKind::BaryCoordSmooth ||
-	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
-		const float coord = (component == 0) ? 0.333333f : ((component == 1) ? 0.333333f : 0.333334f);
-		uint32_t bits = 0;
-		std::memcpy(&bits, &coord, sizeof(float));
-		return ConstantU32(state, bits);
-	}
-#endif
+
 	const auto variable = InputVariableForKind(
 	    state, centroid || sample ? IR::StageInputKind::BaryCoordSmooth : kind);
 	if (variable == 0) {
@@ -94,6 +86,15 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
+#if defined(__APPLE__)
+		// MSL does not support interpolant<float3> for barycentric_coord. Direct access to
+		// gl_BaryCoordEXT is natively supported by Metal.
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+		                          pointer, variable, ConstantU32(state, component + 1u));
+		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+#else
 		if (centroid || sample) {
 			const auto coordinates = state.builder.AllocateId();
 			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
@@ -117,6 +118,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 			                          pointer, variable, ConstantU32(state, component + 1u));
 			state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
 		}
+#endif
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}
@@ -658,10 +660,20 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
+#if defined(__APPLE__)
+	if (state.program.stage == ShaderType::Vertex) {
+		state.builder.AddFunction(
+		    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+		    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
+		                          spv::MemorySemanticsImageMemoryMask));
+		return;
+	}
+#endif
 	state.builder.AddFunction(
-	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	    ConstantU32(state, spv::ScopeDevice),
 	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
-	                          spv::MemorySemanticsImageMemoryMask));
+		                          spv::MemorySemanticsImageMemoryMask));
 }
 
 void EmitDataCacheInvalidate(EmitterState& state) {
@@ -785,9 +797,26 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
-	return ctx.Shuffle(inst, 0, lane);
+	const auto ballot   = ctx.Ballot(inst.Arg(1));
+	const auto lane     = ctx.FirstLane(ballot);
+	const auto shuffled = ctx.Shuffle(inst, 0, lane);
+#if defined(__APPLE__)
+	// Guest waterfall loops (readfirstlane, compare, mask EXEC) only make progress when the
+	// selected lane observes its own value. Metal's fragment simd_shuffle does not guarantee that
+	// (helper threads), which spins those loops until the GPU watchdog fires, so the selected
+	// lane keeps its own value.
+	if (ctx.state.program.stage == ShaderType::Pixel && ctx.other_half == nullptr) {
+		auto&      state = ctx.state;
+		const auto self  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), self,
+		                          EmitSubgroupLocalInvocationId(state), lane);
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeId(state, inst.Arg(0).GetType()), result, self,
+		                          ctx.Arg(inst, 0), shuffled);
+		return result;
+	}
+#endif
+	return shuffled;
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {

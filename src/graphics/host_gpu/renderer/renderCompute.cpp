@@ -353,6 +353,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		LOGF("GraphicsRenderDispatchDirect: pipeline creation failed, skipping compute dispatch\n");
 		return;
 	}
+	buffer.SetDebugShaders(program.shader_hash, 0);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -491,6 +492,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
+	buffer.SetDebugShaders(program.shader_hash, 0);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

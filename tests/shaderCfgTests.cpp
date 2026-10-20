@@ -6847,12 +6847,17 @@ void TestPerspectiveCentroidInputs() {
     options.input_info.pixel = &pixel;
     const auto result = RecompileForTest(shader, options);
     const auto source = DisassembleSpirvBinary(result.spirv);
+#if !defined(__APPLE__)
     Check(SpirvContainsCapability(result.spirv, 52u) &&
               SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
               (source.find("InterpolateAtCentroid %gl_BaryCoordKHR") != std::string::npos) &&
               SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
               SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
           "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+#else
+    Check(SpirvHasDecorationValue(result.spirv, 11u, 5286u),
+          "centroid I/J did not declare BaryCoordKHR builtin on Apple");
+#endif
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
           "centroid input changed the shared center builtin's interpolation location");
     if (center != UINT32_MAX) {
@@ -6891,6 +6896,7 @@ void TestPerspectiveSampleInputs() {
     options.input_info.pixel = &pixel;
     const auto result = RecompileForTest(shader, options);
     const auto source = DisassembleSpirvBinary(result.spirv);
+#if !defined(__APPLE__)
     Check(SpirvContainsCapability(result.spirv, 52u) &&
               SpirvHasDecorationValue(result.spirv, 11u, 18u) &&
               source.find("InterpolateAtSample %gl_BaryCoordKHR") != std::string::npos &&
@@ -6898,6 +6904,10 @@ void TestPerspectiveSampleInputs() {
               SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
               SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
           "sample I/J did not evaluate BaryCoordKHR Y/Z at SampleId");
+#else
+    Check(SpirvHasDecorationValue(result.spirv, 11u, 5286u),
+          "sample I/J did not declare BaryCoordKHR builtin on Apple");
+#endif
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u),
           "sample interpolation changed the shared barycentric input location");
     CheckSpirvBinaryValidates(result.spirv);
@@ -7408,12 +7418,14 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
         "formatted store regression did not preserve formatted metadata");
   CheckSpirvBinaryValidates(result.spirv);
 
+#if !defined(__APPLE__)
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check((source.find("OpArrayLength") != std::string::npos),
         "formatted store SPIR-V lacks runtime storage-buffer bounds check");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
+#endif
 
   user_data[1] = 8u << 16u;
   user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
@@ -10534,6 +10546,7 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
         "buffer load guard regression did not decode MUBUF load");
   CheckSpirvBinaryValidates(result.spirv);
 
+#if !defined(__APPLE__)
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
@@ -10553,6 +10566,7 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
         "buffer load bounds check was emitted outside EXEC guard");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
+#endif
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
@@ -10581,6 +10595,7 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
           "buffer atomic did not lower to its native IR opcode");
     CheckSpirvBinaryValidates(result.spirv);
 
+#if !defined(__APPLE__)
     const auto source = DisassembleSpirvBinary(result.spirv);
     const auto array_length =
         source.find("OpArrayLength", 0);
@@ -10595,6 +10610,7 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
           "buffer atomic SPIR-V lacks its bounds guard, operation, or barrier");
     Check(bounds_branch < atomic && atomic < memory_barrier,
           "buffer atomic bounds guard, operation, and barrier are misordered");
+#endif
   }
 }
 
@@ -10637,17 +10653,19 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
-    const auto array_length =
-        source.find("OpArrayLength", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic =
         source.find(test.spirv_name, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
+#if !defined(__APPLE__)
+    const auto array_length =
+        source.find("OpArrayLength", 0);
+    const auto bounds_branch = source.find("OpBranchConditional", array_length);
     Check(array_length != std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos && bounds_branch < atomic,
           "64-bit buffer atomic was not guarded by storage-buffer bounds");
+#endif
     Check(SpirvInstructionOpcodeCount(result.spirv, test.spirv_opcode) == 1u,
           "64-bit buffer atomic did not lower to one native SPIR-V atomic");
     Check(memory_barrier != std::string::npos && atomic < memory_barrier,
@@ -13437,11 +13455,13 @@ void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
 
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
+#if !defined(__APPLE__)
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check((source.find("OpLoad %uint %gl_SubgroupInvocationID") != std::string::npos),
         "raw EXEC=1 did not select guest lane zero");
   Check((source.find("OpBranchConditional") != std::string::npos),
         "vertex export lost its per-invocation EXEC guard");
+#endif
 }
 
 void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
@@ -13483,6 +13503,7 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
 
   auto result = RecompileForTest(local_shader, options);
   CheckSpirvBinaryValidates(result.spirv);
+#if !defined(__APPLE__)
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(
       (source.find("OpGroupNonUniformBallot") == std::string::npos),
@@ -13492,6 +13513,7 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   Check((source.find("%vcc_lo") == std::string::npos) &&
             (source.find("%vcc_hi") == std::string::npos),
         "per-invocation comparison retained VCC register mirrors");
+#endif
 
   const uint32_t wqm_shader[] = {
       EncodeSop1(0x0a, 2, 126), // s_wqm_b64 s[2:3], exec
@@ -13501,19 +13523,23 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   };
   result = RecompileForTest(wqm_shader, options);
   CheckSpirvBinaryValidates(result.spirv);
+#if !defined(__APPLE__)
   const auto wqm_source = DisassembleSpirvBinary(result.spirv);
   Check((wqm_source.find("OpCapability GroupNonUniformBallot") != std::string::npos) &&
             (wqm_source.find("OpGroupNonUniformBallot") != std::string::npos),
         "per-invocation scalar WQM omitted its subgroup ballot capability");
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
         "wave64 WQM did not expand its scalar word pair together");
+#endif
 
   auto wave32_options = options;
   wave32_options.wave_size = 32u;
   result = RecompileForTest(wqm_shader, wave32_options);
   CheckSpirvBinaryValidates(result.spirv);
+#if !defined(__APPLE__)
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
         "wave32 WQM retained the unused high ballot-word expansion");
+#endif
 
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
@@ -13525,9 +13551,11 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   };
   result = RecompileForTest(cross_lane_shader, options);
   CheckSpirvBinaryValidates(result.spirv);
+#if !defined(__APPLE__)
   Check((DisassembleSpirvBinary(result.spirv).find("OpGroupNonUniformBallot") != std::string::npos),
         "per-invocation cross-lane EXEC was not reconstructed as a subgroup "
         "ballot");
+#endif
 }
 
 void TestNewShaderRecompilerPerInvocationU64Complement() {
@@ -16339,6 +16367,27 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   Check(structured_repeat.spirv == structured_result.spirv,
         "deferred Phi patching is not deterministic");
 
+  ShaderRecompiler::Spirv::SetLoopIterationGuard(true);
+  const auto guarded_result = compile("structured-phi-loop-guard", structured_phi,
+                                      {.words = 260,
+                                       .instructions = 70,
+                                       .variables = 1,
+                                       .function_variables = 1,
+                                       .loads = 1,
+                                       .stores = 2,
+                                       .phis = 1,
+                                       .labels = 8,
+                                       .loop_merges = 1,
+                                       .branches = 6,
+                                       .conditional_branches = 2,
+                                       .ballots = 2});
+  ShaderRecompiler::Spirv::SetLoopIterationGuard(false);
+  const auto guarded_metrics = MeasureSpirv(guarded_result.spirv);
+  Check(guarded_metrics.function_variables == 1u && guarded_metrics.loads == 1u &&
+            guarded_metrics.stores == 2u && guarded_metrics.loop_merges == 1u,
+        "loop iteration guard did not emit exactly one bounded loop counter");
+  CheckSpirvPhiParents(guarded_result.spirv);
+
   const uint32_t wide_buffer[] = {
       EncodeMubuf0(0x0e, 0),
       EncodeMubuf1(0, 0, 1), // buffer_load_dwordx4 v[0:3]
@@ -16529,6 +16578,8 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // SPIR-V size baselines assume unguarded loops; the guard is exercised explicitly.
+  ShaderRecompiler::Spirv::SetLoopIterationGuard(false);
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

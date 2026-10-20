@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -30,6 +31,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_pending_shader_writes = {};
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -115,6 +117,10 @@ void CommandBuffer::EndRendering() const {
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	if (m_pending_shader_writes) {
+		ShaderWriteBarrier(Handle(), m_pending_shader_writes);
+		m_pending_shader_writes = {};
+	}
 }
 
 } // namespace Libs::Graphics

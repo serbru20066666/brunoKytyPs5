@@ -218,13 +218,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		vk::PhysicalDeviceVulkan12Features features12 {};
 		vk::PhysicalDeviceVulkan11Features features11 {};
 		vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
-#if defined(__APPLE__)
-		features12.pNext = &depth_clip_control;
-#else
 		vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
 		fragment_barycentric.pNext = &depth_clip_control;
 		features12.pNext           = &fragment_barycentric;
-#endif
 		robustness2.pNext      = features12.pNext;
 		features11.pNext       = &robustness2;
 		features12.pNext       = &features11;
@@ -726,9 +722,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// }
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
-#if defined(__APPLE__)
-	robustness2.pNext = &features12;
-#else
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
 	if (barycentric_supported) {
 		fragment_barycentric.pNext                     = &features12;
@@ -737,7 +730,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	} else {
 		robustness2.pNext = &features12;
 	}
-#endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
@@ -1150,9 +1142,7 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-#if !defined(__APPLE__)
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-#endif
 		}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

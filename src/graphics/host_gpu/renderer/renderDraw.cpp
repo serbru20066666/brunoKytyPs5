@@ -1211,6 +1211,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		ResetBindings();
 		return;
 	}
+	buffer.SetDebugShaders(state.vertex_info[0].stage.program->shader_hash,
+	                       state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1288,8 +1290,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
-		m_context.GetCommandScheduler().EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		buffer.AddPendingShaderWrites(shader_write_stages);
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

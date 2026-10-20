@@ -6,7 +6,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -388,6 +391,55 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
+// KYTY_SYNC_SUBMITS=1 waits for every submit to retire and logs the slow or failing ones, which
+// pinpoints the exact draw/dispatch behind a GPU hang (the history ring only shows what came
+// after the device was already lost). KYTY_SYNC_SUBMITS_SLOW_MS overrides the slow threshold.
+bool CommandScheduler::SyncSubmitsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_SUBMITS");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+void CommandScheduler::WaitSubmitForDiagnostics(uint64_t tick) {
+	static const uint64_t slow_ms = [] {
+		const char* value = std::getenv("KYTY_SYNC_SUBMITS_SLOW_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 50ull;
+	}();
+	static std::atomic<bool> reported_failure {false};
+
+	vk::SemaphoreWaitInfo wait_info {};
+	const auto            semaphore = m_master.Handle();
+	wait_info.semaphoreCount        = 1;
+	wait_info.pSemaphores           = &semaphore;
+	wait_info.pValues               = &tick;
+
+	const auto start  = std::chrono::steady_clock::now();
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, 10000000000ULL);
+	const auto elapsed_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+	                                                          start)
+	        .count();
+
+	const bool failed = result != vk::Result::eSuccess;
+	if (failed && reported_failure.exchange(true)) {
+		return;
+	}
+	if (failed || static_cast<uint64_t>(elapsed_ms) >= slow_ms) {
+		const auto& c = m_command;
+		LOGF("SyncSubmit %s: tick=%" PRIu64 " result=%s elapsed_ms=%lld submit=%" PRIu64
+		     " op=%u args=%u,%u,%u,%u,0x%016" PRIx64 " shader0=0x%016" PRIx64
+		     " shader1=0x%016" PRIx64 "\n",
+		     failed ? "FAILED" : "SLOW", tick, vk::to_string(result).c_str(),
+		     static_cast<long long>(elapsed_ms), c.m_debug_submit_id, c.m_debug_op, c.m_debug_arg0,
+		     c.m_debug_arg1, c.m_debug_arg2, c.m_debug_arg3, c.m_debug_arg4, c.m_debug_shader0,
+		     c.m_debug_shader1);
+		std::fflush(stdout);
+	}
+	m_master.Refresh();
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
@@ -436,8 +488,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 		LOGF("CommandScheduler: vkQueueSubmit returned %s, continuing gracefully\n",
 		     vk::to_string(result).c_str());
+	} else if (SyncSubmitsEnabled()) {
+		WaitSubmitForDiagnostics(tick);
 	}
 
+	m_command.m_debug_shader0 = 0;
+	m_command.m_debug_shader1 = 0;
 	m_command.m_buffer = nullptr;
 	return tick;
 }

@@ -1,14 +1,35 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <functional>
 #include <optional>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+namespace {
+std::atomic<bool> g_loop_iteration_guard {[] {
+	const char* env = std::getenv("KYTY_LOOP_GUARD");
+	return env != nullptr && env[0] != '\0' && env[0] != '0';
+}()};
+} // namespace
+
+void SetLoopIterationGuard(bool enabled) {
+	g_loop_iteration_guard.store(enabled, std::memory_order_relaxed);
+}
+
+bool LoopIterationGuardEnabled() {
+	return g_loop_iteration_guard.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -96,6 +117,79 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// Metal kills command buffers that run past its GPU watchdog, and after a few such hangs the
+// device is lost for good. Guest loops whose exit depends on state we do not reproduce exactly
+// (spin-waits, data-driven counters) can spin forever, so on Apple each invocation gets a
+// bounded loop-iteration budget and loops take their exit edge once it is exhausted.
+uint32_t LoopBudget(const EmitterState& state) {
+	// KYTY_LOOP_BUDGET overrides the per-invocation budget for every stage.
+	static const uint32_t override_budget = [] {
+		const char* value = std::getenv("KYTY_LOOP_BUDGET");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (override_budget != 0) {
+		return override_budget;
+	}
+	return state.program.stage == ShaderType::Pixel ? (1u << 14) : (1u << 16);
+}
+
+bool ProgramHasLoops(const IR::Program& program) {
+	if (program.dispatcher_fallback) {
+		return true;
+	}
+	return std::any_of(program.blocks.begin(), program.blocks.end(),
+	                   [](const IR::Block* block) { return block->terminator.loop_header; });
+}
+
+bool HasPhis(const IR::Block* block) {
+	return !block->empty() && block->begin()->GetOpcode() == IR::ValueOpcode::Phi;
+}
+
+// Increments the invocation's loop counter and returns true once the budget is exhausted.
+uint32_t EmitLoopBudgetExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.loop_budget_variable);
+	const auto next = EmitAddU32(state, count, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, next);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, next,
+	                          ConstantU32(state, LoopBudget(state)));
+	return exhausted;
+}
+
+// Forces `condition` to select `exit_block` when the loop budget is exhausted.
+uint32_t EmitLoopBudgetCondition(EmitterState& state, uint32_t condition, bool exit_on_true) {
+	const auto exhausted = EmitLoopBudgetExhausted(state);
+	const auto result    = state.builder.AllocateId();
+	if (exit_on_true) {
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), result, condition, exhausted);
+	} else {
+		const auto keep = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), keep, exhausted);
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, condition, keep);
+	}
+	return result;
+}
+
+// Returns the loop exit target if `block` ends in a loop-controlling conditional branch: either a
+// loop header testing its merge, or a back edge paired with an exit to the loop's merge.
+const IR::Block* LoopExitTarget(const IR::Block* block) {
+	const auto& term = block->terminator;
+	const auto* t    = term.true_block;
+	const auto* f    = term.false_block;
+	if (term.loop_header && term.merge_block != nullptr &&
+	    (t == term.merge_block || f == term.merge_block)) {
+		return term.merge_block;
+	}
+	if (t != nullptr && t->terminator.loop_header && t->terminator.merge_block == f) {
+		return f;
+	}
+	if (f != nullptr && f->terminator.loop_header && f->terminator.merge_block == t) {
+		return t;
+	}
+	return nullptr;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
@@ -120,6 +214,18 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
+			if (ctx.state.loop_budget_variable != 0 && target->terminator.loop_header &&
+			    target->terminator.continue_block == block) {
+				// An unconditional back edge can only leave once the merge needs no Phi inputs.
+				const auto* merge = target->terminator.merge_block;
+				if (merge != nullptr && !HasPhis(merge)) {
+					const auto exhausted = EmitLoopBudgetExhausted(ctx.state);
+					emit_merge();
+					ctx.state.builder.AddFunction(spv::OpBranchConditional, exhausted,
+					                              merge->Definition(), target->Definition());
+					return;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranch, target->Definition());
 			return;
@@ -131,7 +237,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			if (ctx.state.loop_budget_variable != 0) {
+				if (const auto* exit = LoopExitTarget(block); exit != nullptr) {
+					condition =
+					    EmitLoopBudgetCondition(ctx.state, condition, exit == true_block);
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -363,9 +475,12 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	if (state.loop_budget_variable != 0) {
+		done = EmitLoopBudgetCondition(state, done, true);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -614,6 +729,10 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (LoopIterationGuardEnabled() && ProgramHasLoops(program)) {
+		state.loop_budget_variable = state.builder.AllocateId();
+		state.builder.AddName(state.loop_budget_variable, "loop_budget_count");
+	}
 	for (const auto* block: program.blocks) {
 		// Re-emission may use a different host subgroup width and ID allocation order.
 		for (const auto& inst: *block) {
@@ -709,6 +828,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_budget_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -737,6 +861,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

@@ -104,6 +104,14 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	// Shader hashes of the last pipeline recorded, reported by synchronous submit diagnostics.
+	void SetDebugShaders(uint64_t first, uint64_t second) noexcept {
+		m_debug_shader0 = first;
+		m_debug_shader1 = second;
+	}
+	void AddPendingShaderWrites(vk::PipelineStageFlags stages) const noexcept {
+		m_pending_shader_writes |= stages;
+	}
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
@@ -135,6 +143,9 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
+	uint64_t            m_debug_shader0   = 0;
+	uint64_t            m_debug_shader1   = 0;
+	mutable vk::PipelineStageFlags m_pending_shader_writes {};
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;

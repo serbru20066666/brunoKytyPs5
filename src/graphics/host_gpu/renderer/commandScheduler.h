@@ -57,8 +57,11 @@ public:
 	                                uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3,
 	                                uint64_t arg4);
 	static void DumpSubmitHistory(uint64_t failed_tick);
+	[[nodiscard]] static bool SyncSubmitsEnabled();
 
 private:
+	void WaitSubmitForDiagnostics(uint64_t tick);
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
