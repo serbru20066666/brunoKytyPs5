@@ -1073,19 +1073,25 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	const auto& hw = buffer.GetRegisters();
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
-	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
-	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
-	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
-	                     emit.first_vertex != 0 || emit.first_instance != 0 ||
-	                     state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
-	                     color.desc.info.samples != 1 ||
-	                     depth.desc.info.extent.width != color.Extent().width ||
-	                     depth.desc.info.extent.height != color.Extent().height ||
-	                     depth.desc.view_info.layer_count != 1 ||
-	                     color.desc.view_info.layer_count != 1 ||
-	                     hw.GetBlendControl(0).enable || state.ps_input_info.ps_pixel_kill_enable ||
-	                     state.ps_input_info.ps_depth_export_enable ||
-	                     state.ps_input_info.ps_sample_mask_export_enable);
+#if !defined(__APPLE__)
+	if (!m_context.GetGraphics().maintenance8_enabled) {
+		return false;
+	}
+#endif
+	if (!Prospero::IsRectList(ucfg.GetPrimType()) ||
+	    draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
+	    emit.first_vertex != 0 || emit.first_instance != 0 ||
+	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	    color.desc.info.samples != 1 ||
+	    depth.desc.info.extent.width != color.Extent().width ||
+	    depth.desc.info.extent.height != color.Extent().height ||
+	    depth.desc.view_info.layer_count != 1 ||
+	    color.desc.view_info.layer_count != 1 ||
+	    hw.GetBlendControl(0).enable || state.ps_input_info.ps_pixel_kill_enable ||
+	    state.ps_input_info.ps_depth_export_enable ||
+	    state.ps_input_info.ps_sample_mask_export_enable) {
+		return false;
+	}
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
 	if (depth.load_clear_aspects) {
@@ -1094,9 +1100,11 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	auto& cache = m_context.GetTextureCache();
 	auto& source = cache.GetImage(depth.image_id);
 	auto& destination = cache.GetImage(color.image_id);
-	EXIT_NOT_IMPLEMENTED((source.backing.format != vk::Format::eD32Sfloat &&
-	                      source.backing.format != vk::Format::eD32SfloatS8Uint) ||
-	                     destination.backing.format != vk::Format::eR32Sfloat);
+	if ((source.backing.format != vk::Format::eD32Sfloat &&
+	     source.backing.format != vk::Format::eD32SfloatS8Uint) ||
+	    destination.backing.format != vk::Format::eR32Sfloat) {
+		return false;
+	}
 	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
 	                                    {rendering.width, rendering.height}, 0);
 	if (rect.right > rect.left && rect.bottom > rect.top) {
