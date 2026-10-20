@@ -13,6 +13,22 @@ namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
+struct SubmitHistoryEntry {
+	uint64_t tick         = 0;
+	uint64_t submit_id    = 0;
+	uint32_t op           = 0;
+	uint32_t arg0         = 0;
+	uint32_t arg1         = 0;
+	uint32_t arg2         = 0;
+	uint32_t arg3         = 0;
+	uint64_t arg4         = 0;
+};
+
+constexpr size_t kHistorySize = 64;
+static std::array<SubmitHistoryEntry, kHistorySize> s_submit_history {};
+static std::atomic<size_t>                          s_history_head {0};
+static std::mutex                                   s_history_mutex;
+
 namespace {
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
@@ -26,10 +42,43 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
+	CommandScheduler::DumpSubmitHistory(tick);
 	std::fflush(stdout);
 }
 
 } // namespace
+
+void CommandScheduler::RecordSubmitHistory(uint64_t tick, uint64_t submit_id, uint32_t op,
+                                           uint32_t arg0, uint32_t arg1, uint32_t arg2,
+                                           uint32_t arg3, uint64_t arg4) {
+	std::lock_guard lock(s_history_mutex);
+	const size_t idx      = s_history_head.load(std::memory_order_relaxed) % kHistorySize;
+	s_submit_history[idx] = {tick, submit_id, op, arg0, arg1, arg2, arg3, arg4};
+	s_history_head.fetch_add(1, std::memory_order_release);
+}
+
+void CommandScheduler::DumpSubmitHistory(uint64_t failed_tick) {
+	std::lock_guard lock(s_history_mutex);
+	const size_t total = s_history_head.load(std::memory_order_acquire);
+	const size_t count = std::min(total, kHistorySize);
+	LOGF("=== RECENT GPU SUBMISSIONS (failed_tick=%" PRIu64 ", total_submitted=%zu) ===\n",
+	     failed_tick, total);
+	std::printf("=== RECENT GPU SUBMISSIONS (failed_tick=%" PRIu64 ", total_submitted=%zu) ===\n",
+	            failed_tick, total);
+	for (size_t i = 0; i < count; i++) {
+		const size_t idx = (total - count + i) % kHistorySize;
+		const auto&  e   = s_submit_history[idx];
+		LOGF("  [#%zu] tick=%" PRIu64 " submit=%" PRIu64
+		     " op=%u args=%u,%u,%u,%u,0x%016" PRIx64 "%s\n",
+		     i, e.tick, e.submit_id, e.op, e.arg0, e.arg1, e.arg2, e.arg3, e.arg4,
+		     (e.tick == failed_tick) ? " <--- FAILED TICK" : "");
+		std::printf("  [#%zu] tick=%" PRIu64 " submit=%" PRIu64
+		            " op=%u args=%u,%u,%u,%u,0x%016" PRIx64 "%s\n",
+		            i, e.tick, e.submit_id, e.op, e.arg0, e.arg1, e.arg2, e.arg3, e.arg4,
+		            (e.tick == failed_tick) ? " <--- FAILED TICK" : "");
+	}
+	std::fflush(stdout);
+}
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -375,6 +424,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+
+	RecordSubmitHistory(tick, m_command.m_debug_submit_id, m_command.m_debug_op,
+	                    m_command.m_debug_arg0, m_command.m_debug_arg1, m_command.m_debug_arg2,
+	                    m_command.m_debug_arg3, m_command.m_debug_arg4);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,

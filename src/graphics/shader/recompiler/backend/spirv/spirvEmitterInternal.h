@@ -619,14 +619,16 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
-	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-	const auto preheader = state.builder.AllocateId();
-	const auto header    = state.builder.AllocateId();
-	const auto cont      = state.builder.AllocateId();
-	const auto merge     = state.builder.AllocateId();
-	const auto initial   = state.builder.AllocateId();
-	const auto observed  = state.builder.AllocateId();
-	const auto exchanged = state.builder.AllocateId();
+	const auto scope      = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	const auto preheader  = state.builder.AllocateId();
+	const auto header     = state.builder.AllocateId();
+	const auto cont       = state.builder.AllocateId();
+	const auto merge      = state.builder.AllocateId();
+	const auto initial    = state.builder.AllocateId();
+	const auto observed   = state.builder.AllocateId();
+	const auto exchanged  = state.builder.AllocateId();
+	const auto loop_count = state.builder.AllocateId();
+	const auto next_count = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBranch, preheader);
 	EmitLabel(state, preheader);
 	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), initial, pointer,
@@ -636,6 +638,8 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, header);
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged,
 	                          cont);
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), loop_count, ConstantU32(state, 0), preheader,
+	                          next_count, cont);
 	const auto next = desired(observed);
 	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
 	                          ConstantU32(state, scope),
@@ -643,9 +647,16 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed);
 	const auto success = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), success, exchanged, observed);
+	const auto max_reached = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), max_reached, loop_count,
+	                          ConstantU32(state, 256));
+	const auto exit_loop = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), exit_loop, success, max_reached);
 	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, success, merge, cont);
+	state.builder.AddFunction(spv::OpBranchConditional, exit_loop, merge, cont);
 	EmitLabel(state, cont);
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_count, loop_count,
+	                          ConstantU32(state, 1));
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, merge);
 	EmitAtomicMemoryBarrier(state, kind);

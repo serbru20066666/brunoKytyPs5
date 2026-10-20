@@ -53,6 +53,11 @@ public:
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
+	static void RecordSubmitHistory(uint64_t tick, uint64_t submit_id, uint32_t op,
+	                                uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3,
+	                                uint64_t arg4);
+	static void DumpSubmitHistory(uint64_t failed_tick);
+
 private:
 	class CommandPool {
 	public:

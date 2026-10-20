@@ -658,20 +658,10 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
-#if defined(__APPLE__)
-	if (state.program.stage == ShaderType::Vertex) {
-		state.builder.AddFunction(
-		    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
-		    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
-		                          spv::MemorySemanticsImageMemoryMask));
-		return;
-	}
-#endif
 	state.builder.AddFunction(
-	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
-	    ConstantU32(state, spv::ScopeDevice),
+	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
 	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
-		                          spv::MemorySemanticsImageMemoryMask));
+	                          spv::MemorySemanticsImageMemoryMask));
 }
 
 void EmitDataCacheInvalidate(EmitterState& state) {

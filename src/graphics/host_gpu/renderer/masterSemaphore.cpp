@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 
 namespace Libs::Graphics {
 
@@ -60,6 +61,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (result != vk::Result::eSuccess) {
 		LOGF("MasterSemaphore::Wait: waitSemaphores returned %s for tick %" PRIu64 "\n",
 		     vk::to_string(result).c_str(), tick);
+		CommandScheduler::DumpSubmitHistory(tick);
 		m_gpu_tick.store(tick, std::memory_order_release);
 		return;
 	}
